@@ -281,11 +281,11 @@ const fn default_path() -> &'static str {
 /// After `env_clear`, cmd.exe pipelines and many Windows programs fail
 /// without `SystemRoot` and `ComSpec`; restore just those two.
 pub(crate) fn apply_windows_environment(process: &mut Command) {
-    if cfg!(windows) {
-        if let Ok(system_root) = std::env::var("SystemRoot") {
-            process.env("ComSpec", format!("{system_root}\\System32\\cmd.exe"));
-            process.env("SystemRoot", system_root);
-        }
+    if cfg!(windows)
+        && let Ok(system_root) = std::env::var("SystemRoot")
+    {
+        process.env("ComSpec", format!("{system_root}\\System32\\cmd.exe"));
+        process.env("SystemRoot", system_root);
     }
 }
 
