@@ -73,6 +73,102 @@ impl SessionWriter {
     }
 }
 
+/// A summary of a recorded session, for the resume picker.
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub path: PathBuf,
+    /// Modification time, used to sort newest first.
+    pub modified: SystemTime,
+    /// First user prompt in the session, for a human-readable preview.
+    pub preview: String,
+    /// Number of conversation messages recorded.
+    pub messages: usize,
+    /// Provider name recorded for the session, if any.
+    pub provider: Option<String>,
+}
+
+/// The provider name recorded in the most recent session for this workspace,
+/// used to default `--provider` to the last one used.
+#[must_use]
+pub fn last_provider(workspace: &Path) -> Option<String> {
+    list_sessions(workspace)
+        .ok()?
+        .into_iter()
+        .find_map(|summary| summary.provider)
+}
+
+/// List recorded sessions under `.febo/sessions`, newest first. Unreadable
+/// or empty files are skipped rather than failing the whole listing.
+///
+/// # Errors
+///
+/// Returns an error only when the sessions directory exists but cannot be
+/// read.
+pub fn list_sessions(workspace: &Path) -> Result<Vec<SessionSummary>, String> {
+    let directory = workspace.join(".febo").join("sessions");
+    if !directory.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut summaries = Vec::new();
+    for entry in fs::read_dir(&directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(summary) = summarize_session(&path) else {
+            continue;
+        };
+        summaries.push(summary);
+    }
+    summaries.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
+    Ok(summaries)
+}
+
+fn summarize_session(path: &Path) -> Option<SessionSummary> {
+    let file = File::open(path).ok()?;
+    let modified = path.metadata().and_then(|meta| meta.modified()).ok()?;
+    let mut preview = String::new();
+    let mut messages = 0usize;
+    let mut provider = None;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        let Ok(event) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        match event.get("event").and_then(Value::as_str) {
+            Some("message") => messages += 1,
+            Some("provider") => {
+                provider = event
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            Some("user_prompt") if preview.is_empty() => {
+                if let Some(value) = event.get("value").and_then(Value::as_str) {
+                    value
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .clone_into(&mut preview);
+                }
+            }
+            _ => {}
+        }
+    }
+    if messages == 0 && preview.is_empty() {
+        return None;
+    }
+    Some(SessionSummary {
+        path: path.to_path_buf(),
+        modified,
+        preview,
+        messages,
+        provider,
+    })
+}
+
 /// Load structured conversation messages from an append-only session log.
 ///
 /// # Errors
@@ -101,10 +197,40 @@ pub fn load_messages(path: &Path) -> Result<Vec<Value>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionWriter, load_messages};
+    use super::{SessionWriter, list_sessions, load_messages};
     use serde_json::json;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn lists_sessions_newest_first_with_preview() {
+        let root = std::env::temp_dir().join(format!(
+            "febo-list-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("directory");
+        assert!(list_sessions(&root).expect("empty ok").is_empty());
+
+        let older = SessionWriter::create(&root).expect("older session");
+        older.record("user_prompt", "first task").expect("prompt");
+        older
+            .record_message(&json!({"role": "user", "content": "first task"}))
+            .expect("message");
+        // Ensure a distinct, newer mtime for the second session.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let newer = SessionWriter::create(&root).expect("newer session");
+        newer.record("user_prompt", "second task").expect("prompt");
+
+        let sessions = list_sessions(&root).expect("list");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].preview, "second task");
+        assert_eq!(sessions[1].preview, "first task");
+        assert_eq!(sessions[1].messages, 1);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
 
     #[test]
     fn records_and_loads_messages() {

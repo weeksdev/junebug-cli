@@ -46,16 +46,19 @@ impl PolicyEngine {
                 }
                 match self.permission {
                     PermissionMode::ReadOnly => Decision::Deny,
-                    PermissionMode::WorkspaceWrite => Decision::Allow,
+                    PermissionMode::WorkspaceWrite | PermissionMode::Yolo => Decision::Allow,
                     PermissionMode::Ask => Decision::Ask,
                 }
             }
             ToolRisk::Execute | ToolRisk::Network => {
                 if self.plan_mode {
                     Decision::Deny
+                } else if matches!(self.permission, PermissionMode::Yolo) {
+                    // Yolo mode pre-approves commands and network access too.
+                    Decision::Allow
                 } else {
-                    // Commands and network access always require an explicit
-                    // approval; no permission mode pre-approves them.
+                    // Otherwise commands and network access always require an
+                    // explicit approval; no other mode pre-approves them.
                     Decision::Ask
                 }
             }
@@ -126,6 +129,7 @@ mod tests {
             PermissionMode::ReadOnly,
             PermissionMode::Ask,
             PermissionMode::WorkspaceWrite,
+            PermissionMode::Yolo,
         ] {
             let policy = PolicyEngine::new(permission, true);
             assert_eq!(policy.evaluate(ToolRisk::Write), Decision::Deny);
@@ -133,6 +137,15 @@ mod tests {
             assert_eq!(policy.evaluate(ToolRisk::Network), Decision::Deny);
             assert_eq!(policy.evaluate(ToolRisk::Read), Decision::Allow);
         }
+    }
+
+    #[test]
+    fn yolo_pre_approves_writes_and_commands_but_not_in_plan_mode() {
+        let policy = PolicyEngine::new(PermissionMode::Yolo, false);
+        assert_eq!(policy.evaluate(ToolRisk::Write), Decision::Allow);
+        assert_eq!(policy.evaluate(ToolRisk::Execute), Decision::Allow);
+        assert_eq!(policy.evaluate(ToolRisk::Network), Decision::Allow);
+        assert_eq!(policy.evaluate(ToolRisk::Read), Decision::Allow);
     }
 
     #[test]

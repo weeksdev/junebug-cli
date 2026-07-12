@@ -110,6 +110,30 @@ impl ProviderKind {
             Self::DeepSeek => "deepseek-v4-flash",
         }
     }
+
+    /// All supported providers, in default preference order.
+    #[must_use]
+    pub const fn all() -> [Self; 3] {
+        [Self::OpenRouter, Self::OpenAi, Self::DeepSeek]
+    }
+
+    /// Whether a credential for this provider is available from the
+    /// environment, the workspace `.env`, or the user credential store.
+    #[must_use]
+    pub fn has_credential(self) -> bool {
+        let environment = self.api_key_environment();
+        std::env::var(environment).is_ok_and(|value| !value.is_empty())
+            || dotenv_value(environment).is_some()
+    }
+}
+
+/// Providers that currently have a usable credential, in preference order.
+#[must_use]
+pub fn available_providers() -> Vec<ProviderKind> {
+    ProviderKind::all()
+        .into_iter()
+        .filter(|kind| kind.has_credential())
+        .collect()
 }
 
 pub struct OpenAiCompatibleProvider {

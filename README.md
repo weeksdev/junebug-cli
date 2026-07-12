@@ -12,7 +12,7 @@ Install on macOS (builds from source, installs to `~/.local/bin/febo`):
 
 Tagged versions (`v*`) publish prebuilt binaries for macOS (arm64/x86_64), Linux, and Windows on the [GitHub releases page](https://github.com/weeksdev/febo_cli/releases).
 
-Save a provider API key once (stored in `~/.febo/credentials.env`, `0600`) and start chatting:
+Save a provider API key once (stored in `~/.febo/credentials.env`, `0600`) and start chatting. When you omit `--provider`, Febo defaults to the provider from your last session (falling back to whichever key it can find):
 
 ```sh
 febo set --provider deepseek YOUR_API_KEY
@@ -32,14 +32,14 @@ The CLI uses standard provider environment variables and also reads an ignored `
 ## Current commands
 
 - `febo` — interactive REPL with a Claude Code-style terminal UI: streamed Markdown rendering, a spinner with elapsed time, `⏺ tool(args)` / `⎿ result` activity lines, and **Esc to interrupt** a running turn (the partial reply stays in context; your next message continues from it).
-  - Slash commands: `/help`, `/model [NAME]` (lists available models from the provider's `/models` endpoint; switches with fuzzy matching), `/compact` (model-written summary replaces old history), `/status`, `/diff`, `/exit`.
+  - Slash commands: `/help`, `/model` (arrow-key pick from the provider's live model list), `/permissions` (arrow-key switch between read-only / ask / workspace-write / **yolo** mid-session), `/compact` (model-written summary replaces old history), `/status`, `/diff`, `/exit`. A dimmed status line under the prompt always shows the current model and access level.
   - Input intellisense: typing `/` opens a slash-command menu; typing `@` opens a workspace file search menu (↑/↓ select, Tab/Enter accept). Accepted `@path` mentions attach the file's contents to your message.
   - Line editing: arrows, Home/End, Ctrl-A/E/U/K, and ↑/↓ history.
 - `febo [prompt]` — single prompt execution with approval prompts for writes and commands.
 - `febo exec [--json] <prompt>` — script-friendly execution emitting JSON Lines events (`text.delta`, `tool.call`, `tool.result`, `completed`).
-- `--permission read-only|ask|workspace-write` — defaults to `read-only`; non-interactive runs require `workspace-write` for edits because approval prompts are unavailable.
+- `--permission read-only|ask|workspace-write|yolo` — defaults to `read-only`. `yolo` approves every write **and** command without asking (plan mode still forces read-only). Non-interactive runs require `workspace-write` or `yolo` for edits.
 - `--plan` — hard read-only guard that also hides write/command tools from the model, regardless of `--permission`.
-- `--resume <session.jsonl>` — continue a recorded session; `--resume-compact <session.jsonl>` additionally summarizes a large history first so resuming does not waste tokens. `--max-context-chars` bounds the request context with deterministic compaction.
+- `--resume [session.jsonl]` — continue a session; **with no path it lists past sessions to pick from**. `--resume-compact [session.jsonl]` additionally summarizes a large history first so resuming does not waste tokens. `--max-context-chars` bounds the request context with deterministic compaction.
 - `--enable-hooks` — run explicitly trusted `.febo/hooks.json` lifecycle commands.
 - `--enable-mcp` — connect local stdio MCP servers from `.febo/mcp.json`; every MCP tool call requires an interactive approval showing the arguments.
 - `febo --version` / `febo --help`.

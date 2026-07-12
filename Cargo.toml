@@ -1,6 +1,6 @@
 [package]
 name = "febo-cli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "A safe, local-first coding agent CLI for Febo models"
 license = "Apache-2.0"

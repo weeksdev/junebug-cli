@@ -9,12 +9,13 @@ use std::path::{Path, PathBuf};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 
-pub const SLASH_COMMANDS: [(&str, &str); 7] = [
+pub const SLASH_COMMANDS: [(&str, &str); 8] = [
     ("/compact", "summarize the conversation to free context"),
     ("/diff", "show the uncommitted Git diff"),
     ("/exit", "quit (Ctrl-D also works)"),
     ("/help", "show help"),
-    ("/model", "show or switch the model (/model NAME)"),
+    ("/model", "pick or switch the model"),
+    ("/permissions", "change what Febo may do without asking"),
     ("/quit", "quit"),
     ("/status", "provider, model, permissions, session"),
 ];
@@ -65,13 +66,14 @@ impl Editor {
         }
     }
 
-    /// Read one input line, drawing the prompt and completion menu. Returns
+    /// Read one input line, drawing the prompt, a dimmed `footer` hint below
+    /// it (when no completion menu is open), and the completion menu. Returns
     /// `None` on end of input (Ctrl-D on an empty line).
-    pub fn read_line(&mut self) -> Option<String> {
+    pub fn read_line(&mut self, footer: &str) -> Option<String> {
         if !io::stdin().is_terminal() || terminal::enable_raw_mode().is_err() {
             return fallback_read_line();
         }
-        let result = self.edit_loop();
+        let result = self.edit_loop(footer);
         let _ = terminal::disable_raw_mode();
         if let Some(line) = &result
             && !line.is_empty()
@@ -82,7 +84,7 @@ impl Editor {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn edit_loop(&mut self) -> Option<String> {
+    fn edit_loop(&mut self, footer: &str) -> Option<String> {
         let mut buffer: Vec<char> = Vec::new();
         let mut cursor = 0usize;
         let mut selected = 0usize;
@@ -95,7 +97,7 @@ impl Editor {
             if selected >= items.len() {
                 selected = 0;
             }
-            draw(&text, cursor, &items, selected);
+            draw(&text, cursor, &items, selected, footer);
             let Ok(Event::Key(key)) = event::read() else {
                 continue;
             };
@@ -300,11 +302,19 @@ fn would_change(_buffer: &[char], context: &CompletionContext, item: &MenuItem) 
     }
 }
 
-fn draw(text: &str, cursor: usize, items: &[MenuItem], selected: usize) {
+fn draw(text: &str, cursor: usize, items: &[MenuItem], selected: usize, footer: &str) {
     use std::fmt::Write as _;
     let mut output = String::from("\r\x1b[J\x1b[1;36m❯\x1b[0m ");
     output.push_str(text);
-    if !items.is_empty() {
+    // Rows drawn below the input that the cursor must be moved back up over.
+    let mut rows_below = 0usize;
+    if items.is_empty() {
+        // No completion menu: show the persistent footer hint, if any.
+        if !footer.is_empty() {
+            let _ = write!(output, "\r\n{DIM}{footer}{RESET}");
+            rows_below = 1;
+        }
+    } else {
         for (index, item) in items.iter().enumerate() {
             output.push_str("\r\n");
             if index == selected {
@@ -316,7 +326,10 @@ fn draw(text: &str, cursor: usize, items: &[MenuItem], selected: usize) {
             output.push_str(&item.label);
             output.push_str(RESET);
         }
-        let _ = write!(output, "\x1b[{}A", items.len());
+        rows_below = items.len();
+    }
+    if rows_below > 0 {
+        let _ = write!(output, "\x1b[{rows_below}A");
     }
     let column = u16::try_from(cursor)
         .unwrap_or(u16::MAX)
@@ -329,6 +342,88 @@ fn draw(text: &str, cursor: usize, items: &[MenuItem], selected: usize) {
 fn clear_menu_and_break_line(text: &str, items: &[MenuItem]) {
     let _ = items;
     eprint!("\r\x1b[J\x1b[1;36m❯\x1b[0m {text}\r\n");
+    let _ = io::stderr().flush();
+}
+
+/// A choice shown in an interactive `select_menu`.
+pub struct Choice {
+    /// Primary label (highlighted when selected).
+    pub label: String,
+    /// Optional dimmed hint shown after the label.
+    pub hint: String,
+}
+
+impl Choice {
+    #[must_use]
+    pub fn new(label: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            hint: hint.into(),
+        }
+    }
+}
+
+/// Show an arrow-key selectable menu on the alternate rows below `title` and
+/// return the chosen index, or `None` if the user cancels (Esc/Ctrl-C) or no
+/// terminal is available. `initial` is the pre-highlighted row.
+#[must_use]
+pub fn select_menu(title: &str, choices: &[Choice], initial: usize) -> Option<usize> {
+    if choices.is_empty() {
+        return None;
+    }
+    if !io::stdin().is_terminal() || terminal::enable_raw_mode().is_err() {
+        return None;
+    }
+    let mut selected = initial.min(choices.len() - 1);
+    let result = loop {
+        draw_select(title, choices, selected);
+        let Ok(Event::Key(key)) = event::read() else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                selected = selected.checked_sub(1).unwrap_or(choices.len() - 1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                selected = (selected + 1) % choices.len();
+            }
+            KeyCode::Enter | KeyCode::Tab => break Some(selected),
+            KeyCode::Esc => break None,
+            KeyCode::Char('c') if control => break None,
+            _ => {}
+        }
+    };
+    let _ = terminal::disable_raw_mode();
+    // Clear the menu region and leave the cursor on a fresh line.
+    eprint!("\r\x1b[J");
+    let _ = io::stderr().flush();
+    result
+}
+
+fn draw_select(title: &str, choices: &[Choice], selected: usize) {
+    use std::fmt::Write as _;
+    let mut output = format!("\r\x1b[J\x1b[1m{title}\x1b[0m");
+    for (index, choice) in choices.iter().enumerate() {
+        output.push_str("\r\n");
+        if index == selected {
+            output.push_str(INVERSE);
+            output.push_str("  ▸ ");
+        } else {
+            output.push_str("    ");
+        }
+        output.push_str(&choice.label);
+        output.push_str(RESET);
+        if !choice.hint.is_empty() {
+            let _ = write!(output, "  {DIM}{}{RESET}", choice.hint);
+        }
+    }
+    // Return the cursor to the title row so the next redraw overwrites cleanly.
+    let _ = write!(output, "\x1b[{}A\r", choices.len());
+    eprint!("{output}");
     let _ = io::stderr().flush();
 }
 
