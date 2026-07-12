@@ -4,7 +4,7 @@
 
 This repository is an early Rust implementation of **Febo CLI**, a local-first agentic coding CLI. The full product roadmap is in [PLAN.md](PLAN.md). Do not represent the project as feature-complete: the core agent loop is working, but major v0.2–v1 capabilities remain unimplemented.
 
-The tree is currently an uncommitted, newly initialized Git repository. Preserve all existing files and avoid broad rewrites until you understand the safety boundaries below.
+The project lives at <https://github.com/weeksdev/febo_cli> (main branch; tags `v*` trigger the release workflow). It was renamed from "Junie" to "Febo" before first publish because JetBrains ships an AI agent named Junie. Avoid broad rewrites until you understand the safety boundaries below.
 
 ## What works today
 
