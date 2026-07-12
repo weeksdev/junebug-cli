@@ -12,6 +12,12 @@ Install on macOS (builds from source, installs to `~/.local/bin/febo`):
 
 Tagged versions (`v*`) publish prebuilt binaries for macOS (arm64/x86_64), Linux, and Windows on the [GitHub releases page](https://github.com/weeksdev/febo_cli/releases).
 
+Save a provider API key once (stored in `~/.febo/credentials.env`, `0600`) and start chatting:
+
+```sh
+febo set --provider deepseek YOUR_API_KEY
+```
+
 ```sh
 cargo run -- --help
 OPENROUTER_API_KEY=... cargo run -- "Describe this project"

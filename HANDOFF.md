@@ -12,7 +12,7 @@ The project lives at <https://github.com/weeksdev/febo_cli> (main branch; tags `
   - `openrouter` (default), via `OPENROUTER_API_KEY`
   - `openai`, via `OPENAI_API_KEY`
   - `deepseek`, via `DEEPSEEK_API_KEY`
-- API keys can be supplied through environment variables or a local ignored `.env` file.
+- API keys can be supplied through environment variables, a local ignored `.env` file, or the user-level `~/.febo/credentials.env` written by `febo set --provider NAME API_KEY` (0600 on unix; the command saves the key and then starts the REPL on that provider). Lookup order: process env, workspace `.env`, user credentials file.
 - Model-driven multi-turn tool loop with streamed text, tool calls, tool results, token usage, cancellation-by-turn-limit, JSONL headless output, and local JSONL sessions.
 - An interactive REPL (`febo` with no prompt and a terminal attached) with a Claude Code-style UI:
   - agent turns run on a worker thread (`std::thread::scope`) while the main thread renders `TurnEvent`s from an mpsc channel: streamed Markdown (`src/markdown.rs`, line-buffered ANSI styling), a braille spinner with elapsed seconds, `⏺ tool(args)` / `⎿ result` activity lines, and approval prompts (raw mode is dropped for the y/N read, then restored);

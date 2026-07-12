@@ -406,12 +406,12 @@ mod tests {
     fn runs_non_destructive_command_in_workspace() {
         let root = temporary_workspace();
         let workspace = Workspace::new(root.clone());
-        let command = if cfg!(windows) {
-            "echo|set /p=febo"
-        } else {
-            "printf febo"
-        };
-        assert_eq!(workspace.run_command(command).expect("run"), "febo");
+        // `echo` emits a trailing newline (\r\n on Windows); trim it rather
+        // than using `set /p`, which returns errorlevel 1 at EOF on Windows.
+        assert_eq!(
+            workspace.run_command("echo febo").expect("run").trim_end(),
+            "febo"
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 

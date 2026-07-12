@@ -12,7 +12,7 @@ use febo_cli::agent::{self, McpClient, TurnObserver};
 use febo_cli::editor::Editor;
 use febo_cli::markdown;
 use febo_cli::policy::{PolicyEngine, parse_approval_answer};
-use febo_cli::provider::{ModelProvider, OpenAiCompatibleProvider, ProviderKind};
+use febo_cli::provider::{ModelProvider, OpenAiCompatibleProvider, ProviderKind, store_credential};
 use febo_cli::session::{SessionWriter, load_messages};
 use febo_cli::tool::Workspace;
 use febo_cli::{PermissionMode, context, hooks, instructions, mcp};
@@ -45,11 +45,17 @@ struct Args {
     hooks: bool,
     mcp: bool,
     plan: bool,
+    set: bool,
 }
 
 fn main() {
     match parse_args(env::args().skip(1).collect()) {
-        Ok(Some(args)) => run(&args),
+        Ok(Some(mut args)) => {
+            if args.set && !handle_set(&mut args) {
+                return;
+            }
+            run(&args);
+        }
         Ok(None) => {}
         Err(message) => {
             eprintln!("error: {message}\nTry `febo --help`.");
@@ -77,6 +83,10 @@ fn parse_args(arguments: Vec<String>) -> Result<Option<Args>, String> {
     let mut arguments = arguments;
     let exec = arguments.first().is_some_and(|argument| argument == "exec");
     if exec {
+        arguments.remove(0);
+    }
+    let set = !exec && arguments.first().is_some_and(|argument| argument == "set");
+    if set {
         arguments.remove(0);
     }
     let mut json = false;
@@ -169,7 +179,39 @@ fn parse_args(arguments: Vec<String>) -> Result<Option<Args>, String> {
         hooks,
         mcp,
         plan,
+        set,
     }))
+}
+
+/// `febo set --provider NAME API_KEY`: save the credential to the user
+/// store, then fall through to the interactive REPL on that provider.
+/// Returns false when the process should exit instead of starting the REPL.
+fn handle_set(args: &mut Args) -> bool {
+    let kind = match ProviderKind::parse(&args.provider) {
+        Ok(kind) => kind,
+        Err(error) => exit_argument_error(&error),
+    };
+    let key = args.prompt.trim().to_owned();
+    if key.is_empty() {
+        exit_argument_error("febo set requires the API key as an argument");
+    }
+    match store_credential(kind, &key) {
+        Ok(path) => eprintln!(
+            "saved {} for provider {} to {}",
+            kind.api_key_environment(),
+            kind.name(),
+            path.display()
+        ),
+        Err(error) => exit_runtime_error(&format!("could not save credential: {error}")),
+    }
+    // The key must never be treated as a prompt.
+    args.prompt = String::new();
+    if io::stdin().is_terminal() {
+        eprintln!("starting febo with provider {}…", kind.name());
+        true
+    } else {
+        false
+    }
 }
 
 fn parse_permission(value: &str) -> Result<PermissionMode, String> {
@@ -899,7 +941,7 @@ fn tool_schemas(plan: bool) -> Vec<Value> {
 
 fn print_help() {
     println!(
-        "Febo CLI {VERSION}\n\nUSAGE:\n  febo [OPTIONS] [prompt]     interactive REPL when prompt is omitted\n  febo exec --json [OPTIONS] <prompt>\n\nOPTIONS:\n  --provider openrouter|openai|deepseek\n  --model MODEL\n  --permission read-only|ask|workspace-write   (default read-only)\n  --plan                        hard read-only guard regardless of --permission\n  --resume SESSION              continue a recorded session\n  --resume-compact SESSION      like --resume but summarizes large histories first\n  --max-context-chars COUNT\n  --no-project-instructions\n  --enable-hooks / --enable-mcp\n\nREPL: /help /model /compact /status /diff /exit — esc interrupts a running turn.\n\nCREDENTIALS:\n  OPENROUTER_API_KEY   provider=openrouter (default)\n  OPENAI_API_KEY       provider=openai\n  DEEPSEEK_API_KEY     provider=deepseek\n\nRepository hooks and MCP servers are disabled unless explicitly enabled."
+        "Febo CLI {VERSION}\n\nUSAGE:\n  febo [OPTIONS] [prompt]     interactive REPL when prompt is omitted\n  febo exec --json [OPTIONS] <prompt>\n  febo set --provider NAME API_KEY   save the key to ~/.febo/credentials.env, then start the REPL\n\nOPTIONS:\n  --provider openrouter|openai|deepseek\n  --model MODEL\n  --permission read-only|ask|workspace-write   (default read-only)\n  --plan                        hard read-only guard regardless of --permission\n  --resume SESSION              continue a recorded session\n  --resume-compact SESSION      like --resume but summarizes large histories first\n  --max-context-chars COUNT\n  --no-project-instructions\n  --enable-hooks / --enable-mcp\n\nREPL: /help /model /compact /status /diff /exit — esc interrupts a running turn.\n\nCREDENTIALS:\n  OPENROUTER_API_KEY   provider=openrouter (default)\n  OPENAI_API_KEY       provider=openai\n  DEEPSEEK_API_KEY     provider=deepseek\n\nRepository hooks and MCP servers are disabled unless explicitly enabled."
     );
 }
 

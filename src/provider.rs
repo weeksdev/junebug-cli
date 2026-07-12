@@ -187,9 +187,15 @@ impl OpenAiCompatibleProvider {
     }
 }
 
-/// Read one simple `KEY=value` entry without executing shell syntax.
+/// Read one simple `KEY=value` entry without executing shell syntax,
+/// checking the workspace `.env` first and then the user credentials file.
 fn dotenv_value(key: &str) -> Option<String> {
-    let contents = std::fs::read_to_string(".env").ok()?;
+    env_file_value(std::path::Path::new(".env"), key)
+        .or_else(|| credentials_path().and_then(|path| env_file_value(&path, key)))
+}
+
+fn env_file_value(path: &std::path::Path, key: &str) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
     contents.lines().find_map(|line| {
         let line = line.trim();
         if line.starts_with('#') {
@@ -210,6 +216,61 @@ fn dotenv_value(key: &str) -> Option<String> {
             .unwrap_or(value);
         (!value.is_empty()).then(|| value.to_owned())
     })
+}
+
+/// The user-level credential store written by `febo set`.
+#[must_use]
+pub fn credentials_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
+    Some(
+        std::path::PathBuf::from(home)
+            .join(".febo")
+            .join("credentials.env"),
+    )
+}
+
+/// Save `key` for `kind` in the user credential store, replacing any
+/// existing entry. Returns the file written.
+///
+/// # Errors
+///
+/// Returns an error when the home directory is unknown or the file cannot
+/// be written.
+pub fn store_credential(kind: ProviderKind, key: &str) -> Result<std::path::PathBuf, String> {
+    let path = credentials_path().ok_or("cannot locate a home directory")?;
+    store_credential_at(&path, kind.api_key_environment(), key)?;
+    Ok(path)
+}
+
+fn store_credential_at(path: &std::path::Path, environment: &str, key: &str) -> Result<(), String> {
+    if key.trim().is_empty() {
+        return Err("the API key is empty".to_owned());
+    }
+    if key.contains(['\n', '\r']) {
+        return Err("the API key must be a single line".to_owned());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let mut lines: Vec<String> = existing
+        .lines()
+        .filter(|line| {
+            line.split_once('=')
+                .is_none_or(|(candidate, _)| candidate.trim() != environment)
+        })
+        .map(str::to_owned)
+        .collect();
+    lines.push(format!("{environment}={}", key.trim()));
+    let contents = format!("{}\n", lines.join("\n"));
+    std::fs::write(path, contents).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(path, permissions).map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 impl ModelProvider for OpenAiCompatibleProvider {
@@ -367,7 +428,9 @@ fn parse_sse(
 
 #[cfg(test)]
 mod tests {
-    use super::ProviderKind;
+    use super::{ProviderKind, env_file_value, store_credential_at};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     #[test]
     fn parses_known_providers() {
         assert_eq!(
@@ -375,5 +438,31 @@ mod tests {
             Ok(ProviderKind::OpenRouter)
         );
         assert!(ProviderKind::parse("fake").is_err());
+    }
+
+    #[test]
+    fn stores_and_replaces_credentials() {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "febo-credentials-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ))
+            .join("credentials.env");
+        store_credential_at(&path, "DEEPSEEK_API_KEY", "first").expect("store");
+        store_credential_at(&path, "OPENAI_API_KEY", "other").expect("store");
+        store_credential_at(&path, "DEEPSEEK_API_KEY", "second").expect("replace");
+        assert_eq!(
+            env_file_value(&path, "DEEPSEEK_API_KEY").as_deref(),
+            Some("second")
+        );
+        assert_eq!(
+            env_file_value(&path, "OPENAI_API_KEY").as_deref(),
+            Some("other")
+        );
+        assert!(store_credential_at(&path, "X", "multi\nline").is_err());
+        std::fs::remove_dir_all(path.parent().expect("parent")).expect("cleanup");
     }
 }
