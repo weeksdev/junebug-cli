@@ -1,0 +1,6 @@
+/target/
+/.febo/
+/.junie/
+.env
+.DS_Store
+

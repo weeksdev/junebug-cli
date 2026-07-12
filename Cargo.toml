@@ -1,0 +1,22 @@
+[package]
+name = "febo-cli"
+version = "0.1.0"
+edition = "2024"
+description = "A safe, local-first coding agent CLI for Febo models"
+license = "Apache-2.0"
+
+[[bin]]
+name = "febo"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[dependencies]
+crossterm = "0.28"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde_json = "1"
