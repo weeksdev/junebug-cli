@@ -218,12 +218,12 @@ impl Workspace {
             process.args(["-c", command]);
             process
         };
-        let output = process
+        process
             .current_dir(&self.root)
             .env_clear()
-            .env("PATH", default_path())
-            .output()
-            .map_err(|error| error.to_string())?;
+            .env("PATH", default_path());
+        apply_windows_environment(&mut process);
+        let output = process.output().map_err(|error| error.to_string())?;
         let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&output.stderr));
         if text.len() > 1024 * 1024 {
@@ -251,14 +251,15 @@ impl Workspace {
     }
 
     fn run_git<const N: usize>(&self, arguments: [&str; N]) -> Result<String, String> {
-        let output = Command::new("git")
+        let mut process = Command::new("git");
+        process
             .arg("--no-pager")
             .args(arguments)
             .current_dir(&self.root)
             .env_clear()
-            .env("PATH", default_path())
-            .output()
-            .map_err(|error| error.to_string())?;
+            .env("PATH", default_path());
+        apply_windows_environment(&mut process);
+        let output = process.output().map_err(|error| error.to_string())?;
         let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&output.stderr));
         if output.status.success() {
@@ -274,6 +275,17 @@ const fn default_path() -> &'static str {
         "C:\\Windows\\System32"
     } else {
         "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    }
+}
+
+/// After `env_clear`, cmd.exe pipelines and many Windows programs fail
+/// without `SystemRoot` and `ComSpec`; restore just those two.
+pub(crate) fn apply_windows_environment(process: &mut Command) {
+    if cfg!(windows) {
+        if let Ok(system_root) = std::env::var("SystemRoot") {
+            process.env("ComSpec", format!("{system_root}\\System32\\cmd.exe"));
+            process.env("SystemRoot", system_root);
+        }
     }
 }
 

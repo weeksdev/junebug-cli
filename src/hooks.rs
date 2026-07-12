@@ -43,12 +43,12 @@ pub fn run(workspace: &Path, command: &str) -> Result<(), String> {
         process.args(["-c", command]);
         process
     };
-    let output = process
+    process
         .current_dir(workspace)
         .env_clear()
-        .env("PATH", default_path())
-        .output()
-        .map_err(|error| error.to_string())?;
+        .env("PATH", default_path());
+    crate::tool::apply_windows_environment(&mut process);
+    let output = process.output().map_err(|error| error.to_string())?;
     if output.status.success() {
         Ok(())
     } else {
