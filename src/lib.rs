@@ -2,7 +2,10 @@
 //! app-server interfaces all use the same provider and policy boundaries.
 
 pub mod agent;
+pub mod checkpoint;
+pub mod config;
 pub mod context;
+pub mod diff;
 pub mod editor;
 pub mod hooks;
 pub mod instructions;
@@ -10,7 +13,9 @@ pub mod markdown;
 pub mod mcp;
 pub mod policy;
 pub mod provider;
+pub mod router;
 pub mod session;
+pub mod swarm;
 pub mod tool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

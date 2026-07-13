@@ -31,6 +31,11 @@ impl PolicyEngine {
         }
     }
 
+    #[must_use]
+    pub const fn plan_mode(self) -> bool {
+        self.plan_mode
+    }
+
     /// Decide how a tool call of the given risk class should be handled.
     ///
     /// Plan mode is a hard guard: it denies every write/execute/network risk

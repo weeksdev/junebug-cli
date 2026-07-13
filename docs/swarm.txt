@@ -1,0 +1,1042 @@
+The hallucination that didn't matter
+0:00
+The number one thing that people tell me
+0:02
+about AI agents is that they cannot
+0:04
+trust them, that they hallucinate. And
+0:06
+you know what? You're right. They do.
+0:08
+Yesterday, one of mine hallucinated my
+0:11
+own wife's words while it was rebuilding
+0:14
+her website. And here's the thing. I
+0:16
+didn't have to correct it. I didn't have
+0:18
+to fix it. I didn't have to lift a
+0:20
+finger because my multi- aent system
+0:24
+caught it for free. And it not only
+0:26
+caught it, it got it fixed. The site
+0:28
+shipped and it made a better site. That
+0:31
+multi-agent swarm that I'm going to show
+0:32
+you made a better site in one hour than
+0:35
+I was able to make in six days with
+0:37
+hands-on AI work with Codeex last month.
+0:40
+So, did the hallucination still happen?
+0:43
+Yeah. Yeah, it did. Is that increasingly
+0:45
+not the point? Yeah, it's not the point
+0:47
+anymore. The larger takeaway for you is
+0:50
+that running a team of AI agents has not
+0:53
+only never been easier, it's actually
+0:55
+become something that any of us can do
+0:58
+and it's become something that allows us
+1:00
+to answer one of the hardest and most
+1:02
+bedeing problems in AI work today. How
+1:05
+do you get models to do real big work
+1:08
+without lying and hallucinating along
+1:10
+the way? So, let's jump into it. How to
+1:12
+structure your team of agents, which
+1:13
+model gets which job, and how to think
+1:15
+about it. how to check everything
+1:17
+without reading any of the individual
+1:19
+mistakes, errors, and results of those
+1:22
+models. And most important, how to
+1:24
+prompt for work this big. Along the way,
+1:26
+you're going to watch the system catch
+1:28
+four distinct failures. Each one is
+1:30
+actually bigger than the last. I don't
+1:32
+have to catch any of them. And the last
+1:34
+one, it's a little bit of a surprise. I
+1:36
+cannot wait to show you. And I'm going
+1:37
+to show you at the end also a full guide
+1:40
+with a one-click setup that gets your
+1:41
+own agent running in this exact
+1:43
+orchestration pattern. And that's it's
+1:45
+not a flex, guys. It's actually a
+1:47
+recipe. Multi- aent setups are a recipe
+1:49
+and you can grab that. So, I'll put that
+1:52
+link in the video and we're going to get
+1:54
+into it. I'm going to show you the full
+1:55
+setup and how it works. The website of
+Elsa's website and the 6-day baseline
+1:57
+Elsa Hunison. She's a deaf blind author.
+1:59
+She's a Hugo winner, subject of the PBS
+2:01
+documentary. And this is going to matter
+2:04
+later. She has been doing accessibility
+2:06
+work professionally for over a decade.
+2:07
+Her new book, Dear Blind Lady, launches
+2:09
+in October, which means her website is
+2:11
+not a hobby at this point. It's a
+2:12
+storefront for launch season. And I'm
+2:14
+telling you all of this with her
+2:15
+permission because she's my wife and
+2:17
+it's her story too. Now a month ago,
+2:19
+Elsa rebuilt this site herself and you
+2:21
+can see how it used to look. She used
+2:23
+codeex 5.5 one agent and she sat with
+2:26
+it. She steered it and you know to be
+2:28
+honest that's the state-of-the-art for
+2:29
+how a lot of capable people use AI
+2:31
+today. And it took her 6 days to work
+2:34
+through that. Now 6 days working with an
+2:36
+AI as a professional who knows what she
+2:38
+wants and at the end of it also told me
+2:40
+she still had a fix list. So, it's six
+2:42
+days working with an AI back and forth
+2:44
+in the midst of everything else like so
+2:46
+many of us do and still not quite
+2:48
+getting what we want. But to be fair,
+2:51
+the codeex built website shipped. It was
+2:53
+a ton better than it was before. And she
+2:55
+was pretty happy with it until I said,
+2:56
+"Please, can we use this as an
+2:58
+experiment for my multi- aent system?
+3:01
+Can I see if I could beat it?" And she
+3:03
+kindly said, "Yes." Now, as an
+3:04
+accessibility professional, you might
+3:06
+think, well, the original website at
+3:08
+least had perfect accessibility. But
+3:11
+anyone who is a professional will know
+3:13
+that they never have time for their own
+3:15
+stuff. And that was true for this
+3:16
+website, too. Elsa had a long fixed list
+3:18
+around accessibility that she just
+3:20
+hadn't had time to get to for her own
+3:22
+site. Even though she knows the standard
+3:23
+cult, she could write the checklist from
+3:25
+memory, but the hours just weren't
+3:27
+there. If that sounds familiar to you,
+3:29
+you're not alone. So yesterday, the team
+The build: a boss, 4 model families, 34 checked tasks
+3:31
+of agents that we hired for this, and
+3:34
+this is the way I think about it now. We
+3:35
+basically have a team of agents that
+3:37
+work for us. They took her site from a
+3:39
+blank repo to production. And the build
+3:41
+looked like this. We have a boss. We
+3:44
+have a foreman. That's Claude Fable 5.
+3:46
+Claude Fable 5 never wrote a single
+3:48
+page. Instead, the work was staffed by
+3:50
+four cheaper model families that did all
+3:52
+the work. They wrote everything. They
+3:53
+had 34 tasks. Every single one was
+3:55
+checked not by me, not by Elsa, but by a
+3:58
+machine. And 12 of those tasks were
+4:01
+caught and sent back for rework. Now,
+4:03
+the hallucination I told you about that
+4:04
+got handled as the first of four big
+4:06
+mistakes along the way. We're going to
+4:08
+get to the other three in a minute. And
+4:09
+what Elsa said when she saw the finished
+4:11
+site, and I'll and I'll share that with
+4:12
+you at the end. It made my whole day. It
+4:15
+was one of the reasons I do what I do.
+4:17
+So, I'll I'll share that at the end. All
+The audition: hiring agents with a tryout
+4:18
+right. I told you I think of these
+4:20
+agents as teams that were hiring. And
+4:21
+so, the first job that I had to do was
+4:24
+do some hiring for agents. Two of the
+4:26
+models I wanted for speed had never
+4:28
+worked in a swarm system that I had put
+4:31
+together before. So, I had to give them
+4:33
+an audition, an actual try out task. I
+4:35
+asked them to write five tagline
+4:37
+candidates for the book's pre-order
+4:38
+page. Exactly five, 12 words or fewer in
+4:41
+the script that automatically rejected
+4:43
+cheesy words, right? Inspiring stuff
+4:45
+that Elsa would reject because it just
+4:47
+didn't match her voice. One model passed
+4:49
+this entire exercise in just 29 seconds.
+4:53
+And both models made the team. And by
+4:55
+the way, the winning line for the
+4:56
+record, "You didn't know you needed
+4:58
+this. Pre-order before she changes her
+5:00
+mind." A little bit snarky. and else it
+5:02
+is snarky. Now, why am I showing you a
+5:04
+try out? Because it tells you what this
+5:06
+system actually is. It's not one genius
+5:09
+AI doing everything. It's an org chart.
+5:12
+And the org chart is the first
+5:14
+structural move that you need to
+5:16
+understand to replicate this at home.
+The org chart and the honest cost breakdown
+5:18
+Here's the thing about AI models in mid
+5:20
+2026. Intelligence comes in price tiers
+5:24
+now, and the spread is just absolutely
+5:26
+insane. At the top, you have Claude
+5:28
+Fable 5. that costs 50 bucks per million
+5:30
+tokens of output and it's worth it for
+5:32
+the right work. At the bottom you have
+5:34
+models like GLM 5.2 that can code all
+5:36
+day for pennies. So you staff this work
+5:39
+the way any functional company staffs.
+5:41
+The expensive mind is taking the boss
+5:43
+role. It writes the specs. It designs
+5:45
+the system. It reviews the work. It
+5:47
+rules on disputes. And it never ever
+5:49
+codes. The coding work goes to the
+5:50
+cheapest worker in the stack as long as
+5:53
+they have clear specs. Now, I want to
+5:55
+give you a really honest breakdown of
+5:57
+how much I saved doing that. So, in
+5:59
+total, this project burned between 11
+6:01
+and 13 million tokens. If I run those
+6:04
+same tokens through the Fable model all
+6:07
+by itself, same job, same afternoon, I
+6:10
+am estimating between $85 and $105 in
+6:14
+costs. Now, if I run it through the org
+6:16
+chart that I just showed you, it's $2.74
+6:19
+on the meter. It's five to seven bucks
+6:22
+all in once you factor in the audio,
+6:24
+which I'll get to in a moment. And I'm
+6:26
+going to round it up to eight because
+6:27
+I'd rather round against myself. It's
+6:29
+the same work. It's a 10 plus multiple
+6:32
+price gap and nothing got worse. In
+6:35
+fact, Fable did more judging, not less.
+6:37
+And once you see that, I certainly read
+6:40
+every company torches its AI budget
+6:42
+stories really differently because now I
+6:44
+have a really simple question. What were
+6:46
+you doing with your routing? Who was
+6:48
+doing all the coding for you? Almost
+6:50
+every horror story has the same answer.
+6:52
+Somebody had not built a router and was
+6:55
+allowing engineers to assign the most
+6:57
+expensive model to do everything. And
+6:59
+that is not an AI problem. That is an
+7:01
+org design problem. And you literally
+7:04
+just watch the fix. But hold on. Cheap
+7:06
+workers doing the work unsupervised
+7:08
+ought to worry, right? That's exactly
+7:10
+what you worry about. Pattern three, and
+Every task ships with an executed check
+7:12
+I'm going to say it in one sentence.
+7:14
+Every single task ships with a checking
+7:17
+agent job that executes the work and
+7:20
+does not consider the worker agents own
+7:23
+report at all. So builds might get
+7:25
+compiled. Uh cited URLs can get
+7:28
+refetched and rematched. Audio files can
+7:30
+get reme-measured against the text.
+7:32
+Accessibility gets tested in a real
+7:34
+actual browser on light mode or dark
+7:36
+mode. Every single route you can think
+7:38
+of. The worker can say done, but the
+7:41
+checking agent decides whether that's
+7:43
+true. Now, let me get into that
+7:46
+hallucination story in a little bit more
+7:48
+depth here. Now, catch one, the
+Catch 1: the hallucinated quotes
+7:50
+hallucination. The capture agent's job
+7:53
+was very simple. Grab Elsa's words
+7:55
+verbatim and come back and literally
+7:58
+give quotes back into the system for
+8:00
+more tasks down the road. It came back
+8:01
+with 213 quotes, all of which it said
+8:05
+were verified. But the checking agent
+8:08
+didn't believe that. The checking agent
+8:09
+recompared every quote, character for
+8:12
+character, curly quotes included,
+8:14
+against the current live site, and found
+8:16
+that 13 of them had been stitched
+8:18
+together or paraphrased by the agent
+8:20
+that was supposed to just retrieve
+8:22
+quotes. It was close enough to fool
+8:23
+anyone skimming, which is what makes it
+8:25
+very dangerous, right? Elsa's words are
+8:27
+her product as a writer, and close
+8:29
+enough is not acceptable. So, the
+8:31
+failures went back to the worker, and it
+8:33
+was not told to try again. It was told
+8:35
+here is precisely what is wrong by the
+8:37
+checker agent and then attempt two came
+8:39
+back perfect. Total human involvement
+8:41
+zero. And that's the loop. You execute,
+8:44
+you fail specifically, an agent gives
+8:47
+feedback and you retry until true. And
+8:49
+if you're thinking, okay, fine. Checks
+8:50
+can catch sloppy work. Sure, but watch
+8:53
+what happens as the afternoon build goes
+8:56
+by. Because because the hallucination
+8:58
+was the easy case. Catch number two, the
+Catch 2: the worker that cheated
+9:00
+worker that cheated. Late in the build,
+9:02
+a worker agent needed to get one of
+9:04
+Elsa's required passages onto a web page
+9:07
+to pass its check. So, it hid the text
+9:10
+inside an invisible paragraph. It's
+9:12
+invisible to you, but it's not invisible
+9:14
+to a screen reader where it becomes
+9:16
+meaningless noise read aloud to a blind
+9:18
+visitor because it's completely out of
+9:20
+context. So, think about it this way.
+9:22
+The AI agent that was a worker chose a
+9:24
+shortcut that is cosmetically fine
+9:26
+because you'd never see it with your
+9:28
+eyes, but it's harmful to precisely the
+9:30
+people the site is for, blind people.
+9:32
+And we're not done yet. Another worker
+9:34
+satisfied a hard layout requirement with
+9:37
+a literal empty element, and that was
+9:39
+caught by an accessibility agent check.
+9:42
+So, look, cheap workers cut corners. We
+9:45
+price that into the system, and the
+9:47
+system isn't built on trusting them.
+9:49
+It's built so that the cut corners don't
+9:52
+survive these checks. And by the way,
+9:54
+both of those checks, again, caught by
+9:56
+agents designed to check the work. This
+Catch 3: the boss's own bug
+9:59
+one surprised me. Fable 5, the boss, the
+10:01
+designer of this whole system, the $50
+10:04
+model, the one that designed this entire
+10:06
+site itself, it wrote a bug, a CSS bug,
+10:10
+a dark mode rule that made the pre-order
+10:12
+button invisible. The single most
+10:14
+important button on an author's website
+10:16
+in launch season, gone on the boss's own
+10:18
+design, and it got caught twice
+10:20
+independently. Once by the accessibility
+10:22
+agent checker and once by the boss's own
+10:25
+review pass. The loop that we are
+10:27
+building here does not care about the
+10:29
+org chart. There is no rank in this
+10:31
+system high enough to avoid
+10:33
+verification. And that's a really
+10:35
+important principle of agent design.
+10:36
+Okay. Catch number four. The one the
+Catch 4: who checks the checkers
+10:38
+skeptics out there are waiting for.
+10:40
+Because the sharpest objection to
+10:41
+everything I've just shared with you is
+10:43
+who checks the checker agents? And we
+10:45
+answered that one, too. Now, here's the
+10:47
+story. A worker agent in the build got
+10:49
+failed by a checker agent for delivering
+10:52
+news posts that were too short under a
+10:54
+length floor that the check enforced.
+10:56
+Except those posts really are that short
+11:00
+on Elsa's website. So they're real and
+11:03
+they're short because they're
+11:04
+announcements. They don't need to be
+11:05
+long. The spec itself said that honesty
+11:08
+beats padding. And so when the worker
+11:11
+agent escalated the dispute to the boss
+11:14
+agent, yes, this really happened. Fable
+11:17
+5 came back in favor of the worker and
+11:20
+the checker agent got corrected.
+11:22
+Failures get investigated in both
+11:24
+directions. So let's look at the ladder
+11:27
+that we just climbed together. The
+11:29
+worker agent gets caught, the cheater
+11:31
+gets caught, the boss gets caught, and
+11:34
+the checker agent gets caught. Those are
+11:36
+four different rungs in the system. And
+11:38
+in every single case, the answer to who
+11:41
+watches that turns out to be the system
+11:43
+does if you design it right. And that
+11:46
+not any model release that is what has
+11:49
+changed agents this year. And I want to
+11:51
+be really clear about something. None of
+11:53
+this required a lab or a team or custom
+11:55
+research with Fable 5 doing the
+11:57
+orchestration. This is just a recipe.
+11:59
+It's it's written down. I I've linked it
+12:01
+below. Hallucination isn't solved. It's
+12:04
+just structurally positioned out of the
+12:06
+picture because we've designed systems
+12:08
+that are anti-h hallucination at root.
+12:10
+Hallucination didn't get solved per se.
+12:13
+It got handled structurally and you can
+12:16
+design and run the structure. Which
+12:17
+brings us to the larger point of this
+12:19
+entire video because all of this
+12:21
+machinery was in service of a website
+12:23
+for a deaf blind author in launch season
+12:26
+and what it built is the thing that
+12:28
+surprised me and honestly shocked Elsa.
+12:30
+So as an example, large print is an
+12:32
+aesthetic statement. The body font that
+12:35
+Fable chose is Atkinson hyperled
+12:37
+legible. It's designed by the Braille
+12:38
+Institute to be extremely readable. the
+12:41
+site's signature divider. That was also
+12:43
+Fable's idea. It's a white cane with a
+The constitution: how to prompt for big work
+12:45
+red tip. And that brings us to the last
+12:47
+pattern, the one that so many of us miss
+12:49
+because it's the answer to how do you
+12:51
+even prompt it to do something like this
+12:53
+cool, right? And the answer is you
+12:55
+don't. Not task by task. Before a single
+12:59
+page existed, the research phase
+13:01
+produced a 14-point accessibility
+13:03
+constitution for this website, a written
+13:06
+standard, and every build round got
+13:08
+tested against it in a real browser.
+13:10
+both themes, light and dark, every route
+13:12
+you could think of. And that should be
+13:14
+how you prompt for big work. You name
+13:17
+what done right means for you one time
+13:19
+at the top and the system enforces it on
+13:22
+every single round while you do
+13:24
+something else. And the prompt that's
+13:27
+not instructions, it's just a standard
+13:29
+plus a way to check it. And by the way,
+13:31
+in this case, the prompt given to Fable
+13:35
+was a prompt to produce a site. And the
+13:39
+comment given to Fable was to please
+13:42
+produce the site in line with
+13:43
+accessibility since of course that that
+13:46
+is aligned with what Elsa's mission is.
+13:48
+And Fable came up with the constitution.
+13:50
+Fable did the research. Fable organized
+13:53
+the workers to get all of that done. And
+13:54
+I was really careful here because I
+13:56
+didn't want Fable to take away Elsa's
+13:59
+voice in the rewrite. Elsa's words
+14:01
+shipped verbatim. There were 171
+14:03
+protected passages from the original
+14:05
+site that were all machine checked on
+14:07
+every build and all Fable did was
+14:10
+orchestrate writing in character
+14:12
+connective tissue between those passages
+14:15
+and then Elsa checked and validated it.
+14:17
+The persona that mattered the most to me
+14:18
+and Elsa was Maya, a blind reader on
+14:21
+voice over with a braille display. She
+14:23
+asked for things that the original
+14:25
+design didn't want to give her, right?
+14:27
+navigable headings, meaningful link
+14:29
+text, a real image description instead
+14:31
+of a joke, and she outranked the design.
+14:33
+All of what she wanted shipped. And
+14:36
+Fable went so far as to test as Maya to
+14:40
+make sure that her experience was good
+14:42
+and went to the trouble of creating a
+14:45
+spoken voice over of the site that she
+14:49
+could play to help her understand the
+14:51
+site, which is something Elsa's always
+14:52
+dreamed of and never had time to put
+14:54
+together. Now, Elsa's the real judge
+Elsa's verdict and where this leaves you
+14:56
+here, and she looked through the
+14:57
+finished site, and as someone with
+15:00
+professional accessibility work under
+15:02
+her belt, she was shocked because she
+15:06
+gave this build nothing. There was no
+15:07
+brief, there was no brand notes. Uh she
+15:10
+it was it was like a five-word prompt,
+15:12
+right? And I just ran with it with with
+15:14
+a team of agents. And it learned to use
+15:17
+her color palette, it learned her voice,
+15:19
+it learned her book cover, and it went
+15:22
+all the way to a W keg 2.2 2A standard,
+15:25
+which is something that very few
+15:27
+websites in the world actually beat. And
+15:29
+so this is something that instead of
+15:30
+taking 6 days for her with one agent
+15:33
+last month, took an hour and a half or
+15:36
+so, maybe 2 and 1/2 hours at 8 bucks.
+15:39
+And Elsa's assessment is that this site
+15:41
+is so much better than the last one. So
+15:44
+it's cheaper, it took less time, it's
+15:46
+way better. Why aren't we using more
+15:48
+multi- aent systems? And I think the
+15:51
+answer is really simple. It's scary.
+15:53
+It's hard. It feels intimidating to look
+15:57
+at 20 agents. And that is what I am
+16:00
+trying to to take away as an objection
+16:03
+with this video. It is not hard to do
+16:05
+multi- aent systems, especially not in
+16:08
+MIT 2026. We have recipes now to do work
+16:11
+like this that we never had before. And
+16:14
+the whole reason we do it that way is so
+16:17
+you can skip the plumbing and start
+16:19
+working on your first job. And that's
+16:21
+where I want to leave you. If this is so
+16:25
+easy that we can all do it, then it's
+16:29
+just about making sure that we
+16:32
+understand the kinds of tasks we can ask
+16:35
+agents to do. And that's actually one of
+16:37
+Elsa's takeaways. She and I were talking
+16:39
+after the website and she was telling
+16:41
+me, "I didn't realize that multi-agent
+16:44
+systems make such a massive difference
+16:48
+in the kinds of work you can get done
+16:50
+and I need to start thinking bigger
+16:52
+about how much work I give multi- aent
+16:54
+systems." That's really true. I if you
+16:57
+are thinking of a piece of work and
+16:58
+you're like, I don't know if AI can do
+17:00
+it or if it feels too big. I'm trying to
+17:03
+put together a tool set here that you
+17:05
+can use to get that work done. And if
+17:08
+you don't touch a terminal, this one's
+17:10
+for you because Elsa doesn't touch a
+17:12
+terminal either, right? Elsa doesn't
+17:14
+feel super comfortable running swarms. I
+17:17
+wanted to take a noncode ccentric task.
+17:20
+Yes, I know code was used in the
+17:21
+website, but it's not centered around
+17:23
+code. It's centered around the value of
+17:25
+telling Elsa's story on the web. And I
+17:27
+wanted to make sure that I could show
+17:29
+that multiple agents help tell that
+17:32
+story in a way that you just can't get
+17:34
+to even with a frontier agent doing
+17:37
+really good work even in a great harness
+17:39
+like Codeex. This multi- aent pattern is
+17:42
+very close to hitting mainstream. I'm
+17:44
+sharing it with you because it's just
+17:46
+breaking out of engineering circles now
+17:48
+and I want you to be the first to grab
+17:49
+it. When it breaks loose, the headlines
+17:52
+are going to look like, "Hey, AI built
+17:54
+this website for eight bucks." I don't
+17:56
+think that's the right headline. I think
+17:58
+a better headline is that we are now
+18:01
+able to delegate bigger, more muscular,
+18:04
+more ambitious tasks to AI and as a
+18:08
+result, we can get more done. Elsa
+18:10
+always wanted an accessible website, but
+18:12
+she was so busy bringing accessibility
+18:14
+to others, she didn't have time to
+18:16
+actually sort it out for herself, so the
+18:18
+agents did. And I think that when you
+18:20
+think of that kind of work in your
+18:22
+world, whatever it is for you, it might
+18:24
+not be accessibility, it might be
+18:26
+anything else under the sun that you
+18:27
+think you can tackle with computing with
+18:30
+agents, this is what you can use to do
+18:34
+that affordably. And yes, you can use
+18:36
+the power of Fable to get there without
+18:39
+the money that Fable would otherwise be
+18:41
+spending. Who wants to spend a hundred
+18:43
+bucks when you could be spending eight,
+18:45
+right? Like you don't want to do that.
+18:47
+So you might only be one afternoon away
+18:50
+from that work that you want done. And
+18:51
+it's not because the models got magical.
+18:54
+It's because actually orchestrating
+18:57
+multi- aent systems has gotten simple
+18:59
+enough that I can talk about this and
+19:01
+share this and it's really very doable.
+19:04
+And that's happened like really in the
+19:05
+last 30 days or so. So have fun. Go jump
+19:08
+into it and tell me what you build with
+19:10
+your multi- aent system. I can't wait to
+19:12
+hear

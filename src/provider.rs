@@ -42,6 +42,7 @@ pub trait ModelProvider {
     /// Returns an error for transport, protocol, or provider failures.
     fn stream_turn(
         &self,
+        model: &str,
         messages: &[Value],
         tools: &[Value],
         cancel: &AtomicBool,
@@ -141,6 +142,30 @@ pub struct OpenAiCompatibleProvider {
     api_key: String,
     model: String,
     client: Client,
+}
+
+pub struct ProviderRegistry {
+    providers: BTreeMap<&'static str, OpenAiCompatibleProvider>,
+}
+
+impl ProviderRegistry {
+    #[must_use]
+    pub fn from_available() -> Self {
+        let providers = available_providers()
+            .into_iter()
+            .filter_map(|kind| {
+                OpenAiCompatibleProvider::from_environment(kind, None)
+                    .ok()
+                    .map(|provider| (kind.name(), provider))
+            })
+            .collect();
+        Self { providers }
+    }
+
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&OpenAiCompatibleProvider> {
+        self.providers.get(name)
+    }
 }
 
 impl OpenAiCompatibleProvider {
@@ -304,11 +329,12 @@ impl ModelProvider for OpenAiCompatibleProvider {
 
     fn stream_turn(
         &self,
+        model: &str,
         messages: &[Value],
         tools: &[Value],
         cancel: &AtomicBool,
     ) -> Result<ModelTurn, String> {
-        let mut body = json!({"model": self.model, "stream": true, "stream_options": {"include_usage": true}, "messages": messages});
+        let mut body = json!({"model": model, "stream": true, "stream_options": {"include_usage": true}, "messages": messages});
         // OpenAI-compatible endpoints reject an empty tools array, so only
         // send the fields when at least one tool is offered.
         if !tools.is_empty() {

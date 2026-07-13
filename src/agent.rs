@@ -11,6 +11,7 @@ use crate::context;
 use crate::mcp;
 use crate::policy::{Decision, PolicyEngine};
 use crate::provider::{ModelProvider, ToolCall};
+use crate::router::RouteDecision;
 use crate::session::SessionWriter;
 use crate::tool::{BUILTIN_TOOLS, ToolRisk, Workspace};
 
@@ -19,11 +20,58 @@ pub struct McpClient {
     pub client: mcp::Client,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LoopOutcome {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub interrupted: bool,
+    pub provider: String,
+    pub model: String,
+    pub band: Option<String>,
+    pub switches: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TurnState {
+    pub turn_index: usize,
+    pub turns_remaining: usize,
+    pub consecutive_tool_failures: usize,
+}
+
+pub struct Selection<'a> {
+    pub provider: &'a dyn ModelProvider,
+    pub provider_name: &'a str,
+    pub model: &'a str,
+    pub decision: Option<RouteDecision>,
+}
+
+pub trait ModelSource {
+    /// # Errors
+    /// Returns an error when no usable provider/model can be selected.
+    fn next(&mut self, state: &TurnState) -> Result<Selection<'_>, String>;
+}
+
+pub struct PinnedModel<'a> {
+    provider: &'a dyn ModelProvider,
+    model: &'a str,
+}
+
+impl<'a> PinnedModel<'a> {
+    #[must_use]
+    pub const fn new(provider: &'a dyn ModelProvider, model: &'a str) -> Self {
+        Self { provider, model }
+    }
+}
+
+impl ModelSource for PinnedModel<'_> {
+    fn next(&mut self, _state: &TurnState) -> Result<Selection<'_>, String> {
+        Ok(Selection {
+            provider: self.provider,
+            provider_name: self.provider.name(),
+            model: self.model,
+            decision: None,
+        })
+    }
 }
 
 /// UI callbacks for one agent turn. Implementations render streamed text,
@@ -32,6 +80,10 @@ pub trait TurnObserver {
     fn on_text(&mut self, text: &str);
     fn on_tool_call(&mut self, name: &str, arguments: &str);
     fn on_tool_result(&mut self, name: &str, result: &str);
+    fn on_route_changed(&mut self, _decision: &RouteDecision) {}
+    /// Line diff of a completed file write. UI-only: it is never added to
+    /// the model context.
+    fn on_file_diff(&mut self, _path: &str, _diff: &str) {}
 }
 
 /// Run the model-driven tool loop until the model stops requesting tools or
@@ -46,9 +98,9 @@ pub trait TurnObserver {
 ///
 /// Never panics in practice: the assistant message it unwraps was pushed
 /// onto `messages` immediately beforehand in this same function.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn run_loop(
-    provider: &dyn ModelProvider,
+    source: &mut dyn ModelSource,
     workspace: &Workspace,
     tools: &[Value],
     policy: &PolicyEngine,
@@ -56,20 +108,30 @@ pub fn run_loop(
     mcp_clients: &mut [McpClient],
     session: &SessionWriter,
     approve: &mut dyn FnMut(&str) -> bool,
+    checkpoint: &mut dyn FnMut(&str),
     max_context_chars: usize,
-    max_turns: u8,
+    max_turns: usize,
     cancel: &AtomicBool,
     observer: &mut dyn TurnObserver,
 ) -> Result<LoopOutcome, String> {
     let mut input_tokens = 0;
     let mut output_tokens = 0;
-    for _ in 0..max_turns {
+    let mut consecutive_tool_failures = 0;
+    let mut last_provider = String::new();
+    let mut last_model = String::new();
+    let mut last_band = None;
+    let mut switches = 0;
+    for turn_index in 0..max_turns {
         if cancel.load(Ordering::Relaxed) {
             session.record("interrupted", "before model turn")?;
             return Ok(LoopOutcome {
                 input_tokens,
                 output_tokens,
                 interrupted: true,
+                provider: last_provider,
+                model: last_model,
+                band: last_band,
+                switches,
             });
         }
         let request_messages = context::compact(messages, max_context_chars);
@@ -79,7 +141,36 @@ pub fn run_loop(
                 &format!("{} to {} messages", messages.len(), request_messages.len()),
             )?;
         }
-        let turn = provider.stream_turn(&request_messages, tools, cancel)?;
+        let selection = source.next(&TurnState {
+            turn_index,
+            turns_remaining: max_turns - turn_index,
+            consecutive_tool_failures,
+        })?;
+        selection.provider_name.clone_into(&mut last_provider);
+        selection.model.clone_into(&mut last_model);
+        if let Some(decision) = selection.decision.as_ref() {
+            let event = if decision.switch {
+                "route_changed"
+            } else {
+                "route_selected"
+            };
+            session.record(
+                event,
+                &format!(
+                    "{}:{}:{:?}",
+                    decision.route.provider, decision.route.model, decision.band
+                ),
+            )?;
+            observer.on_route_changed(decision);
+            last_band = Some(format!("{:?}", decision.band).to_lowercase());
+            if decision.switch {
+                switches += 1;
+            }
+        }
+        let turn =
+            selection
+                .provider
+                .stream_turn(selection.model, &request_messages, tools, cancel)?;
         input_tokens = input_tokens.max(turn.input_tokens);
         output_tokens += turn.output_tokens;
         for text in &turn.text_deltas {
@@ -102,20 +193,40 @@ pub fn run_loop(
                 input_tokens,
                 output_tokens,
                 interrupted,
+                provider: last_provider,
+                model: last_model,
+                band: last_band,
+                switches,
             });
         }
         for call in turn.tool_calls {
             // A tool result must be recorded for every declared call even
             // after an interrupt, or the next request would be rejected for
             // pairing a dangling tool_calls message.
+            // Capture the pre-write content before the tool runs so the
+            // observer can show what actually changed.
+            let write_preview = write_preview(workspace, &call);
             let result = if cancel.load(Ordering::Relaxed) {
                 "ERROR: interrupted by user".to_owned()
             } else {
                 observer.on_tool_call(&call.name, &call.arguments);
-                execute_tool(workspace, &call, policy, approve, mcp_clients)
+                execute_tool(workspace, &call, policy, approve, checkpoint, mcp_clients)
             };
             session.record("tool_result", &format!("{}: {result}", call.name))?;
             observer.on_tool_result(&call.name, &result);
+            if let Some((path, old, new)) = write_preview
+                && !result.starts_with("ERROR")
+            {
+                let rendered = crate::diff::unified(&old, &new);
+                if !rendered.is_empty() {
+                    observer.on_file_diff(&path, &rendered);
+                }
+            }
+            if result.starts_with("ERROR:") {
+                consecutive_tool_failures += 1;
+            } else {
+                consecutive_tool_failures = 0;
+            }
             let tool_message = json!({"role": "tool", "tool_call_id": call.id, "content": result});
             session.record_message(&tool_message)?;
             messages.push(tool_message);
@@ -137,7 +248,44 @@ fn tool_risk(name: &str) -> Option<ToolRisk> {
         .map(|definition| definition.risk)
 }
 
-fn approval_prompt(call: &ToolCall, arguments: &Value, path: &str) -> String {
+/// For a `write_file` call, the path plus old and new content, captured
+/// before the write so a diff can be shown afterwards. `None` for other
+/// tools or unparsable arguments.
+fn write_preview(workspace: &Workspace, call: &ToolCall) -> Option<(String, String, String)> {
+    if call.name != "write_file" {
+        return None;
+    }
+    let arguments: Value = serde_json::from_str(&call.arguments).ok()?;
+    let path = arguments.get("path")?.as_str()?.to_owned();
+    let new = arguments.get("content")?.as_str()?.to_owned();
+    let old = workspace.read_file(Path::new(&path)).unwrap_or_default();
+    Some((path, old, new))
+}
+
+/// Label recorded on the checkpoint taken before a mutating tool runs.
+fn checkpoint_label(call: &ToolCall, arguments: &Value, path: &str) -> String {
+    let detail = match call.name.as_str() {
+        "write_file" => path,
+        "run_command" => arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        _ => "",
+    };
+    if detail.is_empty() {
+        format!("before {}", call.name)
+    } else {
+        let detail: String = detail.chars().take(60).collect();
+        format!("before {}: {detail}", call.name)
+    }
+}
+
+fn approval_prompt(
+    workspace: &Workspace,
+    call: &ToolCall,
+    arguments: &Value,
+    path: &str,
+) -> String {
     if let Some((server, tool)) = call
         .name
         .strip_prefix("mcp__")
@@ -156,11 +304,20 @@ fn approval_prompt(call: &ToolCall, arguments: &Value, path: &str) -> String {
     }
     match call.name.as_str() {
         "write_file" => {
-            let bytes = arguments
+            let content = arguments
                 .get("content")
                 .and_then(Value::as_str)
-                .map_or(0, str::len);
-            format!("Febo requests write access: {path} ({bytes} bytes)")
+                .unwrap_or("");
+            let old = workspace.read_file(Path::new(path)).unwrap_or_default();
+            let diff = crate::diff::clip(&crate::diff::unified(&old, content), 40);
+            if diff.is_empty() {
+                format!(
+                    "Febo requests write access: {path} ({} bytes, no line changes)",
+                    content.len()
+                )
+            } else {
+                format!("Febo requests write access: {path}\n{diff}")
+            }
         }
         "run_command" => {
             let command = arguments
@@ -181,13 +338,16 @@ fn approval_prompt(call: &ToolCall, arguments: &Value, path: &str) -> String {
 /// Dispatch a single tool call, enforcing `policy` before any workspace,
 /// process, or MCP side effect. `approve` is only consulted when the policy
 /// decision is `Ask`; it must return `false` when approval cannot be
-/// obtained (e.g. non-interactive output).
+/// obtained (e.g. non-interactive output). `checkpoint` is invoked before
+/// any permitted mutating tool runs so the prior state can be rewound; it
+/// must never block or fail the tool.
 #[must_use]
 pub fn execute_tool(
     workspace: &Workspace,
     call: &ToolCall,
     policy: &PolicyEngine,
     approve: &mut dyn FnMut(&str) -> bool,
+    checkpoint: &mut dyn FnMut(&str),
     mcp_clients: &mut [McpClient],
 ) -> String {
     let arguments: Value = match serde_json::from_str(&call.arguments) {
@@ -201,11 +361,14 @@ pub fn execute_tool(
     match policy.evaluate(risk) {
         Decision::Deny => return "ERROR: denied by permission policy".to_owned(),
         Decision::Ask => {
-            if !approve(&approval_prompt(call, &arguments, path)) {
+            if !approve(&approval_prompt(workspace, call, &arguments, path)) {
                 return "ERROR: denied by permission policy".to_owned();
             }
         }
         Decision::Allow => {}
+    }
+    if risk != ToolRisk::Read {
+        checkpoint(&checkpoint_label(call, &arguments, path));
     }
     let result = if let Some((server, tool)) = call
         .name
@@ -279,9 +442,47 @@ mod tests {
             &call("does_not_exist", "{}"),
             &policy,
             &mut approve,
+            &mut |_: &str| {},
             &mut [],
         );
         assert!(result.contains("unknown tool"));
+    }
+
+    #[test]
+    fn write_approval_prompt_shows_the_line_diff() {
+        let root = std::env::temp_dir().join(format!(
+            "febo-approval-diff-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("workspace");
+        std::fs::write(root.join("notes.txt"), "alpha\nbeta\n").expect("seed file");
+        let workspace = Workspace::new(root.clone());
+        let policy = PolicyEngine::new(PermissionMode::Ask, false);
+        let mut prompt_seen = String::new();
+        let mut approve = |message: &str| {
+            prompt_seen = message.to_owned();
+            false
+        };
+        let result = execute_tool(
+            &workspace,
+            &call(
+                "write_file",
+                r#"{"path":"notes.txt","content":"alpha\nBETA\n"}"#,
+            ),
+            &policy,
+            &mut approve,
+            &mut |_: &str| {},
+            &mut [],
+        );
+        assert_eq!(result, "ERROR: denied by permission policy");
+        assert!(
+            prompt_seen.contains("- beta") && prompt_seen.contains("+ BETA"),
+            "approval prompt must show what the write changes, got: {prompt_seen}"
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -296,6 +497,7 @@ mod tests {
             &call("mcp__docs__lookup", "{}"),
             &policy,
             &mut approve,
+            &mut |_: &str| {},
             &mut [],
         );
         assert_eq!(result, "ERROR: denied by permission policy");
@@ -315,6 +517,7 @@ mod tests {
             &call("run_command", r#"{"command":"rm -rf important"}"#),
             &policy,
             &mut approve,
+            &mut |_: &str| {},
             &mut [],
         );
         assert_eq!(result, "ERROR: denied by permission policy");
@@ -339,6 +542,7 @@ mod tests {
             &call("write_file", r#"{"path":"x.txt","content":"hi"}"#),
             &policy,
             &mut approve,
+            &mut |_: &str| {},
             &mut [],
         );
         assert_eq!(result, "ERROR: denied by permission policy");

@@ -9,23 +9,45 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 use febo_cli::agent::{self, McpClient, TurnObserver};
+use febo_cli::checkpoint::Checkpointer;
+use febo_cli::config::{self, RoutingConfig, RoutingMode};
 use febo_cli::editor::{self, Choice, Editor};
 use febo_cli::markdown;
 use febo_cli::policy::{PolicyEngine, parse_approval_answer};
 use febo_cli::provider::{ModelProvider, OpenAiCompatibleProvider, ProviderKind, store_credential};
+use febo_cli::router::{RouteDecision, RoutedModel};
 use febo_cli::session::{SessionWriter, load_messages};
+use febo_cli::swarm::{self, Ruling, SwarmRoles, Target, Verdict};
 use febo_cli::tool::Workspace;
 use febo_cli::{PermissionMode, context, hooks, instructions, mcp};
 use serde_json::{Value, json};
 
+enum ActiveSource<'a> {
+    Pinned(agent::PinnedModel<'a>),
+    Routed(Box<RoutedModel>),
+}
+
+impl agent::ModelSource for ActiveSource<'_> {
+    fn next(&mut self, state: &agent::TurnState) -> Result<agent::Selection<'_>, String> {
+        match self {
+            Self::Pinned(source) => source.next(state),
+            Self::Routed(source) => source.next(state),
+        }
+    }
+}
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const MAX_TURNS: u8 = 12;
+/// Runaway backstop, not a task limiter: a real task should never reach it.
+/// It only exists so an agent stuck repeating a failing tool call cannot
+/// burn API credits forever; Esc/Ctrl-C is the intended way to stop a turn.
+const MAX_TURNS: usize = 1000;
 const SYSTEM_PROMPT: &str = "You are Febo, a careful coding agent. Use tools to inspect the workspace before editing. Make only requested changes. Never claim a file was changed unless a tool result confirms it. Explain your final result concisely.";
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 const RED: &str = "\x1b[31m";
+const GREEN: &str = "\x1b[32m";
 const CYAN: &str = "\x1b[36m";
 const MAGENTA: &str = "\x1b[35m";
 const CLEAR_LINE: &str = "\r\x1b[2K";
@@ -47,6 +69,7 @@ struct Args {
     mcp: bool,
     plan: bool,
     set: bool,
+    checkpoints: bool,
 }
 
 fn main() {
@@ -102,6 +125,7 @@ fn parse_args(arguments: Vec<String>) -> Result<Option<Args>, String> {
     let mut hooks = false;
     let mut mcp = false;
     let mut plan = false;
+    let mut checkpoints = true;
     let mut prompt_parts = Vec::new();
     let mut index = 0;
     while index < arguments.len() {
@@ -170,6 +194,7 @@ fn parse_args(arguments: Vec<String>) -> Result<Option<Args>, String> {
             "--enable-hooks" => hooks = true,
             "--enable-mcp" => mcp = true,
             "--plan" => plan = true,
+            "--no-checkpoints" => checkpoints = false,
             value if value.starts_with('-') => return Err(format!("unknown option: {value}")),
             value => prompt_parts.push(value.to_owned()),
         }
@@ -193,6 +218,7 @@ fn parse_args(arguments: Vec<String>) -> Result<Option<Args>, String> {
         mcp,
         plan,
         set,
+        checkpoints,
     }))
 }
 
@@ -350,12 +376,42 @@ fn run(args: &Args) {
         exit_argument_error("a prompt is required when no interactive terminal is attached");
     }
     let root = env::current_dir().expect("current directory must be readable");
+    let config = config::load(&root).unwrap_or_else(|error| exit_argument_error(&error));
+    let routing_auto = args.model.as_deref() == Some("auto")
+        || (args.model.is_none() && config.routing.mode == RoutingMode::Auto);
     let kind = resolve_provider_kind(args, &root);
-    let mut provider = match OpenAiCompatibleProvider::from_environment(kind, args.model.clone()) {
+    // The model is sticky across sessions like the provider: an explicit
+    // --model wins, else the model in effect when the last session on this
+    // provider ended, else the provider default.
+    let pinned_model = args
+        .model
+        .clone()
+        .filter(|model| model != "auto")
+        .or_else(|| {
+            let sticky = febo_cli::session::last_model(&root, kind.name());
+            if let Some(model) = &sticky {
+                eprintln!("{DIM}using model {model} from your last session{RESET}");
+            }
+            sticky
+        });
+    let mut provider = match OpenAiCompatibleProvider::from_environment(kind, pinned_model) {
         Ok(provider) => provider,
         Err(error) => exit_argument_error(&error),
     };
     let workspace = Workspace::new(root.clone());
+    // Checkpoints are best-effort: without git (or with --no-checkpoints)
+    // Febo still runs, it just cannot rewind.
+    let checkpointer = if args.checkpoints {
+        match Checkpointer::new(&root) {
+            Ok(checkpointer) => Some(checkpointer),
+            Err(error) => {
+                eprintln!("{DIM}checkpoints unavailable: {error}{RESET}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     // Resolve which session to resume: an explicit path, the interactive
     // picker (--resume with no path), or a fresh session.
     let resume_path = if let Some(path) = args.resume.clone() {
@@ -375,9 +431,13 @@ fn run(args: &Args) {
         None => SessionWriter::create(&root),
     }
     .unwrap_or_else(|error| exit_runtime_error(&error));
-    // Record the provider so future runs can default to it.
+    // Record the provider and starting model so future runs default to them
+    // even when the model is never switched mid-session.
     session
         .record("provider", provider.name())
+        .unwrap_or_else(|error| exit_runtime_error(&error));
+    session
+        .record("model", provider.model())
         .unwrap_or_else(|error| exit_runtime_error(&error));
     if args.hooks {
         run_hooks(&root, "session_start", &session);
@@ -427,6 +487,9 @@ fn run(args: &Args) {
             &mut mcp_clients,
             &session,
             args,
+            &config.routing,
+            routing_auto,
+            checkpointer.as_ref(),
         );
     } else {
         let policy = PolicyEngine::new(args.permission, args.plan);
@@ -438,6 +501,11 @@ fn run(args: &Args) {
             let mut answer = String::new();
             io::stdin().read_line(&mut answer).is_ok() && parse_approval_answer(&answer)
         };
+        take_checkpoint(
+            checkpointer.as_ref(),
+            &session,
+            &format!("before prompt: {}", truncate_chars(&args.prompt, 48)),
+        );
         session
             .record("user_prompt", &args.prompt)
             .unwrap_or_else(|error| exit_runtime_error(&error));
@@ -448,8 +516,20 @@ fn run(args: &Args) {
         messages.push(user_message);
         let cancel = AtomicBool::new(false);
         let mut observer = PlainObserver { json: args.json };
+        let mut source = if routing_auto {
+            match RoutedModel::new(config.routing, &args.prompt, messages.len(), args.plan) {
+                Ok(source) => ActiveSource::Routed(Box::new(source)),
+                Err(error) => {
+                    eprintln!("{DIM}routing unavailable ({error}) — using pinned model{RESET}");
+                    ActiveSource::Pinned(agent::PinnedModel::new(&provider, provider.model()))
+                }
+            }
+        } else {
+            ActiveSource::Pinned(agent::PinnedModel::new(&provider, provider.model()))
+        };
+        let mut checkpoint = |label: &str| take_checkpoint(checkpointer.as_ref(), &session, label);
         let outcome = agent::run_loop(
-            &provider,
+            &mut source,
             &workspace,
             &tools,
             &policy,
@@ -457,6 +537,7 @@ fn run(args: &Args) {
             &mut mcp_clients,
             &session,
             &mut approve,
+            &mut checkpoint,
             args.max_context_chars,
             MAX_TURNS,
             &cancel,
@@ -470,8 +551,9 @@ fn run(args: &Args) {
             );
         } else {
             eprintln!(
-                "\nprovider={} permissions={} session={}",
-                provider.name(),
+                "\nprovider={} model={} permissions={} session={}",
+                outcome.provider,
+                outcome.model,
                 args.permission.as_str(),
                 session.path().display()
             );
@@ -515,13 +597,44 @@ impl TurnObserver for PlainObserver {
             );
         }
     }
+
+    fn on_route_changed(&mut self, decision: &RouteDecision) {
+        let reason = decision
+            .reasons
+            .first()
+            .map_or("route selected", String::as_str);
+        if self.json {
+            println!(
+                "{}",
+                json!({"type": if decision.switch { "route.changed" } else { "route.selected" }, "provider": decision.route.provider, "model": decision.route.model, "band": format!("{:?}", decision.band).to_lowercase(), "reason": reason})
+            );
+        } else {
+            eprintln!(
+                "↳ {} ({}) — {reason}",
+                decision.route.model, decision.route.provider
+            );
+        }
+    }
+
+    fn on_file_diff(&mut self, path: &str, diff: &str) {
+        if self.json {
+            println!(
+                "{}",
+                json!({"type": "file.diff", "path": path, "diff": diff})
+            );
+        } else {
+            eprintln!("{}", febo_cli::diff::clip(diff, 80));
+        }
+    }
 }
 
 enum TurnEvent {
     Text(String),
     ToolCall(String, String),
     ToolResult(String),
+    FileDiff(String),
     ApprovalRequest(String),
+    RouteChanged(RouteDecision),
 }
 
 /// Forwards turn activity from the agent worker thread to the UI thread.
@@ -543,6 +656,14 @@ impl TurnObserver for ChannelObserver {
     fn on_tool_result(&mut self, _name: &str, result: &str) {
         let _ = self.events.send(TurnEvent::ToolResult(result.to_owned()));
     }
+
+    fn on_route_changed(&mut self, decision: &RouteDecision) {
+        let _ = self.events.send(TurnEvent::RouteChanged(decision.clone()));
+    }
+
+    fn on_file_diff(&mut self, _path: &str, diff: &str) {
+        let _ = self.events.send(TurnEvent::FileDiff(diff.to_owned()));
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -555,15 +676,29 @@ fn repl(
     mcp_clients: &mut [McpClient],
     session: &SessionWriter,
     args: &Args,
+    routing_config: &RoutingConfig,
+    routing_auto: bool,
+    checkpointer: Option<&Checkpointer>,
 ) {
-    banner(provider, args, session);
+    let mut routing_auto = routing_auto;
+    let mut current_model = provider.model().to_owned();
+    let mut current_provider = provider.name().to_owned();
+    let mut current_band = None::<String>;
+    let mut task_switches = 0usize;
+    banner(
+        provider,
+        args,
+        session,
+        routing_auto,
+        routing_config.routes.len(),
+    );
     let mut editor = Editor::new(root.to_path_buf());
     // Permission can change mid-session via /permissions; plan mode is fixed
     // for the run and keeps a hard read-only guard on top of any mode.
     let mut permission = args.permission;
     loop {
         eprintln!();
-        let footer = status_footer(provider, permission, args.plan);
+        let footer = status_footer(&current_model, routing_auto, permission, args.plan);
         let Some(line) = editor.read_line(&footer) else {
             break;
         };
@@ -578,15 +713,21 @@ fn repl(
             match name {
                 "exit" | "quit" => break,
                 "help" => eprintln!(
-                    "{BOLD}/model{RESET}         pick or switch the model (↑/↓, enter)\n{BOLD}/permissions{RESET}   change what Febo may do without asking\n{BOLD}/compact{RESET}       summarize the conversation to free context\n{BOLD}/status{RESET}        provider, model, permissions, session\n{BOLD}/diff{RESET}          show the uncommitted Git diff\n{BOLD}/exit{RESET}          quit (Ctrl-D also works)\n\n{DIM}@path attaches a workspace file · esc interrupts a running turn{RESET}"
+                    "{BOLD}/model{RESET}         pick or switch the model (↑/↓, enter)\n{BOLD}/permissions{RESET}   change what Febo may do without asking\n{BOLD}/rewind{RESET}        restore workspace files to an earlier checkpoint\n{BOLD}/swarm-setup{RESET}   assign models to swarm roles (boss/worker/checker)\n{BOLD}/swarm{RESET} GOAL    run a boss/worker/checker model swarm on a goal\n{BOLD}/compact{RESET}       summarize the conversation to free context\n{BOLD}/status{RESET}        provider, model, permissions, session\n{BOLD}/diff{RESET}          show the uncommitted Git diff\n{BOLD}/exit{RESET}          quit (Ctrl-D also works)\n\n{DIM}@path attaches a workspace file · esc interrupts a running turn{RESET}"
                 ),
                 "status" => eprintln!(
-                    "provider={} model={} permission={} plan={} messages={} session={}",
-                    provider.name(),
-                    provider.model(),
+                    "routing={} provider={} model={} band={} switches_this_task={} permission={} plan={} messages={} checkpoints={} session={}",
+                    if routing_auto { "auto" } else { "off" },
+                    current_provider,
+                    current_model,
+                    current_band.as_deref().unwrap_or("pinned"),
+                    task_switches,
                     permission.as_str(),
                     args.plan,
                     messages.len(),
+                    checkpointer
+                        .and_then(|checkpointer| checkpointer.list().ok())
+                        .map_or_else(|| "off".to_owned(), |list| list.len().to_string()),
                     session.path().display()
                 ),
                 "diff" => match workspace.git_diff() {
@@ -596,9 +737,43 @@ fn repl(
                     Ok(diff) => print!("{diff}"),
                     Err(error) => eprintln!("{RED}error:{RESET} {error}"),
                 },
-                "model" => handle_model_command(provider, session, argument),
+                "model" if argument == "auto" => {
+                    routing_auto = true;
+                    let _ = session.record("routing_mode", "auto");
+                    eprintln!("routing enabled — model will be selected on the next turn");
+                }
+                "model" => {
+                    handle_model_command(provider, session, argument);
+                    routing_auto = false;
+                    provider.model().clone_into(&mut current_model);
+                    provider.name().clone_into(&mut current_provider);
+                    current_band = None;
+                    eprintln!(
+                        "{DIM}routing disabled — pinned to {}{RESET}",
+                        provider.model()
+                    );
+                }
                 "permissions" | "permission" => {
                     handle_permissions_command(&mut permission, args.plan, session, argument);
+                }
+                "rewind" | "undo" => handle_rewind_command(checkpointer, session),
+                "swarm-setup" => handle_swarm_setup(root),
+                "swarm" => {
+                    if argument.is_empty() {
+                        eprintln!("usage: /swarm <goal>   (assign models with /swarm-setup first)");
+                    } else {
+                        run_swarm(
+                            argument,
+                            root,
+                            workspace,
+                            permission,
+                            args.plan,
+                            args.max_context_chars,
+                            messages,
+                            session,
+                            checkpointer,
+                        );
+                    }
                 }
                 "compact" => {
                     eprint!("{DIM}compacting…{RESET}");
@@ -615,7 +790,7 @@ fn repl(
         }
         let expanded = expand_mentions(workspace, input);
         let policy = PolicyEngine::new(permission, args.plan);
-        run_interactive_turn(
+        if let Some(outcome) = run_interactive_turn(
             provider,
             workspace,
             tools,
@@ -625,13 +800,22 @@ fn repl(
             session,
             args.max_context_chars,
             &expanded,
-        );
+            routing_auto,
+            routing_config,
+            checkpointer,
+        ) {
+            current_model = outcome.model;
+            current_provider = outcome.provider;
+            current_band = outcome.band;
+            task_switches = outcome.switches;
+        }
     }
 }
 
 /// The dimmed status line shown under the prompt: model and what Febo may do.
 fn status_footer(
-    provider: &OpenAiCompatibleProvider,
+    model: &str,
+    routing_auto: bool,
     permission: PermissionMode,
     plan: bool,
 ) -> String {
@@ -642,7 +826,11 @@ fn status_footer(
     };
     format!(
         "{} · {}  ·  /help  ·  /permissions to change access",
-        provider.model(),
+        if routing_auto {
+            format!("auto:{model}")
+        } else {
+            model.to_owned()
+        },
         effective
     )
 }
@@ -720,6 +908,20 @@ fn handle_model_command(
     session: &SessionWriter,
     argument: &str,
 ) {
+    if let Some((provider_name, model)) = argument.split_once(':')
+        && let Ok(kind) = ProviderKind::parse(provider_name)
+    {
+        match OpenAiCompatibleProvider::from_environment(kind, Some(model.to_owned())) {
+            Ok(replacement) => {
+                *provider = replacement;
+                let _ = session.record("provider", provider_name);
+                let _ = session.record("model_changed", model);
+                eprintln!("model set to {model} ({provider_name})");
+            }
+            Err(error) => eprintln!("{RED}error:{RESET} {error}"),
+        }
+        return;
+    }
     if argument.is_empty() {
         eprint!("{DIM}fetching available models…{RESET}");
         let models = match provider.list_models() {
@@ -845,15 +1047,23 @@ fn run_interactive_turn(
     session: &SessionWriter,
     max_context_chars: usize,
     input: &str,
-) {
+    routing_auto: bool,
+    routing_config: &RoutingConfig,
+    checkpointer: Option<&Checkpointer>,
+) -> Option<agent::LoopOutcome> {
+    take_checkpoint(
+        checkpointer,
+        session,
+        &format!("before prompt: {}", truncate_chars(input, 48)),
+    );
     if let Err(error) = session.record("user_prompt", input) {
         eprintln!("{RED}error:{RESET} {error}");
-        return;
+        return None;
     }
     let user_message = json!({"role": "user", "content": input});
     if let Err(error) = session.record_message(&user_message) {
         eprintln!("{RED}error:{RESET} {error}");
-        return;
+        return None;
     }
     messages.push(user_message);
 
@@ -876,8 +1086,27 @@ fn run_interactive_turn(
                     .is_ok()
                     && answer_rx.recv().unwrap_or(false)
             };
+            let mut source = if routing_auto {
+                match RoutedModel::new(
+                    routing_config.clone(),
+                    input,
+                    messages.len(),
+                    policy.plan_mode(),
+                ) {
+                    Ok(source) => ActiveSource::Routed(Box::new(source)),
+                    Err(error) => {
+                        let _ = approve_tx.send(TurnEvent::ToolResult(format!(
+                            "routing unavailable ({error}) — using pinned model"
+                        )));
+                        ActiveSource::Pinned(agent::PinnedModel::new(provider, provider.model()))
+                    }
+                }
+            } else {
+                ActiveSource::Pinned(agent::PinnedModel::new(provider, provider.model()))
+            };
+            let mut checkpoint = |label: &str| take_checkpoint(checkpointer, session, label);
             agent::run_loop(
-                provider,
+                &mut source,
                 workspace,
                 tools,
                 &policy,
@@ -885,6 +1114,7 @@ fn run_interactive_turn(
                 mcp_clients,
                 session,
                 &mut approve,
+                &mut checkpoint,
                 max_context_chars,
                 MAX_TURNS,
                 cancel_ref,
@@ -930,6 +1160,18 @@ fn run_interactive_turn(
                         };
                         eprint!("{color}  ⎿ {}{RESET}{ending}", tool_result_summary(&result));
                     }
+                    TurnEvent::FileDiff(diff) => {
+                        for line in febo_cli::diff::clip(&diff, 80).lines() {
+                            let styled = if line.starts_with('+') {
+                                format!("{GREEN}{line}{RESET}")
+                            } else if line.starts_with('-') {
+                                format!("{RED}{line}{RESET}")
+                            } else {
+                                format!("{DIM}{line}{RESET}")
+                            };
+                            eprint!("    {styled}{ending}");
+                        }
+                    }
                     TurnEvent::ApprovalRequest(message) => {
                         if raw {
                             let _ = terminal::disable_raw_mode();
@@ -942,6 +1184,16 @@ fn run_interactive_turn(
                             let _ = terminal::enable_raw_mode();
                         }
                         let _ = answer_tx.send(approved);
+                    }
+                    TurnEvent::RouteChanged(decision) => {
+                        let reason = decision
+                            .reasons
+                            .first()
+                            .map_or("route selected", String::as_str);
+                        eprint!(
+                            "{DIM}↳ {} ({}) — {reason}{RESET}{ending}",
+                            decision.route.model, decision.route.provider
+                        );
                     }
                 }
             }
@@ -1005,16 +1257,666 @@ fn run_interactive_turn(
                 );
             } else {
                 eprintln!(
-                    "{DIM}✓ {}s · tokens {}↑ {}↓{RESET}",
+                    "{DIM}✓ {}s · {} ({}) · tokens {}↑ {}↓{RESET}",
                     started.elapsed().as_secs(),
+                    outcome.model,
+                    outcome.provider,
                     outcome.input_tokens,
                     outcome.output_tokens
                 );
             }
+            return Some(outcome);
         }
         Ok(Err(error)) => eprintln!("{RED}error:{RESET} {error}"),
         Err(_) => eprintln!("{RED}error:{RESET} agent thread panicked"),
     }
+    None
+}
+
+/// Snapshot the workspace into the shadow checkpoint repo. Best-effort by
+/// design: failures are recorded in the session but never surface to the
+/// tool that triggered the snapshot, and never block it.
+fn take_checkpoint(checkpointer: Option<&Checkpointer>, session: &SessionWriter, label: &str) {
+    let Some(checkpointer) = checkpointer else {
+        return;
+    };
+    match checkpointer.snapshot(label) {
+        Ok(Some(tag)) => {
+            let _ = session.record("checkpoint", &format!("{tag}: {label}"));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = session.record("checkpoint_error", &error);
+        }
+    }
+}
+
+/// `/rewind` — pick a checkpoint with the arrow-key menu and restore the
+/// workspace files it captured. The conversation is left untouched, and the
+/// pre-restore state is checkpointed so the rewind itself can be undone.
+fn handle_rewind_command(checkpointer: Option<&Checkpointer>, session: &SessionWriter) {
+    let Some(checkpointer) = checkpointer else {
+        eprintln!("{DIM}checkpoints are disabled (git unavailable or --no-checkpoints){RESET}");
+        return;
+    };
+    let checkpoints = match checkpointer.list() {
+        Ok(checkpoints) => checkpoints,
+        Err(error) => {
+            eprintln!("{RED}error:{RESET} {error}");
+            return;
+        }
+    };
+    if checkpoints.is_empty() {
+        eprintln!(
+            "{DIM}no checkpoints yet — Febo snapshots before prompts, writes, and commands{RESET}"
+        );
+        return;
+    }
+    let shown = checkpoints.len().min(20);
+    let choices: Vec<Choice> = checkpoints
+        .iter()
+        .take(shown)
+        .map(|checkpoint| {
+            Choice::new(
+                truncate_chars(&checkpoint.label, 68),
+                relative_age(checkpoint.created).trim_end().to_owned(),
+            )
+        })
+        .collect();
+    let Some(index) = editor::select_menu(
+        "Rewind — restore workspace files to this checkpoint",
+        &choices,
+        0,
+    ) else {
+        eprintln!("{DIM}unchanged{RESET}");
+        return;
+    };
+    let chosen = &checkpoints[index];
+    eprintln!(
+        "Restore workspace files to \u{201c}{}\u{201d}? The current state is checkpointed first. {BOLD}[y/N]{RESET}",
+        chosen.label
+    );
+    let mut answer = String::new();
+    let approved = io::stdin().read_line(&mut answer).is_ok() && parse_approval_answer(&answer);
+    if !approved {
+        eprintln!("{DIM}unchanged{RESET}");
+        return;
+    }
+    match checkpointer.restore(&chosen.tag) {
+        Ok(()) => {
+            let _ = session.record("restored", &format!("{}: {}", chosen.tag, chosen.label));
+            eprintln!(
+                "✓ restored workspace files to \u{201c}{}\u{201d}",
+                chosen.label
+            );
+            eprintln!(
+                "{DIM}conversation history is unchanged · /rewind again to undo the restore{RESET}"
+            );
+        }
+        Err(error) => eprintln!("{RED}error:{RESET} {error}"),
+    }
+}
+
+/// Turn activity display for swarm agents: tool lines and diffs always show;
+/// streamed prose only for boss phases (plans, rulings, reviews) — worker
+/// and checker chatter would drown the terminal.
+struct SwarmObserver {
+    show_text: bool,
+}
+
+impl TurnObserver for SwarmObserver {
+    fn on_text(&mut self, text: &str) {
+        if self.show_text {
+            print!("{text}");
+            let _ = io::stdout().flush();
+        }
+    }
+
+    fn on_tool_call(&mut self, name: &str, arguments: &str) {
+        eprintln!("{DIM}  ⏺ {name}({}){RESET}", tool_call_detail(arguments));
+    }
+
+    fn on_tool_result(&mut self, _name: &str, result: &str) {
+        let color = if result.starts_with("ERROR") {
+            RED
+        } else {
+            DIM
+        };
+        eprintln!("{color}  ⎿ {}{RESET}", tool_result_summary(result));
+    }
+
+    fn on_file_diff(&mut self, _path: &str, diff: &str) {
+        for line in febo_cli::diff::clip(diff, 80).lines() {
+            let styled = if line.starts_with('+') {
+                format!("{GREEN}{line}{RESET}")
+            } else if line.starts_with('-') {
+                format!("{RED}{line}{RESET}")
+            } else {
+                format!("{DIM}{line}{RESET}")
+            };
+            eprintln!("    {styled}");
+        }
+    }
+}
+
+/// The last assistant text in an agent's message history — the agent's
+/// report, plan, verdict, or ruling.
+fn final_assistant_text(messages: &[Value]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find_map(|message| {
+            (message.get("role").and_then(Value::as_str) == Some("assistant"))
+                .then(|| message.get("content").and_then(Value::as_str))
+                .flatten()
+        })
+        .unwrap_or("")
+        .trim()
+        .to_owned()
+}
+
+/// Run one swarm agent turn: fresh history, pinned role model, shared
+/// workspace/session/approvals. Returns the agent's final text.
+#[allow(clippy::too_many_arguments)]
+fn swarm_agent(
+    provider: &OpenAiCompatibleProvider,
+    model: &str,
+    system: &str,
+    request: &str,
+    tools: &[Value],
+    policy: PolicyEngine,
+    workspace: &Workspace,
+    session: &SessionWriter,
+    approve: &mut dyn FnMut(&str) -> bool,
+    checkpoint: &mut dyn FnMut(&str),
+    max_context_chars: usize,
+    show_text: bool,
+) -> Result<String, String> {
+    let mut agent_messages = vec![
+        json!({"role": "system", "content": system}),
+        json!({"role": "user", "content": request}),
+    ];
+    let mut source = agent::PinnedModel::new(provider, model);
+    let mut observer = SwarmObserver { show_text };
+    let mut clients: Vec<McpClient> = Vec::new();
+    agent::run_loop(
+        &mut source,
+        workspace,
+        tools,
+        &policy,
+        &mut agent_messages,
+        &mut clients,
+        session,
+        approve,
+        checkpoint,
+        max_context_chars,
+        MAX_TURNS,
+        &AtomicBool::new(false),
+        &mut observer,
+    )?;
+    if show_text {
+        println!();
+    }
+    Ok(final_assistant_text(&agent_messages))
+}
+
+/// `/swarm-setup` — assign a provider and model to each swarm role and save
+/// the configuration to `~/.febo/swarm.json`.
+#[allow(clippy::too_many_lines)]
+fn handle_swarm_setup(root: &Path) {
+    let existing = swarm::load(root).ok().flatten();
+    let available = febo_cli::provider::available_providers();
+    if available.is_empty() {
+        eprintln!("{RED}no provider credentials found{RESET} — set one with `febo set` first");
+        return;
+    }
+    eprintln!(
+        "{BOLD}Swarm setup{RESET} {DIM}— the boss plans, reviews, and rules disputes (use your strongest model); workers do all the coding and checkers verify every task (use cheap models){RESET}"
+    );
+    let pick = |role: &str, hint: &str, current: Option<&Target>| -> Option<Target> {
+        let choices: Vec<Choice> = available
+            .iter()
+            .map(|kind| Choice::new(kind.name(), ""))
+            .collect();
+        let initial = current
+            .and_then(|target| {
+                available
+                    .iter()
+                    .position(|kind| kind.name() == target.provider)
+            })
+            .unwrap_or(0);
+        let index = editor::select_menu(&format!("{role} provider — {hint}"), &choices, initial)?;
+        let kind = available[index];
+        let provider = OpenAiCompatibleProvider::from_environment(kind, None).ok()?;
+        if let Ok(models) = provider.list_models()
+            && !models.is_empty()
+        {
+            let shown = models.len().min(40);
+            let choices: Vec<Choice> = models
+                .iter()
+                .take(shown)
+                .map(|model| Choice::new(model.clone(), ""))
+                .collect();
+            let initial = current
+                .and_then(|target| models.iter().position(|model| *model == target.model))
+                .unwrap_or(0);
+            let index = editor::select_menu(
+                &format!("{role} model ({})", kind.name()),
+                &choices,
+                initial.min(shown.saturating_sub(1)),
+            )?;
+            return Some(Target {
+                provider: kind.name().to_owned(),
+                model: models[index].clone(),
+            });
+        }
+        eprint!("{role} model name ({}): ", kind.name());
+        let _ = io::stderr().flush();
+        let mut answer = String::new();
+        if io::stdin().read_line(&mut answer).is_err() {
+            return None;
+        }
+        let model = answer.trim();
+        (!model.is_empty()).then(|| Target {
+            provider: kind.name().to_owned(),
+            model: model.to_owned(),
+        })
+    };
+    let Some(boss) = pick(
+        "boss",
+        "writes specs, reviews, rules disputes — never codes",
+        existing.as_ref().map(|roles| &roles.boss),
+    ) else {
+        eprintln!("{DIM}cancelled{RESET}");
+        return;
+    };
+    let Some(worker) = pick(
+        "worker",
+        "does all the coding — cheap and fast",
+        existing.as_ref().map(|roles| &roles.worker),
+    ) else {
+        eprintln!("{DIM}cancelled{RESET}");
+        return;
+    };
+    let Some(checker) = pick(
+        "checker",
+        "verifies every task independently — never trusts reports",
+        existing.as_ref().map(|roles| &roles.checker),
+    ) else {
+        eprintln!("{DIM}cancelled{RESET}");
+        return;
+    };
+    let roles = SwarmRoles {
+        boss,
+        worker,
+        checker,
+    };
+    match swarm::save(&roles) {
+        Ok(path) => {
+            eprintln!(
+                "swarm saved to {}\n  boss    {} ({})\n  worker  {} ({})\n  checker {} ({})\nstart one with {BOLD}/swarm <goal>{RESET}",
+                path.display(),
+                roles.boss.model,
+                roles.boss.provider,
+                roles.worker.model,
+                roles.worker.provider,
+                roles.checker.model,
+                roles.checker.provider,
+            );
+        }
+        Err(error) => eprintln!("{RED}error:{RESET} {error}"),
+    }
+}
+
+/// `/swarm <goal>` — the boss/worker/checker loop: boss plans (read-only),
+/// workers execute each task, a checker independently verifies it, failures
+/// are reworked with the checker's feedback, repeated failures escalate to
+/// the boss for a ruling, and the boss reviews the finished build.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_swarm(
+    goal: &str,
+    root: &Path,
+    workspace: &Workspace,
+    permission: PermissionMode,
+    plan_mode: bool,
+    max_context_chars: usize,
+    messages: &mut Vec<Value>,
+    main_session: &SessionWriter,
+    checkpointer: Option<&Checkpointer>,
+) {
+    use std::fmt::Write as _;
+    if plan_mode {
+        eprintln!("{RED}error:{RESET} plan mode is read-only; swarm workers need write access");
+        return;
+    }
+    if permission == PermissionMode::ReadOnly {
+        eprintln!(
+            "{RED}error:{RESET} permission is read-only, so workers cannot write. Use /permissions to grant ask or workspace-write first."
+        );
+        return;
+    }
+    let roles = match swarm::load(root) {
+        Ok(Some(roles)) => roles,
+        Ok(None) => {
+            eprintln!("no swarm configured — run {BOLD}/swarm-setup{RESET} first");
+            return;
+        }
+        Err(error) => {
+            eprintln!("{RED}error:{RESET} {error}");
+            return;
+        }
+    };
+    let build_provider = |target: &Target| -> Result<OpenAiCompatibleProvider, String> {
+        let kind = ProviderKind::parse(&target.provider)?;
+        OpenAiCompatibleProvider::from_environment(kind, Some(target.model.clone()))
+    };
+    let (boss, worker, checker) = match (
+        build_provider(&roles.boss),
+        build_provider(&roles.worker),
+        build_provider(&roles.checker),
+    ) {
+        (Ok(boss), Ok(worker), Ok(checker)) => (boss, worker, checker),
+        (boss, worker, checker) => {
+            for error in [boss.err(), worker.err(), checker.err()]
+                .into_iter()
+                .flatten()
+            {
+                eprintln!("{RED}error:{RESET} {error}");
+            }
+            return;
+        }
+    };
+    // The swarm gets its own session log so the main conversation stays
+    // resumable; the main session records a pointer plus the outcome.
+    let session = match SessionWriter::create(root) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("{RED}error:{RESET} {error}");
+            return;
+        }
+    };
+    let _ = session.record("swarm_goal", goal);
+    let _ = main_session.record("swarm_session", &session.path().display().to_string());
+    let mut approve = |message: &str| -> bool {
+        eprintln!("\n{message}\nApprove? {BOLD}[y/N]{RESET}");
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer).is_ok() && parse_approval_answer(&answer)
+    };
+    let mut checkpoint = |label: &str| take_checkpoint(checkpointer, &session, label);
+    take_checkpoint(
+        checkpointer,
+        &session,
+        &format!("before swarm: {}", truncate_chars(goal, 48)),
+    );
+    eprintln!(
+        "{BOLD}swarm{RESET} {DIM}· boss {} · worker {} · checker {} · log {}{RESET}",
+        roles.boss.model,
+        roles.worker.model,
+        roles.checker.model,
+        session.path().display()
+    );
+
+    // Phase 1: the boss plans with read-only access, hard-guarded.
+    let plan_tools = tool_schemas(true);
+    let boss_policy = PolicyEngine::new(PermissionMode::ReadOnly, true);
+    eprintln!("{CYAN}◆ boss ({}) planning…{RESET}", roles.boss.model);
+    let boss_run = |system: &str,
+                    request: &str,
+                    approve: &mut dyn FnMut(&str) -> bool,
+                    checkpoint: &mut dyn FnMut(&str)| {
+        swarm_agent(
+            &boss,
+            &roles.boss.model,
+            system,
+            request,
+            &plan_tools,
+            boss_policy,
+            workspace,
+            &session,
+            approve,
+            checkpoint,
+            max_context_chars,
+            true,
+        )
+    };
+    let plan_text = match boss_run(
+        swarm::BOSS_PLAN_SYSTEM,
+        &swarm::plan_request(goal),
+        &mut approve,
+        &mut checkpoint,
+    ) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("{RED}swarm aborted:{RESET} {error}");
+            return;
+        }
+    };
+    let tasks = match swarm::parse_tasks(&plan_text) {
+        Ok(tasks) => tasks,
+        Err(first_error) => {
+            eprintln!(
+                "{DIM}plan needs reformatting ({first_error}) — asking the boss once more{RESET}"
+            );
+            let retry = boss_run(
+                swarm::BOSS_PLAN_SYSTEM,
+                &format!(
+                    "Your previous reply:\n{plan_text}\n\nReply again with the CONSTITUTION and ONLY a valid ```json task array as specified."
+                ),
+                &mut approve,
+                &mut checkpoint,
+            );
+            match retry.map(|text| swarm::parse_tasks(&text).map(|tasks| (text, tasks))) {
+                Ok(Ok((_, tasks))) => tasks,
+                Ok(Err(error)) | Err(error) => {
+                    eprintln!("{RED}swarm aborted:{RESET} {error}");
+                    return;
+                }
+            }
+        }
+    };
+    let constitution = swarm::constitution_of(&plan_text);
+    let _ = session.record("swarm_plan", &format!("{} tasks", tasks.len()));
+
+    let worker_tools = tool_schemas(false);
+    let checker_tools: Vec<Value> = tool_schemas(false)
+        .into_iter()
+        .filter(|tool| tool.pointer("/function/name").and_then(Value::as_str) != Some("write_file"))
+        .collect();
+    let worker_policy = PolicyEngine::new(permission, false);
+
+    // Phase 2: work → check → rework → escalate, per task.
+    let mut outcomes = String::new();
+    let mut reworks = 0usize;
+    let mut failures = 0usize;
+    for task in &tasks {
+        eprintln!(
+            "\n{BOLD}task {}/{} — {}{RESET}",
+            task.id,
+            tasks.len(),
+            task.title
+        );
+        let _ = session.record("swarm_task", &format!("{}: {}", task.id, task.title));
+        let mut feedback: Option<String> = None;
+        let mut worker_report = String::new();
+        let mut passed = false;
+        let verify = |request_feedback: Option<&str>,
+                      worker_report: &mut String,
+                      approve: &mut dyn FnMut(&str) -> bool,
+                      checkpoint: &mut dyn FnMut(&str)|
+         -> Result<Verdict, String> {
+            eprintln!(
+                "{MAGENTA}⛏ worker ({}){}{RESET}",
+                roles.worker.model,
+                if request_feedback.is_some() {
+                    " reworking"
+                } else {
+                    ""
+                }
+            );
+            *worker_report = swarm_agent(
+                &worker,
+                &roles.worker.model,
+                swarm::WORKER_SYSTEM,
+                &swarm::worker_request(&constitution, task, request_feedback),
+                &worker_tools,
+                worker_policy,
+                workspace,
+                &session,
+                approve,
+                checkpoint,
+                max_context_chars,
+                false,
+            )?;
+            eprintln!(
+                "{CYAN}⚖ checker ({}) verifying…{RESET}",
+                roles.checker.model
+            );
+            let check_text = swarm_agent(
+                &checker,
+                &roles.checker.model,
+                swarm::CHECKER_SYSTEM,
+                &swarm::checker_request(task),
+                &checker_tools,
+                worker_policy,
+                workspace,
+                &session,
+                approve,
+                checkpoint,
+                max_context_chars,
+                false,
+            )?;
+            Ok(swarm::parse_verdict(&check_text))
+        };
+        for attempt in 1..=swarm::MAX_ATTEMPTS {
+            let verdict = match verify(
+                feedback.as_deref(),
+                &mut worker_report,
+                &mut approve,
+                &mut checkpoint,
+            ) {
+                Ok(verdict) => verdict,
+                Err(error) => {
+                    eprintln!("{RED}swarm aborted:{RESET} {error}");
+                    return;
+                }
+            };
+            match verdict {
+                Verdict::Pass => {
+                    eprintln!("{GREEN}  ✓ check passed{RESET}");
+                    let _ = session.record("swarm_verdict", &format!("{}: pass", task.id));
+                    passed = true;
+                    break;
+                }
+                Verdict::Fail(reason) => {
+                    eprintln!(
+                        "{RED}  ✗ check failed:{RESET} {}",
+                        truncate_chars(&reason, 200)
+                    );
+                    let _ =
+                        session.record("swarm_verdict", &format!("{}: fail: {reason}", task.id));
+                    if attempt < swarm::MAX_ATTEMPTS {
+                        reworks += 1;
+                    }
+                    feedback = Some(reason);
+                }
+            }
+        }
+        if !passed {
+            // Dispute: the boss rules, and can overrule the checker.
+            eprintln!(
+                "{CYAN}◆ boss ({}) ruling on the dispute…{RESET}",
+                roles.boss.model
+            );
+            let ruling_text = match boss_run(
+                swarm::BOSS_RULING_SYSTEM,
+                &swarm::ruling_request(
+                    &constitution,
+                    task,
+                    &worker_report,
+                    feedback.as_deref().unwrap_or("(none)"),
+                ),
+                &mut approve,
+                &mut checkpoint,
+            ) {
+                Ok(text) => text,
+                Err(error) => {
+                    eprintln!("{RED}swarm aborted:{RESET} {error}");
+                    return;
+                }
+            };
+            match swarm::parse_ruling(&ruling_text) {
+                Ruling::Worker => {
+                    eprintln!("{GREEN}  ⚖ boss overruled the checker — work accepted{RESET}");
+                    let _ = session.record("swarm_ruling", &format!("{}: worker", task.id));
+                    passed = true;
+                }
+                Ruling::Checker => {
+                    let _ = session.record("swarm_ruling", &format!("{}: checker", task.id));
+                    eprintln!("{DIM}  ⚖ boss upheld the checker — one final guided rework{RESET}");
+                    reworks += 1;
+                    match verify(
+                        Some(&ruling_text),
+                        &mut worker_report,
+                        &mut approve,
+                        &mut checkpoint,
+                    ) {
+                        Ok(Verdict::Pass) => {
+                            eprintln!("{GREEN}  ✓ check passed{RESET}");
+                            passed = true;
+                        }
+                        Ok(Verdict::Fail(reason)) => {
+                            eprintln!(
+                                "{RED}  ✗ task failed permanently:{RESET} {}",
+                                truncate_chars(&reason, 200)
+                            );
+                            failures += 1;
+                        }
+                        Err(error) => {
+                            eprintln!("{RED}swarm aborted:{RESET} {error}");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        let _ = writeln!(
+            outcomes,
+            "task {} ({}): {}",
+            task.id,
+            task.title,
+            if passed { "done" } else { "FAILED" }
+        );
+    }
+
+    // Phase 3: the boss reviews the finished build.
+    eprintln!("\n{CYAN}◆ boss ({}) final review{RESET}", roles.boss.model);
+    let diff = workspace.git_diff().unwrap_or_default();
+    let review = boss_run(
+        swarm::BOSS_REVIEW_SYSTEM,
+        &swarm::review_request(goal, &outcomes, &truncate_chars(&diff, 20_000)),
+        &mut approve,
+        &mut checkpoint,
+    )
+    .unwrap_or_else(|error| format!("(final review failed: {error})"));
+    eprintln!(
+        "{DIM}swarm done — {} tasks · {reworks} reworks · {failures} failed · log {}{RESET}",
+        tasks.len(),
+        session.path().display()
+    );
+    let _ = main_session.record(
+        "swarm",
+        &format!(
+            "{goal} → {} tasks, {reworks} reworks, {failures} failed",
+            tasks.len()
+        ),
+    );
+    // Give the main conversation the outcome so follow-up chat is informed.
+    let summary = json!({"role": "user", "content": format!("[A model swarm just completed work in this workspace.\nGoal: {goal}\nOutcomes:\n{outcomes}\nBoss report:\n{review}]")});
+    let ack = json!({"role": "assistant", "content": "Understood — I have the swarm results and the current workspace state in mind."});
+    let _ = main_session.record_message(&summary);
+    let _ = main_session.record_message(&ack);
+    messages.push(summary);
+    messages.push(ack);
 }
 
 /// Replace the conversation with a model-written summary, keeping the
@@ -1031,7 +1933,7 @@ fn compact_history(
     let mut request = messages.clone();
     request.push(json!({"role": "user", "content": "Summarize this conversation for a fresh context window. Include the user's goals, key decisions, files created or modified and what they now contain, tool results that still matter, and unfinished work. Reply with only the summary."}));
     let never = AtomicBool::new(false);
-    let turn = provider.stream_turn(&request, &[], &never)?;
+    let turn = provider.stream_turn(provider.model(), &request, &[], &never)?;
     let summary = turn
         .assistant_message
         .get("content")
@@ -1058,12 +1960,22 @@ fn compact_history(
     Ok((before, messages.len()))
 }
 
-fn banner(provider: &OpenAiCompatibleProvider, args: &Args, session: &SessionWriter) {
+fn banner(
+    provider: &OpenAiCompatibleProvider,
+    args: &Args,
+    session: &SessionWriter,
+    routing_auto: bool,
+    route_count: usize,
+) {
     let title = format!("✻ Febo CLI v{VERSION}");
     let detail = format!(
         "{} · {} · {}",
         provider.name(),
-        provider.model(),
+        if routing_auto {
+            format!("routing: auto ({route_count} bands)")
+        } else {
+            provider.model().to_owned()
+        },
         if args.plan {
             "plan (read-only)"
         } else {
@@ -1189,7 +2101,7 @@ fn tool_schemas(plan: bool) -> Vec<Value> {
 
 fn print_help() {
     println!(
-        "Febo CLI {VERSION}\n\nUSAGE:\n  febo [OPTIONS] [prompt]     interactive REPL when prompt is omitted\n  febo exec --json [OPTIONS] <prompt>\n  febo set --provider NAME API_KEY   save the key to ~/.febo/credentials.env, then start the REPL\n\nOPTIONS:\n  --provider openrouter|openai|deepseek\n  --model MODEL\n  --permission read-only|ask|workspace-write|yolo   (default read-only)\n  --plan                        hard read-only guard regardless of --permission\n  --resume [SESSION]            continue a session; with no path, pick from a list\n  --resume-compact [SESSION]    like --resume but summarizes large histories first\n  --max-context-chars COUNT\n  --no-project-instructions\n  --enable-hooks / --enable-mcp\n\nREPL: /help /model /permissions /compact /status /diff /exit — esc interrupts a running turn.\n\nCREDENTIALS:\n  OPENROUTER_API_KEY   provider=openrouter\n  OPENAI_API_KEY       provider=openai\n  DEEPSEEK_API_KEY     provider=deepseek\n\nRepository hooks and MCP servers are disabled unless explicitly enabled."
+        "Febo CLI {VERSION}\n\nUSAGE:\n  febo [OPTIONS] [prompt]     interactive REPL when prompt is omitted\n  febo exec --json [OPTIONS] <prompt>\n  febo set --provider NAME API_KEY   save the key to ~/.febo/credentials.env, then start the REPL\n\nOPTIONS:\n  --provider openrouter|openai|deepseek\n  --model MODEL|auto\n  --permission read-only|ask|workspace-write|yolo   (default read-only)\n  --plan                        hard read-only guard regardless of --permission\n  --resume [SESSION]            continue a session; with no path, pick from a list\n  --resume-compact [SESSION]    like --resume but summarizes large histories first\n  --max-context-chars COUNT\n  --no-project-instructions\n  --no-checkpoints              disable automatic workspace snapshots (/rewind)\n  --enable-hooks / --enable-mcp\n\nREPL: /help /model /permissions /rewind /compact /status /diff /exit — esc interrupts a running turn.\n\nCREDENTIALS:\n  OPENROUTER_API_KEY   provider=openrouter\n  OPENAI_API_KEY       provider=openai\n  DEEPSEEK_API_KEY     provider=deepseek\n\nRepository hooks and MCP servers are disabled unless explicitly enabled."
     );
 }
 

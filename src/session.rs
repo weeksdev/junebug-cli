@@ -85,6 +85,8 @@ pub struct SessionSummary {
     pub messages: usize,
     /// Provider name recorded for the session, if any.
     pub provider: Option<String>,
+    /// Model in effect at the end of the session (for the final provider).
+    pub model: Option<String>,
 }
 
 /// The provider name recorded in the most recent session for this workspace,
@@ -95,6 +97,22 @@ pub fn last_provider(workspace: &Path) -> Option<String> {
         .ok()?
         .into_iter()
         .find_map(|summary| summary.provider)
+}
+
+/// The model in effect at the end of the most recent session, so the model
+/// choice is sticky across runs like the provider. Returns `None` when that
+/// session ended on a different provider (model names are provider-specific).
+#[must_use]
+pub fn last_model(workspace: &Path, provider: &str) -> Option<String> {
+    let summary = list_sessions(workspace)
+        .ok()?
+        .into_iter()
+        .find(|summary| summary.provider.is_some())?;
+    if summary.provider.as_deref() == Some(provider) {
+        summary.model
+    } else {
+        None
+    }
 }
 
 /// List recorded sessions under `.febo/sessions`, newest first. Unreadable
@@ -131,6 +149,7 @@ fn summarize_session(path: &Path) -> Option<SessionSummary> {
     let mut preview = String::new();
     let mut messages = 0usize;
     let mut provider = None;
+    let mut model = None;
     for line in BufReader::new(file).lines() {
         let Ok(line) = line else { continue };
         let Ok(event) = serde_json::from_str::<Value>(&line) else {
@@ -140,6 +159,15 @@ fn summarize_session(path: &Path) -> Option<SessionSummary> {
             Some("message") => messages += 1,
             Some("provider") => {
                 provider = event
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                // A mid-session provider switch invalidates any model seen so
+                // far: model names are provider-specific.
+                model = None;
+            }
+            Some("model" | "model_changed") => {
+                model = event
                     .get("value")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
@@ -166,6 +194,7 @@ fn summarize_session(path: &Path) -> Option<SessionSummary> {
         preview,
         messages,
         provider,
+        model,
     })
 }
 
@@ -197,10 +226,73 @@ pub fn load_messages(path: &Path) -> Result<Vec<Value>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionWriter, list_sessions, load_messages};
+    use super::{SessionWriter, last_model, list_sessions, load_messages};
     use serde_json::json;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn model_is_sticky_for_the_matching_provider() {
+        let root = std::env::temp_dir().join(format!(
+            "febo-last-model-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("directory");
+        let session = SessionWriter::create(&root).expect("session");
+        session.record("provider", "deepseek").expect("provider");
+        session.record("model", "deepseek-v4-flash").expect("model");
+        session.record("user_prompt", "task").expect("prompt");
+        session
+            .record("model_changed", "deepseek-v4-pro")
+            .expect("switch");
+
+        assert_eq!(
+            last_model(&root, "deepseek").as_deref(),
+            Some("deepseek-v4-pro"),
+            "the model in effect at session end must win"
+        );
+        assert_eq!(
+            last_model(&root, "openai"),
+            None,
+            "a model must never leak to a different provider"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn mid_session_provider_switch_resets_the_sticky_model() {
+        let root = std::env::temp_dir().join(format!(
+            "febo-provider-switch-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("directory");
+        let session = SessionWriter::create(&root).expect("session");
+        session.record("provider", "deepseek").expect("provider");
+        session
+            .record("model_changed", "deepseek-v4-pro")
+            .expect("switch");
+        session.record("user_prompt", "task").expect("prompt");
+        session
+            .record("provider", "openai")
+            .expect("provider switch");
+
+        assert_eq!(
+            last_model(&root, "openai"),
+            None,
+            "a provider switch without a model choice must not carry the old model"
+        );
+        assert_eq!(last_model(&root, "deepseek"), None);
+
+        session.record("model_changed", "gpt-5.4").expect("switch");
+        assert_eq!(last_model(&root, "openai").as_deref(), Some("gpt-5.4"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
 
     #[test]
     fn lists_sessions_newest_first_with_preview() {
