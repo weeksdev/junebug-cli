@@ -1,0 +1,25 @@
+#!/usr/bin/expect -f
+set timeout 30
+set ws [lindex $argv 0]
+cd $ws
+spawn env -u OPENROUTER_API_KEY -u OPENAI_API_KEY -u DEEPSEEK_API_KEY HOME=$ws/home /Users/andrewweeks/repos/junie_cli/target/debug/febo
+expect { "no API keys found" {} timeout { puts "\nFAIL: no-keys banner missing"; exit 1 } }
+sleep 1
+send "hi there\r"
+expect { "no model yet" {} timeout { puts "\nFAIL: prompt guard missing"; exit 1 } }
+sleep 1
+send "/keys\r"
+expect { "set an API key for which provider" {} timeout { puts "\nFAIL: keys menu missing"; exit 1 } }
+sleep 1
+send "jj\r"
+expect { "paste the deepseek API key" {} timeout { puts "\nFAIL: key prompt missing"; exit 1 } }
+sleep 1
+send "sk-dummy-test-12345\r"
+expect { "model ready: deepseek-v4-flash (deepseek)" {} timeout { puts "\nFAIL: model-ready missing"; exit 1 } }
+sleep 1
+send "/status\r"
+expect { "provider=deepseek" {} timeout { puts "\nFAIL: status missing"; exit 1 } }
+sleep 1
+send "/exit\r"
+expect eof
+puts "\nKEYS-SMOKE-PASSED"

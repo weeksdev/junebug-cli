@@ -379,24 +379,32 @@ fn run(args: &Args) {
     let config = config::load(&root).unwrap_or_else(|error| exit_argument_error(&error));
     let routing_auto = args.model.as_deref() == Some("auto")
         || (args.model.is_none() && config.routing.mode == RoutingMode::Auto);
-    let kind = resolve_provider_kind(args, &root);
-    // The model is sticky across sessions like the provider: an explicit
-    // --model wins, else the model in effect when the last session on this
-    // provider ended, else the provider default.
-    let pinned_model = args
-        .model
-        .clone()
-        .filter(|model| model != "auto")
-        .or_else(|| {
-            let sticky = febo_cli::session::last_model(&root, kind.name());
-            if let Some(model) = &sticky {
-                eprintln!("{DIM}using model {model} from your last session{RESET}");
-            }
-            sticky
-        });
-    let mut provider = match OpenAiCompatibleProvider::from_environment(kind, pinned_model) {
-        Ok(provider) => provider,
-        Err(error) => exit_argument_error(&error),
+    // Interactive with no usable credentials starts in no-model mode
+    // instead of erroring; /keys sets a key and brings a model up in-place.
+    let no_credentials =
+        args.provider.is_none() && febo_cli::provider::available_providers().is_empty();
+    let mut provider: Option<OpenAiCompatibleProvider> = if interactive && no_credentials {
+        None
+    } else {
+        let kind = resolve_provider_kind(args, &root);
+        // The model is sticky across sessions like the provider: an explicit
+        // --model wins, else the model in effect when the last session on
+        // this provider ended, else the provider default.
+        let pinned_model = args
+            .model
+            .clone()
+            .filter(|model| model != "auto")
+            .or_else(|| {
+                let sticky = febo_cli::session::last_model(&root, kind.name());
+                if let Some(model) = &sticky {
+                    eprintln!("{DIM}using model {model} from your last session{RESET}");
+                }
+                sticky
+            });
+        match OpenAiCompatibleProvider::from_environment(kind, pinned_model) {
+            Ok(provider) => Some(provider),
+            Err(error) => exit_argument_error(&error),
+        }
     };
     let workspace = Workspace::new(root.clone());
     // Checkpoints are best-effort: without git (or with --no-checkpoints)
@@ -433,12 +441,14 @@ fn run(args: &Args) {
     .unwrap_or_else(|error| exit_runtime_error(&error));
     // Record the provider and starting model so future runs default to them
     // even when the model is never switched mid-session.
-    session
-        .record("provider", provider.name())
-        .unwrap_or_else(|error| exit_runtime_error(&error));
-    session
-        .record("model", provider.model())
-        .unwrap_or_else(|error| exit_runtime_error(&error));
+    if let Some(provider) = provider.as_ref() {
+        session
+            .record("provider", provider.name())
+            .unwrap_or_else(|error| exit_runtime_error(&error));
+        session
+            .record("model", provider.model())
+            .unwrap_or_else(|error| exit_runtime_error(&error));
+    }
     if args.hooks {
         run_hooks(&root, "session_start", &session);
     }
@@ -469,12 +479,14 @@ fn run(args: &Args) {
     if resume_compact {
         if context::serialized_len(&messages) < 4_000 {
             eprintln!("{DIM}resumed history is small; compaction skipped{RESET}");
-        } else {
+        } else if let Some(provider) = provider.as_ref() {
             eprint!("{DIM}compacting resumed history…{RESET}");
-            match compact_history(&provider, &mut messages, &session) {
+            match compact_history(provider, &mut messages, &session) {
                 Ok((before, after)) => eprintln!("{DIM} {before} → {after} messages{RESET}"),
                 Err(error) => eprintln!("{DIM} failed: {error}{RESET}"),
             }
+        } else {
+            eprintln!("{DIM}no model configured; compaction skipped{RESET}");
         }
     }
     if interactive {
@@ -492,6 +504,7 @@ fn run(args: &Args) {
             checkpointer.as_ref(),
         );
     } else {
+        let provider = provider.expect("non-interactive runs always resolve a provider");
         let policy = PolicyEngine::new(args.permission, args.plan);
         let mut approve = |message: &str| -> bool {
             if args.json || !io::stdin().is_terminal() {
@@ -668,7 +681,7 @@ impl TurnObserver for ChannelObserver {
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn repl(
-    provider: &mut OpenAiCompatibleProvider,
+    provider: &mut Option<OpenAiCompatibleProvider>,
     workspace: &Workspace,
     root: &Path,
     tools: &[Value],
@@ -681,17 +694,26 @@ fn repl(
     checkpointer: Option<&Checkpointer>,
 ) {
     let mut routing_auto = routing_auto;
-    let mut current_model = provider.model().to_owned();
-    let mut current_provider = provider.name().to_owned();
+    let mut current_model = provider
+        .as_ref()
+        .map_or_else(|| "no model".to_owned(), |p| p.model().to_owned());
+    let mut current_provider = provider
+        .as_ref()
+        .map_or_else(|| "none".to_owned(), |p| p.name().to_owned());
     let mut current_band = None::<String>;
     let mut task_switches = 0usize;
     banner(
-        provider,
+        provider.as_ref(),
         args,
         session,
         routing_auto,
         routing_config.routes.len(),
     );
+    if provider.is_none() {
+        eprintln!(
+            "{BOLD}no API keys found{RESET} — run {BOLD}/keys{RESET} to add one and pick a provider; nothing else is needed"
+        );
+    }
     let mut editor = Editor::new(root.to_path_buf());
     // Permission can change mid-session via /permissions; plan mode is fixed
     // for the run and keeps a hard read-only guard on top of any mode.
@@ -713,7 +735,7 @@ fn repl(
             match name {
                 "exit" | "quit" => break,
                 "help" => eprintln!(
-                    "{BOLD}/model{RESET}         pick or switch the model (↑/↓, enter)\n{BOLD}/permissions{RESET}   change what Febo may do without asking\n{BOLD}/rewind{RESET}        restore workspace files to an earlier checkpoint\n{BOLD}/swarm-setup{RESET}   assign models to swarm roles (boss/worker/checker)\n{BOLD}/swarm{RESET} GOAL    run a boss/worker/checker model swarm on a goal\n{BOLD}/compact{RESET}       summarize the conversation to free context\n{BOLD}/status{RESET}        provider, model, permissions, session\n{BOLD}/diff{RESET}          show the uncommitted Git diff\n{BOLD}/exit{RESET}          quit (Ctrl-D also works)\n\n{DIM}@path attaches a workspace file · esc interrupts a running turn{RESET}"
+                    "{BOLD}/keys{RESET}          set or replace a provider API key (input hidden)\n{BOLD}/model{RESET}         pick or switch the model (↑/↓, enter)\n{BOLD}/permissions{RESET}   change what Febo may do without asking\n{BOLD}/rewind{RESET}        restore workspace files to an earlier checkpoint\n{BOLD}/swarm-setup{RESET}   assign models to swarm roles (boss/worker/checker)\n{BOLD}/swarm{RESET} GOAL    run a boss/worker/checker model swarm on a goal\n{BOLD}/compact{RESET}       summarize the conversation to free context\n{BOLD}/status{RESET}        provider, model, permissions, session\n{BOLD}/diff{RESET}          show the uncommitted Git diff\n{BOLD}/exit{RESET}          quit (Ctrl-D also works)\n\n{DIM}@path attaches a workspace file · esc interrupts a running turn{RESET}"
                 ),
                 "status" => eprintln!(
                     "routing={} provider={} model={} band={} switches_this_task={} permission={} plan={} messages={} checkpoints={} session={}",
@@ -743,15 +765,26 @@ fn repl(
                     eprintln!("routing enabled — model will be selected on the next turn");
                 }
                 "model" => {
-                    handle_model_command(provider, session, argument);
+                    let Some(active) = provider.as_mut() else {
+                        eprintln!("no model yet — run {BOLD}/keys{RESET} to add an API key first");
+                        continue;
+                    };
+                    handle_model_command(active, session, argument);
                     routing_auto = false;
-                    provider.model().clone_into(&mut current_model);
-                    provider.name().clone_into(&mut current_provider);
+                    active.model().clone_into(&mut current_model);
+                    active.name().clone_into(&mut current_provider);
                     current_band = None;
                     eprintln!(
                         "{DIM}routing disabled — pinned to {}{RESET}",
-                        provider.model()
+                        active.model()
                     );
+                }
+                "keys" | "key" => {
+                    handle_keys_command(provider, root, session);
+                    if let Some(active) = provider.as_ref() {
+                        active.model().clone_into(&mut current_model);
+                        active.name().clone_into(&mut current_provider);
+                    }
                 }
                 "permissions" | "permission" => {
                     handle_permissions_command(&mut permission, args.plan, session, argument);
@@ -776,8 +809,12 @@ fn repl(
                     }
                 }
                 "compact" => {
+                    let Some(active) = provider.as_ref() else {
+                        eprintln!("no model yet — run {BOLD}/keys{RESET} to add an API key first");
+                        continue;
+                    };
                     eprint!("{DIM}compacting…{RESET}");
-                    match compact_history(provider, messages, session) {
+                    match compact_history(active, messages, session) {
                         Ok((before, after)) => {
                             eprintln!("{DIM} {before} → {after} messages{RESET}");
                         }
@@ -788,10 +825,14 @@ fn repl(
             }
             continue;
         }
+        let Some(active) = provider.as_ref() else {
+            eprintln!("no model yet — run {BOLD}/keys{RESET} to add an API key first");
+            continue;
+        };
         let expanded = expand_mentions(workspace, input);
         let policy = PolicyEngine::new(permission, args.plan);
         if let Some(outcome) = run_interactive_turn(
-            provider,
+            active,
             workspace,
             tools,
             policy,
@@ -1354,6 +1395,125 @@ fn handle_rewind_command(checkpointer: Option<&Checkpointer>, session: &SessionW
             );
         }
         Err(error) => eprintln!("{RED}error:{RESET} {error}"),
+    }
+}
+
+/// Read a secret from the terminal without echoing it (asterisks only).
+/// Esc or Ctrl-C cancels. The value never touches the session log, the
+/// conversation, or the model — only the credential store.
+fn read_secret() -> Option<String> {
+    if !io::stdin().is_terminal() {
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer).ok()?;
+        let answer = answer.trim().to_owned();
+        return (!answer.is_empty()).then_some(answer);
+    }
+    let raw = terminal::enable_raw_mode().is_ok();
+    let mut secret = String::new();
+    let entered = loop {
+        match event::read() {
+            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Enter => break true,
+                KeyCode::Esc => break false,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    break false;
+                }
+                KeyCode::Backspace if secret.pop().is_some() => {
+                    eprint!("\x08 \x08");
+                    let _ = io::stderr().flush();
+                }
+                KeyCode::Char(c) => {
+                    secret.push(c);
+                    eprint!("*");
+                    let _ = io::stderr().flush();
+                }
+                _ => {}
+            },
+            Ok(_) => {}
+            Err(_) => break false,
+        }
+    };
+    if raw {
+        let _ = terminal::disable_raw_mode();
+    }
+    eprintln!();
+    if !entered {
+        return None;
+    }
+    let secret = secret.trim().to_owned();
+    (!secret.is_empty()).then_some(secret)
+}
+
+/// `/keys` — pick a provider and set (or replace) its API key from inside
+/// the REPL. The key goes to `~/.febo/credentials.env` (0600 on unix) and is
+/// never shown, logged, or exposed to the model. When Febo started with no
+/// model, the first saved key brings one up immediately.
+fn handle_keys_command(
+    provider: &mut Option<OpenAiCompatibleProvider>,
+    root: &Path,
+    session: &SessionWriter,
+) {
+    let kinds = ProviderKind::all();
+    let choices: Vec<Choice> = kinds
+        .iter()
+        .map(|kind| {
+            Choice::new(
+                kind.name(),
+                if kind.has_credential() {
+                    "configured"
+                } else {
+                    "no key"
+                },
+            )
+        })
+        .collect();
+    let Some(index) = editor::select_menu("Keys — set an API key for which provider?", &choices, 0)
+    else {
+        eprintln!("{DIM}unchanged{RESET}");
+        return;
+    };
+    let kind = kinds[index];
+    eprint!(
+        "paste the {} API key ({}) — input hidden, esc cancels: ",
+        kind.name(),
+        kind.api_key_environment()
+    );
+    let _ = io::stderr().flush();
+    let Some(key) = read_secret() else {
+        eprintln!("{DIM}unchanged{RESET}");
+        return;
+    };
+    match store_credential(kind, &key) {
+        Ok(path) => {
+            let _ = session.record("credential_saved", kind.name());
+            eprintln!(
+                "saved {} for {} to {}",
+                kind.api_key_environment(),
+                kind.name(),
+                path.display()
+            );
+        }
+        Err(error) => {
+            eprintln!("{RED}error:{RESET} could not save credential: {error}");
+            return;
+        }
+    }
+    // Bring a model up on the spot when Febo started without one.
+    if provider.is_none() {
+        let sticky = febo_cli::session::last_model(root, kind.name());
+        match OpenAiCompatibleProvider::from_environment(kind, sticky) {
+            Ok(active) => {
+                let _ = session.record("provider", active.name());
+                let _ = session.record("model", active.model());
+                eprintln!(
+                    "{BOLD}model ready:{RESET} {} ({}) — just type to chat, or /model to switch",
+                    active.model(),
+                    active.name()
+                );
+                *provider = Some(active);
+            }
+            Err(error) => eprintln!("{RED}error:{RESET} {error}"),
+        }
     }
 }
 
@@ -1961,21 +2121,22 @@ fn compact_history(
 }
 
 fn banner(
-    provider: &OpenAiCompatibleProvider,
+    provider: Option<&OpenAiCompatibleProvider>,
     args: &Args,
     session: &SessionWriter,
     routing_auto: bool,
     route_count: usize,
 ) {
     let title = format!("✻ Febo CLI v{VERSION}");
+    let model_part = match provider {
+        Some(_) if routing_auto => format!("routing: auto ({route_count} bands)"),
+        Some(provider) => provider.model().to_owned(),
+        None => "no model — /keys to add one".to_owned(),
+    };
     let detail = format!(
         "{} · {} · {}",
-        provider.name(),
-        if routing_auto {
-            format!("routing: auto ({route_count} bands)")
-        } else {
-            provider.model().to_owned()
-        },
+        provider.map_or("no provider", OpenAiCompatibleProvider::name),
+        model_part,
         if args.plan {
             "plan (read-only)"
         } else {

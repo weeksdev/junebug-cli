@@ -9,15 +9,22 @@ use std::path::{Path, PathBuf};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 
-pub const SLASH_COMMANDS: [(&str, &str); 8] = [
+pub const SLASH_COMMANDS: [(&str, &str); 12] = [
     ("/compact", "summarize the conversation to free context"),
     ("/diff", "show the uncommitted Git diff"),
     ("/exit", "quit (Ctrl-D also works)"),
     ("/help", "show help"),
+    ("/keys", "set or replace a provider API key"),
     ("/model", "pick or switch the model"),
     ("/permissions", "change what Febo may do without asking"),
     ("/quit", "quit"),
+    (
+        "/rewind",
+        "restore workspace files to an earlier checkpoint",
+    ),
     ("/status", "provider, model, permissions, session"),
+    ("/swarm", "run a boss/worker/checker model swarm on a goal"),
+    ("/swarm-setup", "assign models to swarm roles"),
 ];
 
 const MENU_LIMIT: usize = 8;

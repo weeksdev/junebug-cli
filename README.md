@@ -18,6 +18,8 @@ Save a provider API key once (stored in `~/.febo/credentials.env`, `0600`) and s
 febo set --provider deepseek YOUR_API_KEY
 ```
 
+Or just run `febo` with nothing configured: it starts in no-model mode and `/keys` sets a key from inside the REPL (arrow-key provider picker, hidden input) and brings a model up on the spot — no restart. Keys never appear in session logs and are never exposed to the model.
+
 ```sh
 cargo run -- --help
 OPENROUTER_API_KEY=... cargo run -- "Describe this project"
@@ -34,7 +36,7 @@ The CLI uses standard provider environment variables and also reads an ignored `
 ## Current commands
 
 - `febo` — interactive REPL with a Claude Code-style terminal UI: streamed Markdown rendering, a spinner with elapsed time, `⏺ tool(args)` / `⎿ result` activity lines, and **Esc to interrupt** a running turn (the partial reply stays in context; your next message continues from it).
-  - Slash commands: `/help`, `/model` (arrow-key pick from the provider's live model list), `/permissions` (arrow-key switch between read-only / ask / workspace-write / **yolo** mid-session), `/rewind` (restore workspace files to an earlier checkpoint), `/compact` (model-written summary replaces old history), `/status`, `/diff`, `/exit`. A dimmed status line under the prompt always shows the current model and access level.
+  - Slash commands: `/help`, `/keys` (set or replace a provider API key, input hidden), `/model` (arrow-key pick from the provider's live model list), `/permissions` (arrow-key switch between read-only / ask / workspace-write / **yolo** mid-session), `/rewind` (restore workspace files to an earlier checkpoint), `/compact` (model-written summary replaces old history), `/status`, `/diff`, `/exit`. A dimmed status line under the prompt always shows the current model and access level.
   - Input intellisense: typing `/` opens a slash-command menu; typing `@` opens a workspace file search menu (↑/↓ select, Tab/Enter accept). Accepted `@path` mentions attach the file's contents to your message.
   - Line editing: arrows, Home/End, Ctrl-A/E/U/K, and ↑/↓ history.
 - `febo [prompt]` — single prompt execution with approval prompts for writes and commands.
