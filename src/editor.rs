@@ -358,6 +358,8 @@ pub struct Choice {
     pub label: String,
     /// Optional dimmed hint shown after the label.
     pub hint: String,
+    /// Section labels are rendered but skipped by keyboard navigation.
+    selectable: bool,
 }
 
 impl Choice {
@@ -366,6 +368,17 @@ impl Choice {
         Self {
             label: label.into(),
             hint: hint.into(),
+            selectable: true,
+        }
+    }
+
+    /// A non-selectable heading used to group related choices.
+    #[must_use]
+    pub fn section(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            hint: String::new(),
+            selectable: false,
         }
     }
 }
@@ -375,13 +388,16 @@ impl Choice {
 /// terminal is available. `initial` is the pre-highlighted row.
 #[must_use]
 pub fn select_menu(title: &str, choices: &[Choice], initial: usize) -> Option<usize> {
-    if choices.is_empty() {
+    if choices.is_empty() || choices.iter().all(|choice| !choice.selectable) {
         return None;
     }
     if !io::stdin().is_terminal() || terminal::enable_raw_mode().is_err() {
         return None;
     }
     let mut selected = initial.min(choices.len() - 1);
+    if !choices[selected].selectable {
+        selected = next_selectable(choices, selected, 1)?;
+    }
     let result = loop {
         draw_select(title, choices, selected);
         let Ok(Event::Key(key)) = event::read() else {
@@ -393,10 +409,10 @@ pub fn select_menu(title: &str, choices: &[Choice], initial: usize) -> Option<us
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
-                selected = selected.checked_sub(1).unwrap_or(choices.len() - 1);
+                selected = next_selectable(choices, selected, -1)?;
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                selected = (selected + 1) % choices.len();
+                selected = next_selectable(choices, selected, 1)?;
             }
             KeyCode::Enter | KeyCode::Tab => break Some(selected),
             KeyCode::Esc => break None,
@@ -411,12 +427,41 @@ pub fn select_menu(title: &str, choices: &[Choice], initial: usize) -> Option<us
     result
 }
 
+fn next_selectable(choices: &[Choice], selected: usize, direction: isize) -> Option<usize> {
+    let mut index = selected;
+    for _ in 0..choices.len() {
+        index = if direction < 0 {
+            index.checked_sub(1).unwrap_or(choices.len() - 1)
+        } else {
+            (index + 1) % choices.len()
+        };
+        if choices[index].selectable {
+            return Some(index);
+        }
+    }
+    None
+}
+
 fn draw_select(title: &str, choices: &[Choice], selected: usize) {
     use std::fmt::Write as _;
+    // Reserve space for the title, scroll indicators, and the prompt area
+    // below the picker. The selected row stays centered where possible.
+    let terminal_rows = terminal::size().map_or(24, |(_, rows)| usize::from(rows));
+    let item_capacity = terminal_rows.saturating_sub(6).max(3);
+    let (start, end) = select_window(choices.len(), selected, item_capacity);
     let mut output = format!("\r\x1b[J\x1b[1m{title}\x1b[0m");
-    for (index, choice) in choices.iter().enumerate() {
+    let mut rendered_rows = 0usize;
+    if start > 0 {
+        let _ = write!(output, "\r\n{DIM}    ↑ {start} more{RESET}");
+        rendered_rows += 1;
+    }
+    for (index, choice) in choices.iter().enumerate().take(end).skip(start) {
         output.push_str("\r\n");
-        if index == selected {
+        rendered_rows += 1;
+        if !choice.selectable {
+            output.push_str(DIM);
+            output.push_str("  ─ ");
+        } else if index == selected {
             output.push_str(INVERSE);
             output.push_str("  ▸ ");
         } else {
@@ -428,10 +473,23 @@ fn draw_select(title: &str, choices: &[Choice], selected: usize) {
             let _ = write!(output, "  {DIM}{}{RESET}", choice.hint);
         }
     }
+    if end < choices.len() {
+        let _ = write!(output, "\r\n{DIM}    ↓ {} more{RESET}", choices.len() - end);
+        rendered_rows += 1;
+    }
     // Return the cursor to the title row so the next redraw overwrites cleanly.
-    let _ = write!(output, "\x1b[{}A\r", choices.len());
+    let _ = write!(output, "\x1b[{rendered_rows}A\r");
     eprint!("{output}");
     let _ = io::stderr().flush();
+}
+
+fn select_window(length: usize, selected: usize, capacity: usize) -> (usize, usize) {
+    if length <= capacity {
+        return (0, length);
+    }
+    let half = capacity / 2;
+    let start = selected.saturating_sub(half).min(length - capacity);
+    (start, start + capacity)
 }
 
 /// Collect relative paths of workspace files for completion, skipping
@@ -490,7 +548,9 @@ fn filter_files(files: &[String], query: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompletionContext, completion_context, filter_files};
+    use super::{
+        Choice, CompletionContext, completion_context, filter_files, next_selectable, select_window,
+    };
 
     fn chars(text: &str) -> Vec<char> {
         text.chars().collect()
@@ -538,5 +598,26 @@ mod tests {
         assert_eq!(matches[0], "docs/main-notes.md");
         assert_eq!(matches[1], "src/main.rs");
         assert!(!matches.contains(&"src/lib.rs".to_owned()));
+    }
+
+    #[test]
+    fn grouped_menu_navigation_skips_section_headings() {
+        let choices = vec![
+            Choice::section("openai"),
+            Choice::new("gpt", ""),
+            Choice::section("anthropic"),
+            Choice::new("claude", ""),
+        ];
+        assert_eq!(next_selectable(&choices, 1, 1), Some(3));
+        assert_eq!(next_selectable(&choices, 3, 1), Some(1));
+        assert_eq!(next_selectable(&choices, 1, -1), Some(3));
+    }
+
+    #[test]
+    fn selection_window_scrolls_to_follow_highlighted_row() {
+        assert_eq!(select_window(100, 0, 10), (0, 10));
+        assert_eq!(select_window(100, 50, 10), (45, 55));
+        assert_eq!(select_window(100, 99, 10), (90, 100));
+        assert_eq!(select_window(5, 4, 10), (0, 5));
     }
 }

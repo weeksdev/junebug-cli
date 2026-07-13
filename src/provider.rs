@@ -1,4 +1,5 @@
-//! Provider-neutral streaming model contract and OpenAI-compatible REST client.
+//! Provider-neutral streaming model contract with OpenAI-compatible and
+//! Anthropic Messages REST adapters.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
@@ -54,6 +55,7 @@ pub enum ProviderKind {
     OpenAi,
     OpenRouter,
     DeepSeek,
+    Anthropic,
 }
 
 impl ProviderKind {
@@ -65,8 +67,9 @@ impl ProviderKind {
             "openai" => Ok(Self::OpenAi),
             "openrouter" => Ok(Self::OpenRouter),
             "deepseek" => Ok(Self::DeepSeek),
+            "anthropic" | "claude" => Ok(Self::Anthropic),
             _ => Err(format!(
-                "unsupported provider '{value}'; use openai, openrouter, or deepseek"
+                "unsupported provider '{value}'; use openai, openrouter, deepseek, or anthropic"
             )),
         }
     }
@@ -76,6 +79,7 @@ impl ProviderKind {
             Self::OpenAi => "openai",
             Self::OpenRouter => "openrouter",
             Self::DeepSeek => "deepseek",
+            Self::Anthropic => "anthropic",
         }
     }
     #[must_use]
@@ -84,6 +88,7 @@ impl ProviderKind {
             Self::OpenAi => "https://api.openai.com/v1/chat/completions",
             Self::OpenRouter => "https://openrouter.ai/api/v1/chat/completions",
             Self::DeepSeek => "https://api.deepseek.com/chat/completions",
+            Self::Anthropic => "https://api.anthropic.com/v1/messages",
         }
     }
     #[must_use]
@@ -92,6 +97,7 @@ impl ProviderKind {
             Self::OpenAi => "https://api.openai.com/v1/models",
             Self::OpenRouter => "https://openrouter.ai/api/v1/models",
             Self::DeepSeek => "https://api.deepseek.com/models",
+            Self::Anthropic => "https://api.anthropic.com/v1/models",
         }
     }
 
@@ -101,6 +107,7 @@ impl ProviderKind {
             Self::OpenAi => "OPENAI_API_KEY",
             Self::OpenRouter => "OPENROUTER_API_KEY",
             Self::DeepSeek => "DEEPSEEK_API_KEY",
+            Self::Anthropic => "ANTHROPIC_API_KEY",
         }
     }
     #[must_use]
@@ -109,13 +116,19 @@ impl ProviderKind {
             Self::OpenAi => "gpt-4.1-mini",
             Self::OpenRouter => "openrouter/free",
             Self::DeepSeek => "deepseek-v4-flash",
+            Self::Anthropic => "claude-sonnet-4-5",
         }
     }
 
     /// All supported providers, in default preference order.
     #[must_use]
-    pub const fn all() -> [Self; 3] {
-        [Self::OpenRouter, Self::OpenAi, Self::DeepSeek]
+    pub const fn all() -> [Self; 4] {
+        [
+            Self::OpenRouter,
+            Self::OpenAi,
+            Self::Anthropic,
+            Self::DeepSeek,
+        ]
     }
 
     /// Whether a credential for this provider is available from the
@@ -137,6 +150,9 @@ pub fn available_providers() -> Vec<ProviderKind> {
         .collect()
 }
 
+/// Authenticated REST provider. The historical type name is retained to keep
+/// the public API stable; Anthropic requests branch into their own adapter at
+/// the provider edge.
 pub struct OpenAiCompatibleProvider {
     kind: ProviderKind,
     api_key: String,
@@ -212,12 +228,18 @@ impl OpenAiCompatibleProvider {
     /// Returns an error for transport failures or an unexpected response
     /// shape.
     pub fn list_models(&self) -> Result<Vec<String>, String> {
-        let response = self
+        let mut request = self
             .client
             .get(self.kind.models_endpoint())
-            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
-            .send()
-            .map_err(|error| error.to_string())?;
+            .timeout(CONNECT_TIMEOUT);
+        request = if self.kind == ProviderKind::Anthropic {
+            request
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+        } else {
+            request.header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+        };
+        let response = request.send().map_err(|error| error.to_string())?;
         let status = response.status();
         if !status.is_success() {
             return Err(format!("{} returned {status}", self.kind.name()));
@@ -334,6 +356,9 @@ impl ModelProvider for OpenAiCompatibleProvider {
         tools: &[Value],
         cancel: &AtomicBool,
     ) -> Result<ModelTurn, String> {
+        if self.kind == ProviderKind::Anthropic {
+            return self.stream_anthropic(model, messages, tools, cancel);
+        }
         let mut body = json!({"model": model, "stream": true, "stream_options": {"include_usage": true}, "messages": messages});
         // OpenAI-compatible endpoints reject an empty tools array, so only
         // send the fields when at least one tool is offered.
@@ -366,6 +391,256 @@ impl ModelProvider for OpenAiCompatibleProvider {
         }
         parse_sse(response, cancel)
     }
+}
+
+impl OpenAiCompatibleProvider {
+    fn stream_anthropic(
+        &self,
+        model: &str,
+        messages: &[Value],
+        tools: &[Value],
+        cancel: &AtomicBool,
+    ) -> Result<ModelTurn, String> {
+        let (system, messages) = anthropic_messages(messages);
+        let mut body = json!({
+            "model": model,
+            "max_tokens": 8192,
+            "stream": true,
+            "messages": messages,
+        });
+        if !system.is_empty() {
+            body["system"] = Value::String(system);
+        }
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(tools.iter().filter_map(anthropic_tool).collect());
+        }
+        let response = self
+            .client
+            .post(self.kind.endpoint())
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header(CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!(
+                "anthropic returned {status}: {}",
+                response.text().unwrap_or_default()
+            ));
+        }
+        parse_anthropic_sse(BufReader::new(response), cancel)
+    }
+}
+
+fn anthropic_tool(tool: &Value) -> Option<Value> {
+    let function = tool.get("function")?;
+    Some(json!({
+        "name": function.get("name")?,
+        "description": function.get("description").cloned().unwrap_or(Value::String(String::new())),
+        "input_schema": function.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object"})),
+    }))
+}
+
+/// Translate Febo's canonical OpenAI-shaped transcript at the provider edge.
+/// Keeping this conversion here allows a conversation to switch providers
+/// between turns without changing the session or agent-loop formats.
+fn anthropic_messages(messages: &[Value]) -> (String, Vec<Value>) {
+    let mut system = Vec::new();
+    let mut translated = Vec::<Value>::new();
+    for message in messages {
+        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+        match role {
+            "system" => {
+                if let Some(text) = message.get("content").and_then(Value::as_str) {
+                    system.push(text.to_owned());
+                }
+            }
+            "user" => translated.push(json!({
+                "role": "user",
+                "content": message.get("content").cloned().unwrap_or(Value::String(String::new())),
+            })),
+            "assistant" => {
+                let mut content = Vec::new();
+                if let Some(text) = message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                {
+                    content.push(json!({"type": "text", "text": text}));
+                }
+                if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+                    for call in calls {
+                        let Some(function) = call.get("function") else {
+                            continue;
+                        };
+                        let arguments = function
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .and_then(|value| serde_json::from_str(value).ok())
+                            .unwrap_or_else(|| json!({}));
+                        content.push(json!({
+                            "type": "tool_use",
+                            "id": call.get("id").cloned().unwrap_or(Value::String(String::new())),
+                            "name": function.get("name").cloned().unwrap_or(Value::String(String::new())),
+                            "input": arguments,
+                        }));
+                    }
+                }
+                translated.push(json!({"role": "assistant", "content": content}));
+            }
+            "tool" => {
+                let block = json!({
+                    "type": "tool_result",
+                    "tool_use_id": message.get("tool_call_id").cloned().unwrap_or(Value::String(String::new())),
+                    "content": message.get("content").cloned().unwrap_or(Value::String(String::new())),
+                    "is_error": message.get("content").and_then(Value::as_str).is_some_and(|text| text.starts_with("ERROR:")),
+                });
+                if let Some(last) = translated.last_mut()
+                    && last.get("role").and_then(Value::as_str) == Some("user")
+                    && let Some(content) = last.get_mut("content").and_then(Value::as_array_mut)
+                    && content
+                        .first()
+                        .and_then(|item| item.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("tool_result")
+                {
+                    content.push(block);
+                } else {
+                    translated.push(json!({"role": "user", "content": [block]}));
+                }
+            }
+            _ => {}
+        }
+    }
+    (system.join("\n\n"), translated)
+}
+
+#[derive(Default)]
+struct AnthropicToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+#[allow(clippy::too_many_lines)]
+fn parse_anthropic_sse(reader: impl BufRead, cancel: &AtomicBool) -> Result<ModelTurn, String> {
+    let mut text_deltas = Vec::new();
+    let mut text = String::new();
+    let mut partial_calls = BTreeMap::<usize, AnthropicToolCall>::new();
+    let mut input_tokens = 0;
+    let mut output_tokens = 0;
+    let mut interrupted = false;
+    for line in reader.lines() {
+        if cancel.load(Ordering::Relaxed) {
+            partial_calls.clear();
+            interrupted = true;
+            break;
+        }
+        let line = line.map_err(|error| error.to_string())?;
+        let Some(payload) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let event: Value = serde_json::from_str(payload)
+            .map_err(|error| format!("invalid Anthropic SSE JSON: {error}"))?;
+        if event.get("type").and_then(Value::as_str) == Some("error") {
+            return Err(format!("provider stream error: {}", event["error"]));
+        }
+        input_tokens = event
+            .pointer("/message/usage/input_tokens")
+            .or_else(|| event.pointer("/usage/input_tokens"))
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(input_tokens);
+        output_tokens = event
+            .pointer("/message/usage/output_tokens")
+            .or_else(|| event.pointer("/usage/output_tokens"))
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(output_tokens);
+        let index = event
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(0);
+        match event.get("type").and_then(Value::as_str) {
+            Some("content_block_start")
+                if event.pointer("/content_block/type").and_then(Value::as_str)
+                    == Some("tool_use") =>
+            {
+                partial_calls.insert(
+                    index,
+                    AnthropicToolCall {
+                        id: event
+                            .pointer("/content_block/id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                        name: event
+                            .pointer("/content_block/name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                        arguments: String::new(),
+                    },
+                );
+            }
+            Some("content_block_delta") => {
+                if let Some(delta) = event.pointer("/delta/text").and_then(Value::as_str) {
+                    text.push_str(delta);
+                    text_deltas.push(delta.to_owned());
+                }
+                if let Some(delta) = event.pointer("/delta/partial_json").and_then(Value::as_str)
+                    && let Some(call) = partial_calls.get_mut(&index)
+                {
+                    call.arguments.push_str(delta);
+                }
+            }
+            _ => {}
+        }
+    }
+    if interrupted {
+        text.push_str("\n[response interrupted by user]");
+    }
+    let tool_calls = partial_calls
+        .into_values()
+        .filter(|call| !call.name.is_empty())
+        .map(|call| ToolCall {
+            id: call.id,
+            name: call.name,
+            arguments: if call.arguments.is_empty() {
+                "{}".to_owned()
+            } else {
+                call.arguments
+            },
+        })
+        .collect::<Vec<_>>();
+    let mut assistant_message = json!({
+        "role": "assistant",
+        "content": if text.is_empty() { Value::Null } else { Value::String(text) },
+    });
+    if !tool_calls.is_empty() {
+        assistant_message["tool_calls"] = Value::Array(
+            tool_calls
+                .iter()
+                .map(|call| {
+                    json!({
+                        "id": call.id,
+                        "type": "function",
+                        "function": {"name": call.name, "arguments": call.arguments},
+                    })
+                })
+                .collect(),
+        );
+    }
+    Ok(ModelTurn {
+        text_deltas,
+        tool_calls,
+        assistant_message,
+        input_tokens,
+        output_tokens,
+    })
 }
 
 #[derive(Default)]
@@ -478,7 +753,12 @@ fn parse_sse(
 
 #[cfg(test)]
 mod tests {
-    use super::{ProviderKind, env_file_value, store_credential_at};
+    use super::{
+        ProviderKind, anthropic_messages, env_file_value, parse_anthropic_sse, store_credential_at,
+    };
+    use serde_json::json;
+    use std::io::Cursor;
+    use std::sync::atomic::AtomicBool;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -487,7 +767,51 @@ mod tests {
             ProviderKind::parse("openrouter"),
             Ok(ProviderKind::OpenRouter)
         );
+        assert_eq!(ProviderKind::parse("claude"), Ok(ProviderKind::Anthropic));
         assert!(ProviderKind::parse("fake").is_err());
+    }
+
+    #[test]
+    fn translates_canonical_tool_history_for_anthropic() {
+        let messages = vec![
+            json!({"role":"system","content":"be careful"}),
+            json!({"role":"user","content":"read it"}),
+            json!({"role":"assistant","content":null,"tool_calls":[
+                {"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}},
+                {"id":"call-2","type":"function","function":{"name":"git_status","arguments":"{}"}}
+            ]}),
+            json!({"role":"tool","tool_call_id":"call-1","content":"contents"}),
+            json!({"role":"tool","tool_call_id":"call-2","content":"ERROR: unavailable"}),
+        ];
+        let (system, translated) = anthropic_messages(&messages);
+        assert_eq!(system, "be careful");
+        assert_eq!(translated[1]["content"][0]["type"], "tool_use");
+        assert_eq!(translated[1]["content"][0]["input"]["path"], "README.md");
+        assert_eq!(translated[2]["role"], "user");
+        assert_eq!(translated[2]["content"].as_array().map(Vec::len), Some(2));
+        assert_eq!(translated[2]["content"][1]["tool_use_id"], "call-2");
+        assert_eq!(translated[2]["content"][1]["is_error"], true);
+    }
+
+    #[test]
+    fn parses_anthropic_text_tools_and_usage_into_canonical_turn() {
+        let stream = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":1}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Checking\"}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read_file\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let turn = parse_anthropic_sse(Cursor::new(stream), &AtomicBool::new(false))
+            .expect("valid Anthropic stream");
+        assert_eq!(turn.text_deltas, ["Checking"]);
+        assert_eq!(turn.input_tokens, 12);
+        assert_eq!(turn.output_tokens, 9);
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "read_file");
+        assert_eq!(turn.tool_calls[0].arguments, r#"{"path":"README.md"}"#);
+        assert_eq!(turn.assistant_message["tool_calls"][0]["id"], "toolu_1");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 Febo CLI is an open-source, local-first coding agent for Febo models.
 
-This initial foundation intentionally defaults to read-only workspace access. It includes a provider-neutral event contract, safe read/search tools, and streaming REST support for OpenAI, OpenRouter, and DeepSeek.
+This initial foundation intentionally defaults to read-only workspace access. It includes a provider-neutral event contract, safe read/search tools, and streaming REST support for OpenAI, OpenRouter, DeepSeek, and Anthropic Claude.
 
 Install on macOS (builds from source, installs to `~/.local/bin/febo`):
 
@@ -25,9 +25,10 @@ cargo run -- --help
 OPENROUTER_API_KEY=... cargo run -- "Describe this project"
 OPENAI_API_KEY=... cargo run -- --provider openai --model gpt-4.1-mini "Describe this project"
 DEEPSEEK_API_KEY=... cargo run -- --provider deepseek --model deepseek-v4-flash "Describe this project"
+ANTHROPIC_API_KEY=... cargo run -- --provider anthropic --model claude-sonnet-4-5 "Describe this project"
 ```
 
-OpenRouter is the default provider. Use `--model` to select a model supported by the provider. See [PLAN.md](PLAN.md) for the release roadmap.
+Use `/model` to pick from one grouped list containing the live model catalogs of every provider for which you have an API key; switching providers does not require a separate provider step. `provider:model` remains available for direct selection. See [PLAN.md](PLAN.md) for the release roadmap.
 
 Automatic in-task routing is strictly opt-in: use `--model auto`, `/model auto`, or set `routing.mode` to `"auto"` in `~/.febo/config.json` (a workspace `.febo/config.json` overrides it). Configure `routing.routes` with band entries containing `provider` and `model`. Only providers with credentials are offered. By default Febo sends the routing service derived task signals—not prompts, code, filenames, diffs, or tool output. Set `routing.send_prompt` to `true` only if you explicitly want the prompt sent. The default service URL is `http://127.0.0.1:8791`; if it is unavailable, Febo prints a notice and uses local routing rules.
 
@@ -36,7 +37,7 @@ The CLI uses standard provider environment variables and also reads an ignored `
 ## Current commands
 
 - `febo` — interactive REPL with a Claude Code-style terminal UI: streamed Markdown rendering, a spinner with elapsed time, `⏺ tool(args)` / `⎿ result` activity lines, and **Esc to interrupt** a running turn (the partial reply stays in context; your next message continues from it).
-  - Slash commands: `/help`, `/keys` (set or replace a provider API key, input hidden), `/model` (arrow-key pick from the provider's live model list), `/permissions` (arrow-key switch between read-only / ask / workspace-write / **yolo** mid-session), `/rewind` (restore workspace files to an earlier checkpoint), `/compact` (model-written summary replaces old history), `/status`, `/diff`, `/exit`. A dimmed status line under the prompt always shows the current model and access level.
+  - Slash commands: `/help`, `/keys` (set or replace a provider API key, input hidden), `/model` (arrow-key pick across every configured provider's live model list), `/permissions` (arrow-key switch between read-only / ask / workspace-write / **yolo** mid-session), `/rewind` (restore workspace files to an earlier checkpoint), `/compact` (model-written summary replaces old history), `/status`, `/diff`, `/exit`. A dimmed status line under the prompt always shows the current model and access level.
   - Input intellisense: typing `/` opens a slash-command menu; typing `@` opens a workspace file search menu (↑/↓ select, Tab/Enter accept). Accepted `@path` mentions attach the file's contents to your message.
   - Line editing: arrows, Home/End, Ctrl-A/E/U/K, and ↑/↓ history.
 - `febo [prompt]` — single prompt execution with approval prompts for writes and commands.
@@ -44,7 +45,7 @@ The CLI uses standard provider environment variables and also reads an ignored `
 - `--permission read-only|ask|workspace-write|yolo` — defaults to `read-only`. `yolo` approves every write **and** command without asking (plan mode still forces read-only). Non-interactive runs require `workspace-write` or `yolo` for edits.
 - `--plan` — hard read-only guard that also hides write/command tools from the model, regardless of `--permission`.
 - `--resume [session.jsonl]` — continue a session; **with no path it lists past sessions to pick from**. `--resume-compact [session.jsonl]` additionally summarizes a large history first so resuming does not waste tokens. `--max-context-chars` bounds the request context with deterministic compaction.
-- **Model swarms** — `/swarm-setup` assigns models to three roles: a **boss** that inspects the workspace, writes a constitution + task plan, rules on disputes, and reviews the result (use your strongest model — it never writes files); a **worker** that executes each task (cheap); and a **checker** that independently verifies every task with its own tools, never trusting the worker's report (cheap). `/swarm <goal>` runs the loop: failed checks send specific feedback back to the worker (up to 2 reworks), persistent disputes escalate to the boss — which can overrule the checker — and the boss closes with an honest final report. Every step is labeled with the role and model doing it, each swarm gets its own session log, and checkpoints are taken throughout so `/rewind` can undo a swarm. Requires `ask` or `workspace-write` permission (`yolo` avoids per-step prompts).
+- **Model swarms** — `/swarm-setup` assigns models from one grouped all-provider picker to three roles: a **boss** that inspects the workspace, writes a constitution + task plan, rules on disputes, and reviews the result (use your strongest model — it never writes files); a **worker** that executes each task (cheap); and a **checker** that independently verifies every task with its own tools, never trusting the worker's report (cheap). `/swarm <goal>` runs the loop: failed checks send specific feedback back to the worker (up to 2 reworks), persistent disputes escalate to the boss — which can overrule the checker — and the boss closes with an honest final report. Every step is labeled with the role and model doing it, each swarm gets its own session log, and checkpoints are taken throughout so `/rewind` can undo a swarm. Requires `ask` or `workspace-write` permission (`yolo` avoids per-step prompts).
 - **File-change diffs** — every file write shows what changed: colored `-`/`+` line hunks with context appear in the REPL activity stream under the tool line, in `ask`-mode approval prompts (so you see exactly what you're approving before answering y/N), and as `file.diff` events in `exec --json`. Diffs are display-only and are never sent to the model.
 - **Workspace checkpoints** — before every prompt, file write, and command, Febo snapshots the workspace into a shadow Git repository under `~/.febo/checkpoints/` (your own repo is never touched; works in non-Git workspaces). `/rewind` restores files to any checkpoint, and the pre-restore state is checkpointed first so a rewind is always undoable. Snapshots respect your `.gitignore` and never capture `.env*`, `.febo/`, or build caches. Disable with `--no-checkpoints`.
 - `--enable-hooks` — run explicitly trusted `.febo/hooks.json` lifecycle commands.

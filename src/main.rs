@@ -941,9 +941,78 @@ fn permission_hint(mode: PermissionMode) -> &'static str {
     }
 }
 
-/// `/model` — no argument lists available models from the provider's
-/// standard `/models` endpoint; an argument switches, resolving unique
-/// substring matches against that list.
+/// Pick one model across every provider with a configured API key. Provider
+/// headings are visible but not selectable; their models appear below them.
+fn pick_configured_model(title: &str, current: Option<&Target>) -> Option<Target> {
+    let available = febo_cli::provider::available_providers();
+    if available.is_empty() {
+        return None;
+    }
+    eprint!("{DIM}fetching models from configured providers…{RESET}");
+    let mut choices = Vec::new();
+    let mut targets = Vec::<Option<Target>>::new();
+    let mut initial = 0;
+    for kind in available {
+        choices.push(Choice::section(kind.name()));
+        targets.push(None);
+        let provider = match OpenAiCompatibleProvider::from_environment(kind, None) {
+            Ok(provider) => provider,
+            Err(error) => {
+                eprintln!(
+                    "{CLEAR_LINE}{DIM}could not load {}: {error}{RESET}",
+                    kind.name()
+                );
+                continue;
+            }
+        };
+        let (mut models, fallback) = match provider.list_models() {
+            Ok(models) if !models.is_empty() => (models, false),
+            Ok(_) => (vec![kind.default_model().to_owned()], true),
+            Err(error) => {
+                eprintln!(
+                    "{CLEAR_LINE}{DIM}could not list {} models ({error}); showing its default{RESET}",
+                    kind.name()
+                );
+                (vec![kind.default_model().to_owned()], true)
+            }
+        };
+        if let Some(current) = current
+            && current.provider == kind.name()
+            && !models.contains(&current.model)
+        {
+            models.insert(0, current.model.clone());
+        }
+        // Keep very large catalogs navigable while still showing every
+        // configured provider. An exact provider:model argument can select
+        // anything outside this live menu window.
+        models.truncate(40);
+        for model in models {
+            let is_current = current
+                .is_some_and(|current| current.provider == kind.name() && current.model == model);
+            let hint = if is_current {
+                "current"
+            } else if fallback {
+                "default · live list unavailable"
+            } else {
+                ""
+            };
+            choices.push(Choice::new(format!("  {model}"), hint));
+            targets.push(Some(Target {
+                provider: kind.name().to_owned(),
+                model,
+            }));
+            if is_current {
+                initial = choices.len() - 1;
+            }
+        }
+    }
+    eprint!("{CLEAR_LINE}");
+    let index = editor::select_menu(title, &choices, initial)?;
+    targets.get(index)?.clone()
+}
+
+/// `/model` — no argument opens one grouped picker across all configured
+/// providers. `provider:model` remains available for direct selection.
 fn handle_model_command(
     provider: &mut OpenAiCompatibleProvider,
     session: &SessionWriter,
@@ -964,47 +1033,29 @@ fn handle_model_command(
         return;
     }
     if argument.is_empty() {
-        eprint!("{DIM}fetching available models…{RESET}");
-        let models = match provider.list_models() {
-            Ok(models) if !models.is_empty() => models,
-            Ok(_) => {
-                eprintln!("{CLEAR_LINE}{DIM}the provider returned no models{RESET}");
-                return;
-            }
-            Err(error) => {
-                eprintln!("{CLEAR_LINE}{DIM}could not list models: {error}{RESET}");
-                return;
-            }
+        let current = Target {
+            provider: provider.name().to_owned(),
+            model: provider.model().to_owned(),
         };
-        eprint!("{CLEAR_LINE}");
-        // Cap the menu so a provider with hundreds of models stays usable;
-        // /model NAME still reaches anything outside the shown window.
-        let shown = models.len().min(40);
-        let current = provider.model().to_owned();
-        let choices: Vec<Choice> = models
-            .iter()
-            .take(shown)
-            .map(|model| {
-                let hint = if *model == current { "current" } else { "" };
-                Choice::new(model.clone(), hint)
-            })
-            .collect();
-        let initial = models
-            .iter()
-            .position(|model| *model == current)
-            .unwrap_or(0);
-        let title = if models.len() > shown {
-            format!("Model — pick one (showing {shown} of {})", models.len())
-        } else {
-            "Model — pick one".to_owned()
+        let Some(target) =
+            pick_configured_model("Model — choose any configured provider", Some(&current))
+        else {
+            eprintln!(
+                "{DIM}unchanged ({} · {}){RESET}",
+                current.provider, current.model
+            );
+            return;
         };
-        match editor::select_menu(&title, &choices, initial.min(shown.saturating_sub(1))) {
-            Some(index) => {
-                provider.set_model(models[index].clone());
-                let _ = session.record("model_changed", &models[index]);
-                eprintln!("model set to {}", models[index]);
+        let kind =
+            ProviderKind::parse(&target.provider).expect("picker only returns known providers");
+        match OpenAiCompatibleProvider::from_environment(kind, Some(target.model.clone())) {
+            Ok(replacement) => {
+                *provider = replacement;
+                let _ = session.record("provider", &target.provider);
+                let _ = session.record("model_changed", &target.model);
+                eprintln!("model set to {} ({})", target.model, target.provider);
             }
-            None => eprintln!("{DIM}unchanged ({current}){RESET}"),
+            Err(error) => eprintln!("{RED}error:{RESET} {error}"),
         }
         return;
     }
@@ -1620,13 +1671,11 @@ fn swarm_agent(
     Ok(final_assistant_text(&agent_messages))
 }
 
-/// `/swarm-setup` — assign a provider and model to each swarm role and save
-/// the configuration to `~/.febo/swarm.json`.
-#[allow(clippy::too_many_lines)]
+/// `/swarm-setup` — assign a model from any configured provider to each
+/// swarm role and save the configuration to `~/.febo/swarm.json`.
 fn handle_swarm_setup(root: &Path) {
     let existing = swarm::load(root).ok().flatten();
-    let available = febo_cli::provider::available_providers();
-    if available.is_empty() {
+    if febo_cli::provider::available_providers().is_empty() {
         eprintln!("{RED}no provider credentials found{RESET} — set one with `febo set` first");
         return;
     }
@@ -1634,53 +1683,7 @@ fn handle_swarm_setup(root: &Path) {
         "{BOLD}Swarm setup{RESET} {DIM}— the boss plans, reviews, and rules disputes (use your strongest model); workers do all the coding and checkers verify every task (use cheap models){RESET}"
     );
     let pick = |role: &str, hint: &str, current: Option<&Target>| -> Option<Target> {
-        let choices: Vec<Choice> = available
-            .iter()
-            .map(|kind| Choice::new(kind.name(), ""))
-            .collect();
-        let initial = current
-            .and_then(|target| {
-                available
-                    .iter()
-                    .position(|kind| kind.name() == target.provider)
-            })
-            .unwrap_or(0);
-        let index = editor::select_menu(&format!("{role} provider — {hint}"), &choices, initial)?;
-        let kind = available[index];
-        let provider = OpenAiCompatibleProvider::from_environment(kind, None).ok()?;
-        if let Ok(models) = provider.list_models()
-            && !models.is_empty()
-        {
-            let shown = models.len().min(40);
-            let choices: Vec<Choice> = models
-                .iter()
-                .take(shown)
-                .map(|model| Choice::new(model.clone(), ""))
-                .collect();
-            let initial = current
-                .and_then(|target| models.iter().position(|model| *model == target.model))
-                .unwrap_or(0);
-            let index = editor::select_menu(
-                &format!("{role} model ({})", kind.name()),
-                &choices,
-                initial.min(shown.saturating_sub(1)),
-            )?;
-            return Some(Target {
-                provider: kind.name().to_owned(),
-                model: models[index].clone(),
-            });
-        }
-        eprint!("{role} model name ({}): ", kind.name());
-        let _ = io::stderr().flush();
-        let mut answer = String::new();
-        if io::stdin().read_line(&mut answer).is_err() {
-            return None;
-        }
-        let model = answer.trim();
-        (!model.is_empty()).then(|| Target {
-            provider: kind.name().to_owned(),
-            model: model.to_owned(),
-        })
+        pick_configured_model(&format!("{role} model — {hint}"), current)
     };
     let Some(boss) = pick(
         "boss",
@@ -2262,7 +2265,7 @@ fn tool_schemas(plan: bool) -> Vec<Value> {
 
 fn print_help() {
     println!(
-        "Febo CLI {VERSION}\n\nUSAGE:\n  febo [OPTIONS] [prompt]     interactive REPL when prompt is omitted\n  febo exec --json [OPTIONS] <prompt>\n  febo set --provider NAME API_KEY   save the key to ~/.febo/credentials.env, then start the REPL\n\nOPTIONS:\n  --provider openrouter|openai|deepseek\n  --model MODEL|auto\n  --permission read-only|ask|workspace-write|yolo   (default read-only)\n  --plan                        hard read-only guard regardless of --permission\n  --resume [SESSION]            continue a session; with no path, pick from a list\n  --resume-compact [SESSION]    like --resume but summarizes large histories first\n  --max-context-chars COUNT\n  --no-project-instructions\n  --no-checkpoints              disable automatic workspace snapshots (/rewind)\n  --enable-hooks / --enable-mcp\n\nREPL: /help /model /permissions /rewind /compact /status /diff /exit — esc interrupts a running turn.\n\nCREDENTIALS:\n  OPENROUTER_API_KEY   provider=openrouter\n  OPENAI_API_KEY       provider=openai\n  DEEPSEEK_API_KEY     provider=deepseek\n\nRepository hooks and MCP servers are disabled unless explicitly enabled."
+        "Febo CLI {VERSION}\n\nUSAGE:\n  febo [OPTIONS] [prompt]     interactive REPL when prompt is omitted\n  febo exec --json [OPTIONS] <prompt>\n  febo set --provider NAME API_KEY   save the key to ~/.febo/credentials.env, then start the REPL\n\nOPTIONS:\n  --provider openrouter|openai|deepseek|anthropic\n  --model MODEL|auto\n  --permission read-only|ask|workspace-write|yolo   (default read-only)\n  --plan                        hard read-only guard regardless of --permission\n  --resume [SESSION]            continue a session; with no path, pick from a list\n  --resume-compact [SESSION]    like --resume but summarizes large histories first\n  --max-context-chars COUNT\n  --no-project-instructions\n  --no-checkpoints              disable automatic workspace snapshots (/rewind)\n  --enable-hooks / --enable-mcp\n\nREPL: /help /model /permissions /rewind /compact /status /diff /exit — esc interrupts a running turn.\n\nCREDENTIALS:\n  OPENROUTER_API_KEY   provider=openrouter\n  OPENAI_API_KEY       provider=openai\n  DEEPSEEK_API_KEY     provider=deepseek\n  ANTHROPIC_API_KEY    provider=anthropic (Claude)\n\nRepository hooks and MCP servers are disabled unless explicitly enabled."
     );
 }
 
