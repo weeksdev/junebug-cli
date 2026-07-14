@@ -6,6 +6,9 @@
 //! consult model output, tool arguments, or other untrusted signals — those
 //! could otherwise be used to talk the policy into a looser decision.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use crate::PermissionMode;
 use crate::tool::ToolRisk;
 
@@ -16,9 +19,66 @@ pub enum Decision {
     Ask,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Shared permission mode used by the REPL and an in-flight agent turn.
+#[derive(Debug, Clone)]
+pub struct PermissionState {
+    value: Arc<AtomicU8>,
+}
+
+impl PermissionState {
+    #[must_use]
+    pub fn new(permission: PermissionMode) -> Self {
+        Self {
+            value: Arc::new(AtomicU8::new(permission_code(permission))),
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self) -> PermissionMode {
+        permission_from_code(self.value.load(Ordering::Relaxed))
+    }
+
+    pub fn set(&self, permission: PermissionMode) {
+        self.value
+            .store(permission_code(permission), Ordering::Relaxed);
+    }
+
+    /// Cycle read-only → ask → workspace-write → yolo → read-only.
+    #[must_use]
+    pub fn cycle(&self) -> PermissionMode {
+        let next = match self.get() {
+            PermissionMode::ReadOnly => PermissionMode::Ask,
+            PermissionMode::Ask => PermissionMode::WorkspaceWrite,
+            PermissionMode::WorkspaceWrite => PermissionMode::Yolo,
+            PermissionMode::Yolo => PermissionMode::ReadOnly,
+        };
+        self.set(next);
+        next
+    }
+}
+
+const fn permission_code(permission: PermissionMode) -> u8 {
+    match permission {
+        PermissionMode::ReadOnly => 0,
+        PermissionMode::Ask => 1,
+        PermissionMode::WorkspaceWrite => 2,
+        PermissionMode::Yolo => 3,
+    }
+}
+
+const fn permission_from_code(code: u8) -> PermissionMode {
+    match code {
+        1 => PermissionMode::Ask,
+        2 => PermissionMode::WorkspaceWrite,
+        3 => PermissionMode::Yolo,
+        _ => PermissionMode::ReadOnly,
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct PolicyEngine {
     permission: PermissionMode,
+    shared_permission: Option<PermissionState>,
     plan_mode: bool,
 }
 
@@ -27,13 +87,44 @@ impl PolicyEngine {
     pub const fn new(permission: PermissionMode, plan_mode: bool) -> Self {
         Self {
             permission,
+            shared_permission: None,
             plan_mode,
         }
     }
 
     #[must_use]
-    pub const fn plan_mode(self) -> bool {
+    pub fn with_state(permission: PermissionState, plan_mode: bool) -> Self {
+        Self {
+            permission: permission.get(),
+            shared_permission: Some(permission),
+            plan_mode,
+        }
+    }
+
+    #[must_use]
+    pub fn permission(&self) -> PermissionMode {
+        self.shared_permission
+            .as_ref()
+            .map_or(self.permission, PermissionState::get)
+    }
+
+    /// Freeze the currently effective permission for one tool-call boundary.
+    #[must_use]
+    pub fn snapshot(&self) -> Self {
+        Self::new(self.permission(), self.plan_mode)
+    }
+
+    #[must_use]
+    pub const fn plan_mode(&self) -> bool {
         self.plan_mode
+    }
+
+    /// Whether tools may leave the startup workspace, access normally
+    /// protected paths, and inherit the launching environment. Plan mode
+    /// always keeps the boundary intact.
+    #[must_use]
+    pub fn unrestricted_access(&self) -> bool {
+        !self.plan_mode && matches!(self.permission(), PermissionMode::Yolo)
     }
 
     /// Decide how a tool call of the given risk class should be handled.
@@ -42,14 +133,15 @@ impl PolicyEngine {
     /// regardless of the configured permission mode, independent of whichever
     /// tools happen to be offered to the model.
     #[must_use]
-    pub const fn evaluate(&self, risk: ToolRisk) -> Decision {
+    pub fn evaluate(&self, risk: ToolRisk) -> Decision {
+        let permission = self.permission();
         match risk {
             ToolRisk::Read => Decision::Allow,
             ToolRisk::Write => {
                 if self.plan_mode {
                     return Decision::Deny;
                 }
-                match self.permission {
+                match permission {
                     PermissionMode::ReadOnly => Decision::Deny,
                     PermissionMode::WorkspaceWrite | PermissionMode::Yolo => Decision::Allow,
                     PermissionMode::Ask => Decision::Ask,
@@ -58,7 +150,7 @@ impl PolicyEngine {
             ToolRisk::Execute | ToolRisk::Network => {
                 if self.plan_mode {
                     Decision::Deny
-                } else if matches!(self.permission, PermissionMode::Yolo) {
+                } else if matches!(permission, PermissionMode::Yolo) {
                     // Yolo mode pre-approves commands and network access too.
                     Decision::Allow
                 } else {
@@ -81,7 +173,7 @@ pub fn parse_approval_answer(answer: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Decision, PolicyEngine, parse_approval_answer};
+    use super::{Decision, PermissionState, PolicyEngine, parse_approval_answer};
     use crate::PermissionMode;
     use crate::tool::ToolRisk;
 
@@ -151,6 +243,9 @@ mod tests {
         assert_eq!(policy.evaluate(ToolRisk::Execute), Decision::Allow);
         assert_eq!(policy.evaluate(ToolRisk::Network), Decision::Allow);
         assert_eq!(policy.evaluate(ToolRisk::Read), Decision::Allow);
+        assert!(policy.unrestricted_access());
+        assert!(!PolicyEngine::new(PermissionMode::Yolo, true).unrestricted_access());
+        assert!(!PolicyEngine::new(PermissionMode::WorkspaceWrite, false).unrestricted_access());
     }
 
     #[test]
@@ -161,5 +256,20 @@ mod tests {
         assert!(!parse_approval_answer("n"));
         assert!(!parse_approval_answer(""));
         assert!(!parse_approval_answer("sure"));
+    }
+
+    #[test]
+    fn shared_permission_cycles_and_changes_live_policy_decisions() {
+        let state = PermissionState::new(PermissionMode::ReadOnly);
+        let policy = PolicyEngine::with_state(state.clone(), false);
+        assert_eq!(policy.evaluate(ToolRisk::Write), Decision::Deny);
+        assert_eq!(state.cycle(), PermissionMode::Ask);
+        assert_eq!(policy.evaluate(ToolRisk::Write), Decision::Ask);
+        assert_eq!(state.cycle(), PermissionMode::WorkspaceWrite);
+        assert_eq!(policy.evaluate(ToolRisk::Write), Decision::Allow);
+        assert_eq!(state.cycle(), PermissionMode::Yolo);
+        assert!(policy.unrestricted_access());
+        assert_eq!(state.cycle(), PermissionMode::ReadOnly);
+        assert_eq!(policy.evaluate(ToolRisk::Execute), Decision::Ask);
     }
 }

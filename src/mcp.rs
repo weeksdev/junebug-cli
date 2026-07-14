@@ -16,9 +16,11 @@ pub struct ServerConfig {
 
 /// # Errors
 ///
-/// Returns an error when `.febo/mcp.json` cannot be read or validated.
+/// Returns an error when `.junebug/mcp.json` cannot be read or validated.
 pub fn load_config(workspace: &Path) -> Result<Vec<ServerConfig>, String> {
-    let path = workspace.join(".febo").join("mcp.json");
+    let current = workspace.join(".junebug").join("mcp.json");
+    let legacy = workspace.join(".febo").join("mcp.json");
+    let path = if current.is_file() { current } else { legacy };
     if !path.is_file() {
         return Ok(Vec::new());
     }
@@ -86,7 +88,7 @@ impl Client {
             stdout,
             next_id: 1,
         };
-        let initialize = json!({"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"febo-cli","version":env!("CARGO_PKG_VERSION")}});
+        let initialize = json!({"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"junebug-cli","version":env!("CARGO_PKG_VERSION")}});
         client.request("initialize", &initialize)?;
         client.notify("notifications/initialized", &json!({}))?;
         Ok(client)
@@ -179,15 +181,15 @@ mod tests {
     #[test]
     fn loads_config_and_namespaces_tool() {
         let root = std::env::temp_dir().join(format!(
-            "febo-mcp-{}",
+            "junebug-mcp-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos()
         ));
-        fs::create_dir_all(root.join(".febo")).expect("dir");
+        fs::create_dir_all(root.join(".junebug")).expect("dir");
         fs::write(
-            root.join(".febo/mcp.json"),
+            root.join(".junebug/mcp.json"),
             r#"{"servers":{"docs":{"command":"echo","args":["hi"]}}}"#,
         )
         .expect("config");
@@ -200,6 +202,25 @@ mod tests {
             .expect("tool")["function"]["name"],
             "mcp__docs__lookup"
         );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn loads_legacy_febo_config() {
+        let root = std::env::temp_dir().join(format!(
+            "junebug-legacy-mcp-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join(".febo")).expect("dir");
+        fs::write(
+            root.join(".febo/mcp.json"),
+            r#"{"servers":{"legacy":{"command":"echo"}}}"#,
+        )
+        .expect("config");
+        assert_eq!(load_config(&root).expect("load")[0].name, "legacy");
         fs::remove_dir_all(root).expect("cleanup");
     }
 }

@@ -41,24 +41,36 @@ fn home() -> Option<PathBuf> {
 /// The user-level swarm configuration written by `/swarm-setup`.
 #[must_use]
 pub fn user_config_path() -> Option<PathBuf> {
-    home().map(|home| home.join(".febo").join("swarm.json"))
+    home().map(|home| home.join(".junebug").join("swarm.json"))
 }
 
-/// Load the swarm roles: a workspace `.febo/swarm.json` wins over the
+/// Load the swarm roles: a workspace `.junebug/swarm.json` wins over the
 /// user-level file. `Ok(None)` when no configuration exists yet.
 ///
 /// # Errors
 ///
 /// Returns an error when a configuration file exists but cannot be parsed.
 pub fn load(workspace: &Path) -> Result<Option<SwarmRoles>, String> {
-    let workspace_file = workspace.join(".febo").join("swarm.json");
-    if workspace_file.is_file() {
-        return read_roles(&workspace_file).map(Some);
+    for workspace_file in [
+        workspace.join(".junebug").join("swarm.json"),
+        workspace.join(".febo").join("swarm.json"),
+    ] {
+        if workspace_file.is_file() {
+            return read_roles(&workspace_file).map(Some);
+        }
     }
-    match user_config_path() {
-        Some(path) if path.is_file() => read_roles(&path).map(Some),
-        _ => Ok(None),
+    let Some(home) = home() else {
+        return Ok(None);
+    };
+    for path in [
+        home.join(".junebug").join("swarm.json"),
+        home.join(".febo").join("swarm.json"),
+    ] {
+        if path.is_file() {
+            return read_roles(&path).map(Some);
+        }
     }
+    Ok(None)
 }
 
 fn read_roles(path: &Path) -> Result<SwarmRoles, String> {
@@ -323,7 +335,7 @@ mod tests {
     fn roles_round_trip_through_the_config_file() {
         let path = std::env::temp_dir()
             .join(format!(
-                "febo-swarm-{}",
+                "junebug-swarm-{}",
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .expect("clock")
@@ -347,5 +359,34 @@ mod tests {
         save_to(&roles, &path).expect("save");
         assert_eq!(read_roles(&path).expect("read"), roles);
         std::fs::remove_dir_all(path.parent().expect("parent")).expect("cleanup");
+    }
+
+    #[test]
+    fn loads_legacy_workspace_swarm_config() {
+        let root = std::env::temp_dir().join(format!(
+            "junebug-legacy-swarm-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let path = root.join(".febo/swarm.json");
+        let roles = SwarmRoles {
+            boss: Target {
+                provider: "openai".to_owned(),
+                model: "boss".to_owned(),
+            },
+            worker: Target {
+                provider: "deepseek".to_owned(),
+                model: "worker".to_owned(),
+            },
+            checker: Target {
+                provider: "anthropic".to_owned(),
+                model: "checker".to_owned(),
+            },
+        };
+        save_to(&roles, &path).expect("legacy save");
+        assert_eq!(load(&root).expect("load"), Some(roles));
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 }

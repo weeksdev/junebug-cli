@@ -10,13 +10,13 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use febo_cli::PermissionMode;
-use febo_cli::agent::{self, ModelSource, Selection, TurnObserver, TurnState};
-use febo_cli::policy::PolicyEngine;
-use febo_cli::provider::{ModelProvider, ModelTurn, ToolCall};
-use febo_cli::router::{Band, Route, RouteDecision};
-use febo_cli::session::SessionWriter;
-use febo_cli::tool::Workspace;
+use junebug_cli::PermissionMode;
+use junebug_cli::agent::{self, ModelSource, Selection, TurnObserver, TurnState};
+use junebug_cli::policy::PolicyEngine;
+use junebug_cli::provider::{ModelProvider, ModelTurn, ToolCall};
+use junebug_cli::router::{Band, Route, RouteDecision};
+use junebug_cli::session::SessionWriter;
+use junebug_cli::tool::Workspace;
 use serde_json::{Value, json};
 
 /// Observer that discards all UI events.
@@ -103,7 +103,7 @@ fn final_turn() -> ModelTurn {
 
 fn temp_workspace(label: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "febo-policy-integration-{label}-{}",
+        "junebug-policy-integration-{label}-{}",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")

@@ -63,7 +63,19 @@ impl Workspace {
         }
     }
 
-    fn checked_path(&self, requested: &Path) -> Result<PathBuf, String> {
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn checked_path(&self, requested: &Path, unrestricted: bool) -> Result<PathBuf, String> {
+        if unrestricted {
+            return Ok(if requested.is_absolute() {
+                requested.to_path_buf()
+            } else {
+                self.root.join(requested)
+            });
+        }
         if requested.is_absolute()
             || requested
                 .components()
@@ -78,9 +90,13 @@ impl Workspace {
         for component in requested.components() {
             if let Component::Normal(name) = component {
                 let name = name.to_string_lossy();
-                if name == ".git" || name == ".febo" || name == ".env" || name.starts_with(".env.")
+                if name == ".git"
+                    || name == ".junebug"
+                    || name == ".febo"
+                    || name == ".env"
+                    || name.starts_with(".env.")
                 {
-                    return Err("path is protected by Febo policy".to_owned());
+                    return Err("path is protected by Junebug policy".to_owned());
                 }
             }
         }
@@ -116,7 +132,20 @@ impl Workspace {
     ///
     /// Returns an error for protected/escaping paths, non-files, oversized files, or I/O failures.
     pub fn read_file(&self, requested: &Path) -> Result<String, String> {
-        let path = self.checked_path(requested)?;
+        self.read_file_with_access(requested, false)
+    }
+
+    /// Read a file with optional yolo filesystem access.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for disallowed paths, non-files, oversized files, or I/O failures.
+    pub fn read_file_with_access(
+        &self,
+        requested: &Path,
+        unrestricted: bool,
+    ) -> Result<String, String> {
+        let path = self.checked_path(requested, unrestricted)?;
         let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
         if !metadata.is_file() {
             return Err("requested path is not a regular file".to_owned());
@@ -131,9 +160,25 @@ impl Workspace {
     ///
     /// Returns an error when ripgrep cannot run or emits excessive output.
     pub fn search(&self, query: &str) -> Result<String, String> {
+        self.search_at(query, Path::new("."), false)
+    }
+
+    /// Search under `requested`, which may be outside the startup workspace
+    /// only when unrestricted yolo access is active.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid paths, ripgrep failures, or excessive output.
+    pub fn search_at(
+        &self,
+        query: &str,
+        requested: &Path,
+        unrestricted: bool,
+    ) -> Result<String, String> {
         if query.is_empty() {
             return Err("search query cannot be empty".to_owned());
         }
+        let path = self.checked_path(requested, unrestricted)?;
         let output = Command::new("rg")
             .args([
                 "--line-number",
@@ -145,7 +190,7 @@ impl Workspace {
                 query,
                 ".",
             ])
-            .current_dir(&self.root)
+            .current_dir(path)
             .env_clear()
             .env("PATH", default_path())
             .output()
@@ -165,7 +210,20 @@ impl Workspace {
     ///
     /// Returns an error for protected/escaping paths or directory I/O failures.
     pub fn list_dir(&self, requested: &Path) -> Result<Vec<String>, String> {
-        let path = self.checked_path(requested)?;
+        self.list_dir_with_access(requested, false)
+    }
+
+    /// List a directory with optional yolo filesystem access.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for disallowed paths or directory I/O failures.
+    pub fn list_dir_with_access(
+        &self,
+        requested: &Path,
+        unrestricted: bool,
+    ) -> Result<Vec<String>, String> {
+        let path = self.checked_path(requested, unrestricted)?;
         let mut entries = fs::read_dir(path)
             .map_err(|error| error.to_string())?
             .map(|entry| entry.map_err(|error| error.to_string()))
@@ -181,13 +239,28 @@ impl Workspace {
     ///
     /// Returns an error for protected/escaping paths, symbolic links, oversized contents, or I/O failures.
     pub fn write_file(&self, requested: &Path, contents: &str) -> Result<(), String> {
+        self.write_file_with_access(requested, contents, false)
+    }
+
+    /// Write a file with optional yolo filesystem access.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for disallowed paths, oversized contents, or I/O failures.
+    pub fn write_file_with_access(
+        &self,
+        requested: &Path,
+        contents: &str,
+        unrestricted: bool,
+    ) -> Result<(), String> {
         if contents.len() > 1024 * 1024 {
             return Err("write exceeds the 1 MiB content limit".to_owned());
         }
-        let path = self.checked_path(requested)?;
+        let path = self.checked_path(requested, unrestricted)?;
         // symlink_metadata does not follow links, so this also refuses
         // dangling symlinks, which fs::write would otherwise follow.
-        if let Ok(metadata) = path.symlink_metadata()
+        if !unrestricted
+            && let Ok(metadata) = path.symlink_metadata()
             && metadata.file_type().is_symlink()
         {
             return Err("refusing to overwrite a symbolic link".to_owned());
@@ -202,6 +275,20 @@ impl Workspace {
     ///
     /// Returns an error when the command cannot be started, fails, or emits more than 1 MiB of output.
     pub fn run_command(&self, command: &str) -> Result<String, String> {
+        self.run_command_with_access(command, false)
+    }
+
+    /// Run a command, inheriting the launching environment only for
+    /// unrestricted yolo access. Other modes retain the sanitized environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the command cannot start, fails, or emits excessive output.
+    pub fn run_command_with_access(
+        &self,
+        command: &str,
+        unrestricted: bool,
+    ) -> Result<String, String> {
         if command.trim().is_empty() {
             return Err("command cannot be empty".to_owned());
         }
@@ -218,11 +305,11 @@ impl Workspace {
             process.args(["-c", command]);
             process
         };
-        process
-            .current_dir(&self.root)
-            .env_clear()
-            .env("PATH", default_path());
-        apply_windows_environment(&mut process);
+        process.current_dir(&self.root);
+        if !unrestricted {
+            process.env_clear().env("PATH", default_path());
+            apply_windows_environment(&mut process);
+        }
         let output = process.output().map_err(|error| error.to_string())?;
         let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&output.stderr));
@@ -240,26 +327,75 @@ impl Workspace {
     ///
     /// Returns an error if Git cannot report workspace status.
     pub fn git_status(&self) -> Result<String, String> {
-        self.run_git(["status", "--short"])
+        self.git_status_at(Path::new("."), false)
+    }
+
+    /// Git status at an explicit target directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a disallowed path or Git failure.
+    pub fn git_status_at(&self, requested: &Path, unrestricted: bool) -> Result<String, String> {
+        self.run_git_or_explain_non_repository(
+            ["status", "--short"],
+            requested,
+            unrestricted,
+            "Git status",
+        )
     }
 
     /// # Errors
     ///
     /// Returns an error if Git cannot produce a workspace diff.
     pub fn git_diff(&self) -> Result<String, String> {
-        self.run_git(["diff", "--no-ext-diff"])
+        self.git_diff_at(Path::new("."), false)
     }
 
-    fn run_git<const N: usize>(&self, arguments: [&str; N]) -> Result<String, String> {
-        let mut process = Command::new("git");
-        process
-            .arg("--no-pager")
-            .args(arguments)
-            .current_dir(&self.root)
-            .env_clear()
-            .env("PATH", default_path());
-        apply_windows_environment(&mut process);
-        let output = process.output().map_err(|error| error.to_string())?;
+    /// Git diff at an explicit target directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a disallowed path or Git failure.
+    pub fn git_diff_at(&self, requested: &Path, unrestricted: bool) -> Result<String, String> {
+        self.run_git_or_explain_non_repository(
+            ["diff", "--no-ext-diff"],
+            requested,
+            unrestricted,
+            "Git diff",
+        )
+    }
+
+    fn run_git_or_explain_non_repository<const N: usize>(
+        &self,
+        arguments: [&str; N],
+        requested: &Path,
+        unrestricted: bool,
+        operation: &str,
+    ) -> Result<String, String> {
+        let path = self.checked_path(requested, unrestricted)?;
+        if !Self::is_git_work_tree(&path)? {
+            return Ok(format!(
+                "This directory is not a Git repository; {operation} is unavailable.\n"
+            ));
+        }
+        Self::run_git_in(&path, &arguments)
+    }
+
+    fn is_git_work_tree(path: &Path) -> Result<bool, String> {
+        let output = Self::git_command(path, &["rev-parse", "--is-inside-work-tree"])?;
+        if output.status.success() {
+            return Ok(String::from_utf8_lossy(&output.stdout).trim() == "true");
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("not a git repository") {
+            Ok(false)
+        } else {
+            Err(format!("git repository check failed: {}", stderr.trim()))
+        }
+    }
+
+    fn run_git_in(path: &Path, arguments: &[&str]) -> Result<String, String> {
+        let output = Self::git_command(path, arguments)?;
         let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&output.stderr));
         if output.status.success() {
@@ -268,13 +404,29 @@ impl Workspace {
             Err(format!("git exited with {}: {text}", output.status))
         }
     }
+
+    fn git_command(path: &Path, arguments: &[&str]) -> Result<std::process::Output, String> {
+        let mut process = Command::new("git");
+        process
+            .arg("--no-pager")
+            .args(arguments)
+            .current_dir(path)
+            .env_clear()
+            .env("PATH", default_path())
+            .env("LC_ALL", "C");
+        apply_windows_environment(&mut process);
+        process.output().map_err(|error| error.to_string())
+    }
 }
 
 const fn default_path() -> &'static str {
     if cfg!(windows) {
         "C:\\Windows\\System32"
     } else {
-        "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        // Include the standard Apple Silicon Homebrew location. Read-only
+        // subprocesses still get a fixed, sanitized PATH, but `rg` installed
+        // by Homebrew must remain discoverable for the search tool.
+        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     }
 }
 
@@ -360,7 +512,7 @@ mod tests {
 
     fn temporary_workspace() -> PathBuf {
         let name = format!(
-            "febo-tool-test-{}",
+            "junebug-tool-test-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
@@ -389,6 +541,39 @@ mod tests {
     }
 
     #[test]
+    fn unrestricted_access_can_read_protected_and_outside_paths() {
+        let root = temporary_workspace();
+        let outside = temporary_workspace();
+        fs::write(root.join(".env"), "LOCAL_SECRET=test-only").expect("seed protected file");
+        fs::write(outside.join("outside.txt"), "outside").expect("seed outside file");
+        let workspace = Workspace::new(root.clone());
+
+        assert!(workspace.read_file(Path::new(".env")).is_err());
+        assert_eq!(
+            workspace
+                .read_file_with_access(Path::new(".env"), true)
+                .expect("yolo protected read"),
+            "LOCAL_SECRET=test-only"
+        );
+        assert_eq!(
+            workspace
+                .read_file_with_access(&outside.join("outside.txt"), true)
+                .expect("yolo outside read"),
+            "outside"
+        );
+        workspace
+            .write_file_with_access(&outside.join("created.txt"), "created", true)
+            .expect("yolo outside write");
+        assert_eq!(
+            fs::read_to_string(outside.join("created.txt")).expect("outside write exists"),
+            "created"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup root");
+        fs::remove_dir_all(outside).expect("cleanup outside");
+    }
+
+    #[test]
     fn writes_and_reads_regular_workspace_file() {
         let root = temporary_workspace();
         let workspace = Workspace::new(root.clone());
@@ -409,8 +594,59 @@ mod tests {
         // `echo` emits a trailing newline (\r\n on Windows); trim it rather
         // than using `set /p`, which returns errorlevel 1 at EOF on Windows.
         assert_eq!(
-            workspace.run_command("echo febo").expect("run").trim_end(),
-            "febo"
+            workspace
+                .run_command("echo junebug")
+                .expect("run")
+                .trim_end(),
+            "junebug"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn git_tools_explain_when_workspace_is_not_a_repository() {
+        let root = temporary_workspace();
+        let workspace = Workspace::new(root.clone());
+
+        let status = workspace.git_status().expect("non-repo status is graceful");
+        let diff = workspace.git_diff().expect("non-repo diff is graceful");
+
+        assert!(status.contains("not a Git repository"), "got: {status}");
+        assert!(diff.contains("not a Git repository"), "got: {diff}");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn search_can_find_ripgrep_in_homebrew_path() {
+        if !Path::new("/opt/homebrew/bin/rg").is_file() {
+            return;
+        }
+        let root = temporary_workspace();
+        fs::write(root.join("needle.txt"), "homebrew-rg-marker").expect("seed search file");
+        let workspace = Workspace::new(root.clone());
+        let result = workspace
+            .search("homebrew-rg-marker")
+            .expect("search with sanitized PATH");
+        assert!(result.contains("needle.txt"), "got: {result}");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrestricted_commands_inherit_environment_but_regular_commands_do_not() {
+        let root = temporary_workspace();
+        let workspace = Workspace::new(root.clone());
+        assert_eq!(
+            workspace
+                .run_command("printf %s \"${HOME-unset}\"")
+                .expect("sanitized command"),
+            "unset"
+        );
+        assert_ne!(
+            workspace
+                .run_command_with_access("printf %s \"${HOME-unset}\"", true)
+                .expect("yolo command"),
+            "unset"
         );
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -460,9 +696,9 @@ mod tests {
         let workspace = Workspace::new(root.clone());
         assert_eq!(
             workspace
-                .run_command("printf febo 2>/dev/null")
+                .run_command("printf junebug 2>/dev/null")
                 .expect("run"),
-            "febo"
+            "junebug"
         );
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -474,6 +710,11 @@ mod tests {
         assert!(
             workspace
                 .write_file(Path::new("sub/.git/config"), "nope")
+                .is_err()
+        );
+        assert!(
+            workspace
+                .read_file(Path::new(".junebug/sessions/x.jsonl"))
                 .is_err()
         );
         assert!(

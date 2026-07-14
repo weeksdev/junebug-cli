@@ -56,6 +56,8 @@ pub enum ProviderKind {
     OpenRouter,
     DeepSeek,
     Anthropic,
+    Ollama,
+    LocalOpenAi,
 }
 
 impl ProviderKind {
@@ -68,8 +70,10 @@ impl ProviderKind {
             "openrouter" => Ok(Self::OpenRouter),
             "deepseek" => Ok(Self::DeepSeek),
             "anthropic" | "claude" => Ok(Self::Anthropic),
+            "ollama" | "local" => Ok(Self::Ollama),
+            "local-openai" | "openai-local" | "lmstudio" | "vllm" => Ok(Self::LocalOpenAi),
             _ => Err(format!(
-                "unsupported provider '{value}'; use openai, openrouter, deepseek, or anthropic"
+                "unsupported provider '{value}'; use openai, openrouter, deepseek, anthropic, ollama, or local-openai"
             )),
         }
     }
@@ -80,24 +84,32 @@ impl ProviderKind {
             Self::OpenRouter => "openrouter",
             Self::DeepSeek => "deepseek",
             Self::Anthropic => "anthropic",
+            Self::Ollama => "ollama",
+            Self::LocalOpenAi => "local-openai",
         }
     }
     #[must_use]
-    pub const fn endpoint(self) -> &'static str {
+    pub fn endpoint(self) -> String {
         match self {
-            Self::OpenAi => "https://api.openai.com/v1/chat/completions",
-            Self::OpenRouter => "https://openrouter.ai/api/v1/chat/completions",
-            Self::DeepSeek => "https://api.deepseek.com/chat/completions",
-            Self::Anthropic => "https://api.anthropic.com/v1/messages",
+            Self::OpenAi => "https://api.openai.com/v1/chat/completions".to_owned(),
+            Self::OpenRouter => "https://openrouter.ai/api/v1/chat/completions".to_owned(),
+            Self::DeepSeek => "https://api.deepseek.com/chat/completions".to_owned(),
+            Self::Anthropic => "https://api.anthropic.com/v1/messages".to_owned(),
+            Self::Ollama => format!("{}/v1/chat/completions", ollama_base_url()),
+            Self::LocalOpenAi => {
+                format!("{}/v1/chat/completions", local_openai_base_url())
+            }
         }
     }
     #[must_use]
-    pub const fn models_endpoint(self) -> &'static str {
+    pub fn models_endpoint(self) -> String {
         match self {
-            Self::OpenAi => "https://api.openai.com/v1/models",
-            Self::OpenRouter => "https://openrouter.ai/api/v1/models",
-            Self::DeepSeek => "https://api.deepseek.com/models",
-            Self::Anthropic => "https://api.anthropic.com/v1/models",
+            Self::OpenAi => "https://api.openai.com/v1/models".to_owned(),
+            Self::OpenRouter => "https://openrouter.ai/api/v1/models".to_owned(),
+            Self::DeepSeek => "https://api.deepseek.com/models".to_owned(),
+            Self::Anthropic => "https://api.anthropic.com/v1/models".to_owned(),
+            Self::Ollama => format!("{}/v1/models", ollama_base_url()),
+            Self::LocalOpenAi => format!("{}/v1/models", local_openai_base_url()),
         }
     }
 
@@ -108,6 +120,8 @@ impl ProviderKind {
             Self::OpenRouter => "OPENROUTER_API_KEY",
             Self::DeepSeek => "DEEPSEEK_API_KEY",
             Self::Anthropic => "ANTHROPIC_API_KEY",
+            Self::Ollama => "OLLAMA_HOST",
+            Self::LocalOpenAi => "LOCAL_OPENAI_API_KEY",
         }
     }
     #[must_use]
@@ -117,17 +131,26 @@ impl ProviderKind {
             Self::OpenRouter => "openrouter/free",
             Self::DeepSeek => "deepseek-v4-flash",
             Self::Anthropic => "claude-sonnet-4-5",
+            Self::Ollama => "qwen3:8b",
+            Self::LocalOpenAi => "local-model",
         }
+    }
+
+    #[must_use]
+    pub const fn requires_api_key(self) -> bool {
+        !matches!(self, Self::Ollama | Self::LocalOpenAi)
     }
 
     /// All supported providers, in default preference order.
     #[must_use]
-    pub const fn all() -> [Self; 4] {
+    pub const fn all() -> [Self; 6] {
         [
             Self::OpenRouter,
             Self::OpenAi,
             Self::Anthropic,
             Self::DeepSeek,
+            Self::Ollama,
+            Self::LocalOpenAi,
         ]
     }
 
@@ -135,13 +158,81 @@ impl ProviderKind {
     /// environment, the workspace `.env`, or the user credential store.
     #[must_use]
     pub fn has_credential(self) -> bool {
+        if self == Self::Ollama {
+            return ollama_is_available();
+        }
+        if self == Self::LocalOpenAi {
+            return local_openai_is_available();
+        }
         let environment = self.api_key_environment();
         std::env::var(environment).is_ok_and(|value| !value.is_empty())
             || dotenv_value(environment).is_some()
     }
 }
 
-/// Providers that currently have a usable credential, in preference order.
+fn normalize_base_url(value: &str) -> String {
+    let value = value.trim().trim_end_matches('/');
+    if value.starts_with("http://") || value.starts_with("https://") {
+        value.to_owned()
+    } else {
+        format!("http://{value}")
+    }
+}
+
+fn ollama_base_url() -> String {
+    let host = std::env::var("OLLAMA_HOST")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:11434".to_owned());
+    normalize_base_url(&host)
+}
+
+fn ollama_is_available() -> bool {
+    Client::builder()
+        .connect_timeout(Duration::from_millis(250))
+        .timeout(Duration::from_millis(500))
+        .build()
+        .ok()
+        .and_then(|client| {
+            client
+                .get(format!("{}/api/version", ollama_base_url()))
+                .send()
+                .ok()
+        })
+        .is_some_and(|response| response.status().is_success())
+}
+
+fn local_openai_base_url() -> String {
+    std::env::var("LOCAL_OPENAI_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map_or_else(String::new, |value| normalize_base_url(&value))
+}
+
+fn local_openai_is_available() -> bool {
+    let base_url = local_openai_base_url();
+    if base_url.is_empty() {
+        return false;
+    }
+    let Ok(client) = Client::builder()
+        .connect_timeout(Duration::from_millis(250))
+        .timeout(Duration::from_millis(500))
+        .build()
+    else {
+        return false;
+    };
+    let mut request = client.get(format!("{base_url}/v1/models"));
+    if let Ok(key) = std::env::var("LOCAL_OPENAI_API_KEY")
+        && !key.is_empty()
+    {
+        request = request.header(AUTHORIZATION, format!("Bearer {key}"));
+    }
+    request
+        .send()
+        .is_ok_and(|response| response.status().is_success())
+}
+
+/// Providers currently usable through an API key or a reachable local runtime.
 #[must_use]
 pub fn available_providers() -> Vec<ProviderKind> {
     ProviderKind::all()
@@ -190,25 +281,57 @@ impl OpenAiCompatibleProvider {
     /// Returns an error when the provider credential cannot be found or the
     /// HTTP client cannot be constructed.
     pub fn from_environment(kind: ProviderKind, model: Option<String>) -> Result<Self, String> {
-        let environment = kind.api_key_environment();
-        let api_key = std::env::var(environment)
-            .ok()
-            .or_else(|| dotenv_value(environment))
-            .ok_or_else(|| format!("{environment} is required for provider {}", kind.name()))?;
-        if api_key.is_empty() {
-            return Err(format!("{environment} is empty"));
-        }
+        let api_key = if kind == ProviderKind::Ollama {
+            if !ollama_is_available() {
+                return Err(format!(
+                    "Ollama is not reachable at {}; start Ollama or set OLLAMA_HOST",
+                    ollama_base_url()
+                ));
+            }
+            "ollama".to_owned()
+        } else if kind == ProviderKind::LocalOpenAi {
+            if !local_openai_is_available() {
+                return Err(
+                    "local OpenAI-compatible server is unavailable; set LOCAL_OPENAI_BASE_URL"
+                        .to_owned(),
+                );
+            }
+            std::env::var("LOCAL_OPENAI_API_KEY").unwrap_or_else(|_| "local".to_owned())
+        } else {
+            let environment = kind.api_key_environment();
+            let key = std::env::var(environment)
+                .ok()
+                .or_else(|| dotenv_value(environment))
+                .ok_or_else(|| format!("{environment} is required for provider {}", kind.name()))?;
+            if key.is_empty() {
+                return Err(format!("{environment} is empty"));
+            }
+            key
+        };
         let client = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(TURN_TIMEOUT)
             .build()
             .map_err(|error| error.to_string())?;
-        Ok(Self {
+        let requested_model = model.is_some();
+        let mut provider = Self {
             kind,
             api_key,
             model: model.unwrap_or_else(|| kind.default_model().to_owned()),
             client,
-        })
+        };
+        // A local runtime may contain any model names. Prefer Junebug's
+        // coding default when installed; otherwise make `--provider ollama`
+        // immediately useful by selecting the first installed model.
+        if matches!(kind, ProviderKind::Ollama | ProviderKind::LocalOpenAi)
+            && !requested_model
+            && let Ok(models) = provider.list_models()
+            && !models.is_empty()
+            && !models.contains(&provider.model)
+        {
+            provider.model.clone_from(&models[0]);
+        }
+        Ok(provider)
     }
 
     #[must_use]
@@ -263,6 +386,7 @@ impl OpenAiCompatibleProvider {
 fn dotenv_value(key: &str) -> Option<String> {
     env_file_value(std::path::Path::new(".env"), key)
         .or_else(|| credentials_path().and_then(|path| env_file_value(&path, key)))
+        .or_else(|| legacy_credentials_path().and_then(|path| env_file_value(&path, key)))
 }
 
 fn env_file_value(path: &std::path::Path, key: &str) -> Option<String> {
@@ -289,9 +413,18 @@ fn env_file_value(path: &std::path::Path, key: &str) -> Option<String> {
     })
 }
 
-/// The user-level credential store written by `febo set`.
+/// The user-level credential store written by `junebug set`.
 #[must_use]
 pub fn credentials_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
+    Some(
+        std::path::PathBuf::from(home)
+            .join(".junebug")
+            .join("credentials.env"),
+    )
+}
+
+fn legacy_credentials_path() -> Option<std::path::PathBuf> {
     let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
     Some(
         std::path::PathBuf::from(home)
@@ -308,6 +441,9 @@ pub fn credentials_path() -> Option<std::path::PathBuf> {
 /// Returns an error when the home directory is unknown or the file cannot
 /// be written.
 pub fn store_credential(kind: ProviderKind, key: &str) -> Result<std::path::PathBuf, String> {
+    if !kind.requires_api_key() {
+        return Err("local providers are configured through their runtime environment".to_owned());
+    }
     let path = credentials_path().ok_or("cannot locate a home directory")?;
     store_credential_at(&path, kind.api_key_environment(), key)?;
     Ok(path)
@@ -359,7 +495,14 @@ impl ModelProvider for OpenAiCompatibleProvider {
         if self.kind == ProviderKind::Anthropic {
             return self.stream_anthropic(model, messages, tools, cancel);
         }
-        let mut body = json!({"model": model, "stream": true, "stream_options": {"include_usage": true}, "messages": messages});
+        let request_messages = openai_request_messages(self.kind, messages);
+        let mut body = json!({"model": model, "stream": true, "stream_options": {"include_usage": true}, "messages": request_messages});
+        // Ollama enables Qwen3 thinking by default. Coding-agent turns need
+        // responsive tool calls more than a long hidden reasoning trace; the
+        // OpenAI-compatible endpoint documents `none` for this purpose.
+        if self.kind == ProviderKind::Ollama {
+            body["reasoning_effort"] = Value::String("none".to_owned());
+        }
         // OpenAI-compatible endpoints reject an empty tools array, so only
         // send the fields when at least one tool is offered.
         if !tools.is_empty() {
@@ -373,8 +516,8 @@ impl ModelProvider for OpenAiCompatibleProvider {
             .header(CONTENT_TYPE, "application/json");
         if self.kind == ProviderKind::OpenRouter {
             request = request
-                .header("HTTP-Referer", "https://github.com/weeksdev/febo_cli")
-                .header("X-OpenRouter-Title", "Febo CLI");
+                .header("HTTP-Referer", "https://github.com/weeksdev/junebug-cli")
+                .header("X-OpenRouter-Title", "Junebug CLI");
         }
         let response = request
             .json(&body)
@@ -389,7 +532,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 response.text().unwrap_or_default()
             ));
         }
-        parse_sse(response, cancel)
+        parse_sse(BufReader::new(response), cancel)
     }
 }
 
@@ -443,7 +586,7 @@ fn anthropic_tool(tool: &Value) -> Option<Value> {
     }))
 }
 
-/// Translate Febo's canonical OpenAI-shaped transcript at the provider edge.
+/// Translate Junebug's canonical OpenAI-shaped transcript at the provider edge.
 /// Keeping this conversion here allows a conversation to switch providers
 /// between turns without changing the session or agent-loop formats.
 fn anthropic_messages(messages: &[Value]) -> (String, Vec<Value>) {
@@ -488,7 +631,9 @@ fn anthropic_messages(messages: &[Value]) -> (String, Vec<Value>) {
                         }));
                     }
                 }
-                translated.push(json!({"role": "assistant", "content": content}));
+                if !content.is_empty() {
+                    translated.push(json!({"role": "assistant", "content": content}));
+                }
             }
             "tool" => {
                 let block = json!({
@@ -515,6 +660,44 @@ fn anthropic_messages(messages: &[Value]) -> (String, Vec<Value>) {
         }
     }
     (system.join("\n\n"), translated)
+}
+
+fn has_assistant_payload(message: &Value) -> bool {
+    let has_content = match message.get("content") {
+        Some(Value::String(content)) => !content.is_empty(),
+        Some(Value::Array(content)) => !content.is_empty(),
+        Some(Value::Null) | None => false,
+        Some(_) => true,
+    };
+    let has_tool_calls = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .is_some_and(|calls| !calls.is_empty());
+    has_content || has_tool_calls
+}
+
+/// Repair invalid empty assistant entries left by interrupted/empty legacy
+/// streams. Reasoning is retained only for `DeepSeek`, whose thinking-mode
+/// tool continuation requires it; other OpenAI-shaped providers may reject
+/// that provider-specific field.
+fn openai_request_messages(kind: ProviderKind, messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .filter_map(|message| {
+            let mut message = message.clone();
+            if message.get("role").and_then(Value::as_str) == Some("assistant") {
+                if !has_assistant_payload(&message) {
+                    return None;
+                }
+                if kind != ProviderKind::DeepSeek
+                    && let Some(object) = message.as_object_mut()
+                {
+                    object.remove("reasoning_content");
+                }
+            }
+            Some(message)
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -650,17 +833,16 @@ struct PartialToolCall {
     arguments: String,
 }
 
-fn parse_sse(
-    response: reqwest::blocking::Response,
-    cancel: &AtomicBool,
-) -> Result<ModelTurn, String> {
+#[allow(clippy::too_many_lines)]
+fn parse_sse(reader: impl BufRead, cancel: &AtomicBool) -> Result<ModelTurn, String> {
     let mut text_deltas = Vec::new();
     let mut text = String::new();
+    let mut reasoning_content = String::new();
     let mut partial_calls = BTreeMap::<usize, PartialToolCall>::new();
     let mut input_tokens = 0;
     let mut output_tokens = 0;
     let mut interrupted = false;
-    for line in BufReader::new(response).lines() {
+    for line in reader.lines() {
         if cancel.load(Ordering::Relaxed) {
             // Drop partial tool calls: their JSON arguments may be
             // incomplete and they must never execute after an interrupt.
@@ -687,6 +869,13 @@ fn parse_sse(
         {
             text.push_str(content);
             text_deltas.push(content.to_owned());
+        }
+        if let Some(reasoning) = chunk
+            .pointer("/choices/0/delta/reasoning_content")
+            .and_then(Value::as_str)
+            .filter(|content| !content.is_empty())
+        {
+            reasoning_content.push_str(reasoning);
         }
         if let Some(calls) = chunk
             .pointer("/choices/0/delta/tool_calls")
@@ -739,6 +928,9 @@ fn parse_sse(
         text.push_str("\n[response interrupted by user]");
     }
     let mut assistant_message = json!({"role": "assistant", "content": if text.is_empty() { Value::Null } else { Value::String(text) }});
+    if !reasoning_content.is_empty() {
+        assistant_message["reasoning_content"] = Value::String(reasoning_content);
+    }
     if !tool_calls.is_empty() {
         assistant_message["tool_calls"] = Value::Array(tool_calls.iter().map(|call| json!({"id": call.id, "type": "function", "function": {"name": call.name, "arguments": call.arguments}})).collect());
     }
@@ -754,7 +946,8 @@ fn parse_sse(
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderKind, anthropic_messages, env_file_value, parse_anthropic_sse, store_credential_at,
+        ProviderKind, anthropic_messages, env_file_value, openai_request_messages,
+        parse_anthropic_sse, parse_sse, store_credential_at,
     };
     use serde_json::json;
     use std::io::Cursor;
@@ -768,6 +961,14 @@ mod tests {
             Ok(ProviderKind::OpenRouter)
         );
         assert_eq!(ProviderKind::parse("claude"), Ok(ProviderKind::Anthropic));
+        assert_eq!(ProviderKind::parse("local"), Ok(ProviderKind::Ollama));
+        assert_eq!(
+            ProviderKind::parse("lmstudio"),
+            Ok(ProviderKind::LocalOpenAi)
+        );
+        assert!(!ProviderKind::Ollama.requires_api_key());
+        assert!(!ProviderKind::LocalOpenAi.requires_api_key());
+        assert_eq!(ProviderKind::Ollama.default_model(), "qwen3:8b");
         assert!(ProviderKind::parse("fake").is_err());
     }
 
@@ -815,10 +1016,40 @@ mod tests {
     }
 
     #[test]
+    fn repairs_empty_assistant_history_and_scopes_deepseek_reasoning() {
+        let messages = vec![
+            json!({"role":"system","content":"system"}),
+            json!({"role":"assistant","content":null}),
+            json!({"role":"assistant","content":""}),
+            json!({"role":"assistant","content":null,"reasoning_content":"thinking","tool_calls":[{"id":"c1","type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
+            json!({"role":"user","content":"continue"}),
+        ];
+        let deepseek = openai_request_messages(ProviderKind::DeepSeek, &messages);
+        assert_eq!(deepseek.len(), 3);
+        assert_eq!(deepseek[1]["reasoning_content"], "thinking");
+        let openai = openai_request_messages(ProviderKind::OpenAi, &messages);
+        assert_eq!(openai.len(), 3);
+        assert!(openai[1].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn openai_stream_preserves_reasoning_for_tool_continuation() {
+        let stream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"inspect first\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let turn = parse_sse(Cursor::new(stream), &AtomicBool::new(false)).expect("valid stream");
+        assert_eq!(turn.assistant_message["content"], serde_json::Value::Null);
+        assert_eq!(turn.assistant_message["reasoning_content"], "inspect first");
+        assert_eq!(turn.tool_calls.len(), 1);
+    }
+
+    #[test]
     fn stores_and_replaces_credentials() {
         let path = std::env::temp_dir()
             .join(format!(
-                "febo-credentials-{}",
+                "junebug-credentials-{}",
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .expect("clock")

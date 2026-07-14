@@ -30,13 +30,13 @@ jobs:
       - run: cargo build --release --target ${{ matrix.target }}
       - name: Package (unix)
         if: runner.os != 'Windows'
-        run: tar -C target/${{ matrix.target }}/release -czf febo-${{ github.ref_name }}-${{ matrix.target }}.tar.gz febo
+        run: tar -C target/${{ matrix.target }}/release -czf junebug-${{ github.ref_name }}-${{ matrix.target }}.tar.gz junebug
       - name: Package (windows)
         if: runner.os == 'Windows'
-        run: Compress-Archive -Path target/${{ matrix.target }}/release/febo.exe -DestinationPath febo-${{ github.ref_name }}-${{ matrix.target }}.zip
+        run: Compress-Archive -Path target/${{ matrix.target }}/release/junebug.exe -DestinationPath junebug-${{ github.ref_name }}-${{ matrix.target }}.zip
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            febo-*.tar.gz
-            febo-*.zip
+            junebug-*.tar.gz
+            junebug-*.zip

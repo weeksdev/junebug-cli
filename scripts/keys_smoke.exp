@@ -2,7 +2,7 @@
 set timeout 30
 set ws [lindex $argv 0]
 cd $ws
-spawn env -u OPENROUTER_API_KEY -u OPENAI_API_KEY -u DEEPSEEK_API_KEY HOME=$ws/home /Users/andrewweeks/repos/junie_cli/target/debug/febo
+spawn env -u OPENROUTER_API_KEY -u OPENAI_API_KEY -u DEEPSEEK_API_KEY HOME=$ws/home /Users/andrewweeks/repos/junie_cli/target/debug/junebug
 expect { "no API keys found" {} timeout { puts "\nFAIL: no-keys banner missing"; exit 1 } }
 sleep 1
 send "hi there\r"

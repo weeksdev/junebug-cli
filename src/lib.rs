@@ -1,7 +1,8 @@
-//! Core types for Febo CLI. Public contracts live here so future TUI, CLI and
+//! Core types for Junebug CLI. Public contracts live here so future TUI, CLI and
 //! app-server interfaces all use the same provider and policy boundaries.
 
 pub mod agent;
+pub mod browser;
 pub mod checkpoint;
 pub mod config;
 pub mod context;
@@ -23,8 +24,8 @@ pub enum PermissionMode {
     ReadOnly,
     Ask,
     WorkspaceWrite,
-    /// Approve every write and command without prompting ("yolo"). Plan mode
-    /// still overrides this to read-only.
+    /// Unrestricted filesystem access plus every write and command without
+    /// prompting ("yolo"). Plan mode still overrides this to read-only.
     Yolo,
 }
 

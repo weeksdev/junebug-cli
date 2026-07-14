@@ -171,6 +171,11 @@ pub fn run_loop(
             selection
                 .provider
                 .stream_turn(selection.model, &request_messages, tools, cancel)?;
+        if turn.tool_calls.is_empty() && !assistant_has_content(&turn.assistant_message) {
+            return Err(
+                "provider returned an empty assistant turn; history was left unchanged".to_owned(),
+            );
+        }
         input_tokens = input_tokens.max(turn.input_tokens);
         output_tokens += turn.output_tokens;
         for text in &turn.text_deltas {
@@ -205,12 +210,21 @@ pub fn run_loop(
             // pairing a dangling tool_calls message.
             // Capture the pre-write content before the tool runs so the
             // observer can show what actually changed.
-            let write_preview = write_preview(workspace, &call);
+            let tool_policy = policy.snapshot();
+            let unrestricted = tool_policy.unrestricted_access();
+            let write_preview = write_preview(workspace, &call, unrestricted);
             let result = if cancel.load(Ordering::Relaxed) {
                 "ERROR: interrupted by user".to_owned()
             } else {
                 observer.on_tool_call(&call.name, &call.arguments);
-                execute_tool(workspace, &call, policy, approve, checkpoint, mcp_clients)
+                execute_tool(
+                    workspace,
+                    &call,
+                    &tool_policy,
+                    approve,
+                    checkpoint,
+                    mcp_clients,
+                )
             };
             session.record("tool_result", &format!("{}: {result}", call.name))?;
             observer.on_tool_result(&call.name, &result);
@@ -235,6 +249,15 @@ pub fn run_loop(
     Err(format!("agent exceeded the {max_turns}-turn safety limit"))
 }
 
+fn assistant_has_content(message: &Value) -> bool {
+    match message.get("content") {
+        Some(Value::String(content)) => !content.is_empty(),
+        Some(Value::Array(content)) => !content.is_empty(),
+        Some(Value::Null) | None => false,
+        Some(_) => true,
+    }
+}
+
 /// Classify a tool by risk. MCP tools can execute arbitrary server-defined
 /// behavior, so they are treated as `Execute` (always requires approval)
 /// rather than trusted based on their self-reported description.
@@ -251,14 +274,20 @@ fn tool_risk(name: &str) -> Option<ToolRisk> {
 /// For a `write_file` call, the path plus old and new content, captured
 /// before the write so a diff can be shown afterwards. `None` for other
 /// tools or unparsable arguments.
-fn write_preview(workspace: &Workspace, call: &ToolCall) -> Option<(String, String, String)> {
+fn write_preview(
+    workspace: &Workspace,
+    call: &ToolCall,
+    unrestricted: bool,
+) -> Option<(String, String, String)> {
     if call.name != "write_file" {
         return None;
     }
     let arguments: Value = serde_json::from_str(&call.arguments).ok()?;
     let path = arguments.get("path")?.as_str()?.to_owned();
     let new = arguments.get("content")?.as_str()?.to_owned();
-    let old = workspace.read_file(Path::new(&path)).unwrap_or_default();
+    let old = workspace
+        .read_file_with_access(Path::new(&path), unrestricted)
+        .unwrap_or_default();
     Some((path, old, new))
 }
 
@@ -299,7 +328,7 @@ fn approval_prompt(
             rendered.push('…');
         }
         return format!(
-            "Febo requests MCP tool execution: {server}.{tool}\n  arguments: {rendered}"
+            "Junebug requests MCP tool execution: {server}.{tool}\n  arguments: {rendered}"
         );
     }
     match call.name.as_str() {
@@ -312,11 +341,11 @@ fn approval_prompt(
             let diff = crate::diff::clip(&crate::diff::unified(&old, content), 40);
             if diff.is_empty() {
                 format!(
-                    "Febo requests write access: {path} ({} bytes, no line changes)",
+                    "Junebug requests write access: {path} ({} bytes, no line changes)",
                     content.len()
                 )
             } else {
-                format!("Febo requests write access: {path}\n{diff}")
+                format!("Junebug requests write access: {path}\n{diff}")
             }
         }
         "run_command" => {
@@ -325,13 +354,13 @@ fn approval_prompt(
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let warning = if crate::tool::is_dangerous_command(command) {
-                "\n  ⚠ WARNING: matches Febo's destructive/network command patterns"
+                "\n  ⚠ WARNING: matches Junebug's destructive/network command patterns"
             } else {
                 ""
             };
-            format!("Febo requests command execution in the workspace:\n  {command}{warning}")
+            format!("Junebug requests command execution in the workspace:\n  {command}{warning}")
         }
-        other => format!("Febo requests approval to run {other}"),
+        other => format!("Junebug requests approval to run {other}"),
     }
 }
 
@@ -358,6 +387,7 @@ pub fn execute_tool(
         return format!("ERROR: unknown tool: {}", call.name);
     };
     let path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
+    let unrestricted = policy.unrestricted_access();
     match policy.evaluate(risk) {
         Decision::Deny => return "ERROR: denied by permission policy".to_owned(),
         Decision::Ask => {
@@ -385,19 +415,21 @@ pub fn execute_tool(
     } else {
         match call.name.as_str() {
             "list_dir" => workspace
-                .list_dir(Path::new(path))
+                .list_dir_with_access(Path::new(path), unrestricted)
                 .map(|entries| entries.join("\n")),
-            "read_file" => workspace.read_file(Path::new(path)),
-            "search" => {
-                workspace.search(arguments.get("query").and_then(Value::as_str).unwrap_or(""))
-            }
+            "read_file" => workspace.read_file_with_access(Path::new(path), unrestricted),
+            "search" => workspace.search_at(
+                arguments.get("query").and_then(Value::as_str).unwrap_or(""),
+                Path::new(arguments.get("path").and_then(Value::as_str).unwrap_or(".")),
+                unrestricted,
+            ),
             "write_file" => {
                 let content = arguments
                     .get("content")
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 workspace
-                    .write_file(Path::new(path), content)
+                    .write_file_with_access(Path::new(path), content, unrestricted)
                     .map(|()| format!("wrote {path} ({} bytes)", content.len()))
             }
             "run_command" => {
@@ -405,10 +437,10 @@ pub fn execute_tool(
                     .get("command")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                workspace.run_command(command)
+                workspace.run_command_with_access(command, unrestricted)
             }
-            "git_status" => workspace.git_status(),
-            "git_diff" => workspace.git_diff(),
+            "git_status" => workspace.git_status_at(Path::new(path), unrestricted),
+            "git_diff" => workspace.git_diff_at(Path::new(path), unrestricted),
             _ => Err(format!("unknown tool: {}", call.name)),
         }
     };
@@ -417,7 +449,7 @@ pub fn execute_tool(
 
 #[cfg(test)]
 mod tests {
-    use super::execute_tool;
+    use super::{assistant_has_content, execute_tool};
     use crate::PermissionMode;
     use crate::policy::PolicyEngine;
     use crate::provider::ToolCall;
@@ -449,9 +481,22 @@ mod tests {
     }
 
     #[test]
+    fn empty_assistant_messages_are_not_valid_turns() {
+        assert!(!assistant_has_content(
+            &serde_json::json!({"role":"assistant","content":null})
+        ));
+        assert!(!assistant_has_content(
+            &serde_json::json!({"role":"assistant","content":""})
+        ));
+        assert!(assistant_has_content(
+            &serde_json::json!({"role":"assistant","content":"done"})
+        ));
+    }
+
+    #[test]
     fn write_approval_prompt_shows_the_line_diff() {
         let root = std::env::temp_dir().join(format!(
-            "febo-approval-diff-{}",
+            "junebug-approval-diff-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
@@ -547,5 +592,74 @@ mod tests {
         );
         assert_eq!(result, "ERROR: denied by permission policy");
         assert!(!prompted, "read-only denial must not prompt for approval");
+    }
+
+    #[test]
+    fn yolo_dispatch_reads_protected_and_absolute_paths_without_prompting() {
+        let root = std::env::temp_dir().join(format!(
+            "junebug-yolo-dispatch-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let outside = root.with_extension("outside");
+        std::fs::create_dir_all(&root).expect("workspace");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(root.join(".env"), "LOCAL_SECRET=test-only").expect("protected file");
+        std::fs::write(outside.join("note.txt"), "outside").expect("outside file");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(&outside)
+                .status()
+                .expect("git init")
+                .success()
+        );
+        let workspace = Workspace::new(root.clone());
+        let policy = PolicyEngine::new(PermissionMode::Yolo, false);
+        let mut prompted = false;
+        let mut approve = |_: &str| {
+            prompted = true;
+            false
+        };
+
+        let protected = execute_tool(
+            &workspace,
+            &call("read_file", r#"{"path":".env"}"#),
+            &policy,
+            &mut approve,
+            &mut |_: &str| {},
+            &mut [],
+        );
+        let absolute = execute_tool(
+            &workspace,
+            &call(
+                "read_file",
+                &serde_json::json!({"path": outside.join("note.txt")}).to_string(),
+            ),
+            &policy,
+            &mut approve,
+            &mut |_: &str| {},
+            &mut [],
+        );
+        let git_status = execute_tool(
+            &workspace,
+            &call(
+                "git_status",
+                &serde_json::json!({"path": &outside}).to_string(),
+            ),
+            &policy,
+            &mut approve,
+            &mut |_: &str| {},
+            &mut [],
+        );
+        assert_eq!(protected, "LOCAL_SECRET=test-only");
+        assert_eq!(absolute, "outside");
+        assert!(git_status.contains("note.txt"), "got: {git_status}");
+        assert!(!prompted);
+
+        std::fs::remove_dir_all(root).expect("cleanup root");
+        std::fs::remove_dir_all(outside).expect("cleanup outside");
     }
 }

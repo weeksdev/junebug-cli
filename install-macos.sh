@@ -1,6 +1,6 @@
 #!/bin/sh
-# Build and install (or replace) the latest Febo CLI on macOS.
-# Installs to ~/.local/bin/febo — the same convention Claude Code uses —
+# Build and install (or replace) the latest Junebug CLI on macOS.
+# Installs to ~/.local/bin/junebug — the same convention Claude Code uses —
 # so no sudo is needed. Re-run any time to upgrade to the current checkout.
 set -eu
 
@@ -11,19 +11,19 @@ if ! command -v cargo > /dev/null 2>&1; then
     exit 1
 fi
 
-echo "building febo (release)…"
+echo "building junebug (release)…"
 cargo build --release --quiet
 
 BIN_DIR="$HOME/.local/bin"
 mkdir -p "$BIN_DIR"
-install -m 755 target/release/febo "$BIN_DIR/febo"
+install -m 755 target/release/junebug "$BIN_DIR/junebug"
 
-VERSION=$("$BIN_DIR/febo" --version)
-echo "installed $VERSION to $BIN_DIR/febo"
+VERSION=$("$BIN_DIR/junebug" --version)
+echo "installed $VERSION to $BIN_DIR/junebug"
 
 case ":$PATH:" in
     *":$BIN_DIR:"*)
-        echo "run: febo"
+        echo "run: junebug"
         ;;
     *)
         echo ""

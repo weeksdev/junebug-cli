@@ -16,7 +16,7 @@ impl SessionWriter {
     ///
     /// Returns an error when the local session directory cannot be created.
     pub fn create(workspace: &Path) -> Result<Self, String> {
-        let directory = workspace.join(".febo").join("sessions");
+        let directory = workspace.join(".junebug").join("sessions");
         fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
         let millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -115,29 +115,34 @@ pub fn last_model(workspace: &Path, provider: &str) -> Option<String> {
     }
 }
 
-/// List recorded sessions under `.febo/sessions`, newest first. Unreadable
-/// or empty files are skipped rather than failing the whole listing.
+/// List recorded sessions under `.junebug/sessions` and the legacy
+/// `.febo/sessions`, newest first. Unreadable or empty files are skipped
+/// rather than failing the whole listing.
 ///
 /// # Errors
 ///
 /// Returns an error only when the sessions directory exists but cannot be
 /// read.
 pub fn list_sessions(workspace: &Path) -> Result<Vec<SessionSummary>, String> {
-    let directory = workspace.join(".febo").join("sessions");
-    if !directory.is_dir() {
-        return Ok(Vec::new());
-    }
     let mut summaries = Vec::new();
-    for entry in fs::read_dir(&directory).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+    for directory in [
+        workspace.join(".junebug").join("sessions"),
+        workspace.join(".febo").join("sessions"),
+    ] {
+        if !directory.is_dir() {
             continue;
         }
-        let Some(summary) = summarize_session(&path) else {
-            continue;
-        };
-        summaries.push(summary);
+        for entry in fs::read_dir(&directory).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(summary) = summarize_session(&path) else {
+                continue;
+            };
+            summaries.push(summary);
+        }
     }
     summaries.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
     Ok(summaries)
@@ -150,13 +155,26 @@ fn summarize_session(path: &Path) -> Option<SessionSummary> {
     let mut messages = 0usize;
     let mut provider = None;
     let mut model = None;
+    let mut standalone_swarm_log = false;
     for line in BufReader::new(file).lines() {
         let Ok(line) = line else { continue };
         let Ok(event) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
         match event.get("event").and_then(Value::as_str) {
-            Some("message") => messages += 1,
+            Some("message") => {
+                messages += 1;
+                // Older logs and swarm summaries may have structured user
+                // messages without the redundant `user_prompt` event. Use
+                // the first such message as a picker title fallback.
+                if preview.is_empty()
+                    && let Some(message) = event.get("message")
+                    && message.get("role").and_then(Value::as_str) == Some("user")
+                    && let Some(content) = message.get("content").and_then(Value::as_str)
+                {
+                    first_preview_line(content).clone_into(&mut preview);
+                }
+            }
             Some("provider") => {
                 provider = event
                     .get("value")
@@ -172,20 +190,22 @@ fn summarize_session(path: &Path) -> Option<SessionSummary> {
                     .and_then(Value::as_str)
                     .map(str::to_owned);
             }
+            Some("swarm_goal") => {
+                // A swarm session is an audit log containing several fresh
+                // boss/worker/checker histories concatenated together. It is
+                // intentionally not a provider-resumable conversation and
+                // must not appear in the `--resume` picker.
+                standalone_swarm_log = true;
+            }
             Some("user_prompt") if preview.is_empty() => {
                 if let Some(value) = event.get("value").and_then(Value::as_str) {
-                    value
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .clone_into(&mut preview);
+                    first_preview_line(value).clone_into(&mut preview);
                 }
             }
             _ => {}
         }
     }
-    if messages == 0 && preview.is_empty() {
+    if standalone_swarm_log || (messages == 0 && preview.is_empty()) {
         return None;
     }
     Some(SessionSummary {
@@ -196,6 +216,10 @@ fn summarize_session(path: &Path) -> Option<SessionSummary> {
         provider,
         model,
     })
+}
+
+fn first_preview_line(value: &str) -> &str {
+    value.lines().next().unwrap_or("").trim()
 }
 
 /// Load structured conversation messages from an append-only session log.
@@ -234,7 +258,7 @@ mod tests {
     #[test]
     fn model_is_sticky_for_the_matching_provider() {
         let root = std::env::temp_dir().join(format!(
-            "febo-last-model-{}",
+            "junebug-last-model-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
@@ -265,7 +289,7 @@ mod tests {
     #[test]
     fn mid_session_provider_switch_resets_the_sticky_model() {
         let root = std::env::temp_dir().join(format!(
-            "febo-provider-switch-{}",
+            "junebug-provider-switch-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
@@ -297,7 +321,7 @@ mod tests {
     #[test]
     fn lists_sessions_newest_first_with_preview() {
         let root = std::env::temp_dir().join(format!(
-            "febo-list-{}",
+            "junebug-list-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
@@ -325,9 +349,81 @@ mod tests {
     }
 
     #[test]
+    fn legacy_febo_sessions_remain_listed() {
+        let root = std::env::temp_dir().join(format!(
+            "junebug-legacy-session-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let directory = root.join(".febo/sessions");
+        fs::create_dir_all(&directory).expect("legacy directory");
+        fs::write(
+            directory.join("old.jsonl"),
+            "{\"event\":\"user_prompt\",\"value\":\"legacy task\"}\n",
+        )
+        .expect("legacy session");
+
+        let sessions = list_sessions(&root).expect("list");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].preview, "legacy task");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn message_only_session_uses_first_user_message_as_preview() {
+        let root = std::env::temp_dir().join(format!(
+            "junebug-message-preview-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("directory");
+        let session = SessionWriter::create(&root).expect("session");
+        session
+            .record_message(&json!({"role": "assistant", "content": "not the title"}))
+            .expect("assistant message");
+        session
+            .record_message(&json!({"role": "user", "content": "swarm goal\nmore detail"}))
+            .expect("user message");
+
+        let sessions = list_sessions(&root).expect("list");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].preview, "swarm goal");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn standalone_swarm_log_is_not_offered_for_resume() {
+        let root = std::env::temp_dir().join(format!(
+            "junebug-swarm-preview-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("directory");
+        let session = SessionWriter::create(&root).expect("session");
+        session
+            .record("swarm_goal", "do the next phase where we left off")
+            .expect("goal");
+        session
+            .record_message(&json!({"role": "assistant", "content": null, "tool_calls": []}))
+            .expect("assistant message");
+
+        assert!(
+            list_sessions(&root).expect("list").is_empty(),
+            "multi-agent swarm audit histories are not resumable conversations"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn records_and_loads_messages() {
         let root = std::env::temp_dir().join(format!(
-            "febo-session-test-{}",
+            "junebug-session-test-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")

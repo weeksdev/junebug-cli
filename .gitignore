@@ -1,6 +1,6 @@
 /target/
+/.junebug/
 /.febo/
 /.junie/
 .env
 .DS_Store
-

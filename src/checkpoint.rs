@@ -1,13 +1,13 @@
 //! Workspace checkpoints in a shadow Git repository.
 //!
-//! Febo snapshots the workspace before each prompt and before every mutating
+//! Junebug snapshots the workspace before each prompt and before every mutating
 //! tool call, without touching the user's own repository: the shadow repo
-//! lives under `~/.febo/checkpoints/<workspace-id>` and uses the workspace as
+//! lives under `~/.junebug/checkpoints/<workspace-id>` and uses the workspace as
 //! its work tree, so it works in non-Git workspaces too. `/rewind` restores
 //! files from any checkpoint; the state just before a restore is checkpointed
 //! first, so a restore is always undoable. Snapshots respect the workspace's
-//! `.gitignore` plus a fixed exclude list, so secrets (`.env*`) and Febo's own
-//! state (`.febo/`) are never captured or rewound.
+//! `.gitignore` plus a fixed exclude list, so secrets (`.env*`) and Junebug's own
+//! state (`.junebug/`) are never captured or rewound.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -16,9 +16,9 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Never snapshot or restore these. `.env*` keeps secrets out of the shadow
-/// repo; `.febo/` keeps sessions and hooks from being rewound; `.git/` cannot
-/// be tracked anyway; build caches are skipped for size.
-const EXCLUDES: &str = ".git/\n.febo/\n.env\n.env.*\ntarget/\nnode_modules/\n";
+/// repo; current and legacy state directories keep sessions and hooks from
+/// being rewound; `.git/` cannot be tracked anyway; build caches are skipped.
+const EXCLUDES: &str = ".git/\n.junebug/\n.febo/\n.env\n.env.*\ntarget/\nnode_modules/\n";
 
 #[derive(Debug, Clone)]
 pub struct Checkpoint {
@@ -37,7 +37,7 @@ pub struct Checkpointer {
 
 impl Checkpointer {
     /// Open (or initialize) the shadow repository for `workspace` under the
-    /// user's `~/.febo/checkpoints` directory.
+    /// user's `~/.junebug/checkpoints` directory.
     ///
     /// # Errors
     ///
@@ -53,10 +53,17 @@ impl Checkpointer {
             .unwrap_or_else(|_| workspace.to_path_buf());
         let mut hasher = DefaultHasher::new();
         identity.hash(&mut hasher);
-        let git_dir = PathBuf::from(home)
-            .join(".febo")
-            .join("checkpoints")
-            .join(format!("{:016x}", hasher.finish()));
+        let home = PathBuf::from(home);
+        let suffix = format!("{:016x}", hasher.finish());
+        let current = home.join(".junebug").join("checkpoints").join(&suffix);
+        let legacy = home.join(".febo").join("checkpoints").join(suffix);
+        // Existing workspaces keep using their old shadow repo so `/rewind`
+        // history survives the product rename. New workspaces use Junebug.
+        let git_dir = if current.join("HEAD").exists() || !legacy.join("HEAD").exists() {
+            current
+        } else {
+            legacy
+        };
         Self::with_git_dir(workspace.to_path_buf(), git_dir)
     }
 
@@ -158,7 +165,7 @@ impl Checkpointer {
 
     /// Restore workspace files to `tag`. The state just before restoring is
     /// checkpointed first, so the restore itself can be rewound. Excluded
-    /// paths (`.env*`, `.febo/`, ignored files) are never touched.
+    /// paths (`.env*`, `.junebug/`, ignored files) are never touched.
     ///
     /// # Errors
     ///
@@ -174,6 +181,32 @@ impl Checkpointer {
         self.snapshot("before rewind restore")?;
         self.git(&["reset", "--hard", "-q", tag])?;
         Ok(())
+    }
+
+    /// Return machine-readable changes since the most recent checkpoint.
+    /// This is the non-Git-workspace baseline used by the read-only
+    /// `/changes` browser.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the shadow Git repository cannot be inspected.
+    pub fn changes_status(&self) -> Result<String, String> {
+        self.git(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+    }
+
+    /// Return a per-file diff against the most recent checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the shadow Git repository cannot be inspected.
+    pub fn diff_from_head(&self, path: &Path) -> Result<String, String> {
+        self.git(&[
+            "diff",
+            "--no-ext-diff",
+            "HEAD",
+            "--",
+            path.to_string_lossy().as_ref(),
+        ])
     }
 
     /// Run git against the shadow repo with the workspace as the work tree.
@@ -206,9 +239,9 @@ impl Checkpointer {
             .arg(&self.workspace)
             .args([
                 "-c",
-                "user.name=Febo",
+                "user.name=Junebug",
                 "-c",
-                "user.email=febo@localhost",
+                "user.email=junebug@localhost",
                 "-c",
                 "commit.gpgsign=false",
                 "-c",
@@ -229,7 +262,7 @@ mod tests {
 
     fn temp_checkpointer(label: &str) -> (PathBuf, Checkpointer) {
         let base = std::env::temp_dir().join(format!(
-            "febo-checkpoint-{label}-{}",
+            "junebug-checkpoint-{label}-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
@@ -312,13 +345,15 @@ mod tests {
     }
 
     #[test]
-    fn secrets_and_febo_state_are_never_captured_or_restored() {
+    fn secrets_and_junebug_state_are_never_captured_or_restored() {
         let (base, checkpointer) = temp_checkpointer("excludes");
         let workspace = base.join("workspace");
         fs::write(workspace.join("a.txt"), "code").expect("write");
         fs::write(workspace.join(".env"), "SECRET=original").expect("env");
-        fs::create_dir_all(workspace.join(".febo/sessions")).expect("febo dir");
-        fs::write(workspace.join(".febo/sessions/s.jsonl"), "log").expect("session");
+        fs::create_dir_all(workspace.join(".junebug/sessions")).expect("junebug dir");
+        fs::write(workspace.join(".junebug/sessions/s.jsonl"), "log").expect("session");
+        fs::create_dir_all(workspace.join(".febo/sessions")).expect("legacy dir");
+        fs::write(workspace.join(".febo/sessions/s.jsonl"), "legacy").expect("legacy session");
 
         let first = checkpointer.snapshot("s1").expect("snapshot").expect("tag");
         let tracked = checkpointer
@@ -329,8 +364,12 @@ mod tests {
             "secrets must not enter the shadow repo"
         );
         assert!(
+            !tracked.contains(".junebug"),
+            "junebug state must not enter the shadow repo"
+        );
+        assert!(
             !tracked.contains(".febo"),
-            "febo state must not enter the shadow repo"
+            "legacy state must not enter the shadow repo"
         );
 
         fs::write(workspace.join(".env"), "SECRET=changed").expect("env");
@@ -343,8 +382,12 @@ mod tests {
             "restore must never touch .env"
         );
         assert_eq!(
-            fs::read_to_string(workspace.join(".febo/sessions/s.jsonl")).expect("read"),
+            fs::read_to_string(workspace.join(".junebug/sessions/s.jsonl")).expect("read"),
             "log"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join(".febo/sessions/s.jsonl")).expect("read"),
+            "legacy"
         );
         assert_eq!(
             fs::read_to_string(workspace.join("a.txt")).expect("read"),

@@ -1,12 +1,12 @@
 [package]
-name = "febo-cli"
-version = "0.3.0"
+name = "junebug-cli"
+version = "0.4.0"
 edition = "2024"
-description = "A safe, local-first coding agent CLI for Febo models"
+description = "A safe, local-first coding agent CLI for Junebug models"
 license = "Apache-2.0"
 
 [[bin]]
-name = "febo"
+name = "junebug"
 path = "src/main.rs"
 
 [lints.rust]
@@ -21,3 +21,4 @@ crossterm = "0.28"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "parsing", "regex-fancy"] }

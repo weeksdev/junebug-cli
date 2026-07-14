@@ -67,7 +67,7 @@ mod tests {
     #[test]
     fn finds_instruction_file() {
         let root = std::env::temp_dir().join(format!(
-            "febo-instructions-{}",
+            "junebug-instructions-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")

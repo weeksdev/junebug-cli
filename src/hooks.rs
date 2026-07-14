@@ -1,4 +1,4 @@
-//! Explicitly trusted lifecycle hooks loaded from `.febo/hooks.json`.
+//! Explicitly trusted lifecycle hooks loaded from `.junebug/hooks.json`.
 
 use serde_json::Value;
 use std::fs;
@@ -9,7 +9,9 @@ use std::process::Command;
 ///
 /// Returns an error when a hook configuration cannot be read or validated.
 pub fn load(workspace: &Path, event: &str) -> Result<Vec<String>, String> {
-    let path = workspace.join(".febo").join("hooks.json");
+    let current = workspace.join(".junebug").join("hooks.json");
+    let legacy = workspace.join(".febo").join("hooks.json");
+    let path = if current.is_file() { current } else { legacy };
     if !path.is_file() {
         return Ok(Vec::new());
     }
@@ -76,7 +78,26 @@ mod tests {
     #[test]
     fn loads_event_commands() {
         let root = std::env::temp_dir().join(format!(
-            "febo-hooks-{}",
+            "junebug-hooks-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join(".junebug")).expect("directory");
+        fs::write(
+            root.join(".junebug/hooks.json"),
+            r#"{"session_start":["echo ok"]}"#,
+        )
+        .expect("config");
+        assert_eq!(load(&root, "session_start").expect("load"), vec!["echo ok"]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn loads_legacy_febo_hooks() {
+        let root = std::env::temp_dir().join(format!(
+            "junebug-legacy-hooks-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
@@ -85,10 +106,13 @@ mod tests {
         fs::create_dir_all(root.join(".febo")).expect("directory");
         fs::write(
             root.join(".febo/hooks.json"),
-            r#"{"session_start":["echo ok"]}"#,
+            r#"{"session_start":["echo legacy"]}"#,
         )
         .expect("config");
-        assert_eq!(load(&root, "session_start").expect("load"), vec!["echo ok"]);
+        assert_eq!(
+            load(&root, "session_start").expect("load"),
+            vec!["echo legacy"]
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 }

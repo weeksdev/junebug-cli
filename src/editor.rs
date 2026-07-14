@@ -9,14 +9,16 @@ use std::path::{Path, PathBuf};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 
-pub const SLASH_COMMANDS: [(&str, &str); 12] = [
+pub const SLASH_COMMANDS: [(&str, &str); 14] = [
+    ("/changes", "browse changed files and per-file diffs"),
     ("/compact", "summarize the conversation to free context"),
     ("/diff", "show the uncommitted Git diff"),
     ("/exit", "quit (Ctrl-D also works)"),
+    ("/explorer", "browse and search workspace files"),
     ("/help", "show help"),
     ("/keys", "set or replace a provider API key"),
     ("/model", "pick or switch the model"),
-    ("/permissions", "change what Febo may do without asking"),
+    ("/permissions", "change what Junebug may do without asking"),
     ("/quit", "quit"),
     (
         "/rewind",
@@ -73,14 +75,25 @@ impl Editor {
         }
     }
 
-    /// Read one input line, drawing the prompt, a dimmed `footer` hint below
+    /// Read one input line, drawing the prompt and a styled `footer` hint below
     /// it (when no completion menu is open), and the completion menu. Returns
     /// `None` on end of input (Ctrl-D on an empty line).
     pub fn read_line(&mut self, footer: &str) -> Option<String> {
+        self.read_line_with_shortcut(footer, None)
+    }
+
+    /// Read a line while allowing Shift+Tab to update the footer in place.
+    /// The callback is responsible for cycling application state and returns
+    /// the newly rendered footer. Typed input and cursor position are kept.
+    pub fn read_line_with_shortcut(
+        &mut self,
+        footer: &str,
+        on_shift_tab: Option<&mut dyn FnMut() -> String>,
+    ) -> Option<String> {
         if !io::stdin().is_terminal() || terminal::enable_raw_mode().is_err() {
             return fallback_read_line();
         }
-        let result = self.edit_loop(footer);
+        let result = self.edit_loop(footer.to_owned(), on_shift_tab);
         let _ = terminal::disable_raw_mode();
         if let Some(line) = &result
             && !line.is_empty()
@@ -91,7 +104,11 @@ impl Editor {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn edit_loop(&mut self, footer: &str) -> Option<String> {
+    fn edit_loop(
+        &mut self,
+        mut footer: String,
+        mut on_shift_tab: Option<&mut dyn FnMut() -> String>,
+    ) -> Option<String> {
         let mut buffer: Vec<char> = Vec::new();
         let mut cursor = 0usize;
         let mut selected = 0usize;
@@ -104,7 +121,7 @@ impl Editor {
             if selected >= items.len() {
                 selected = 0;
             }
-            draw(&text, cursor, &items, selected, footer);
+            draw(&text, cursor, &items, selected, &footer);
             let Ok(Event::Key(key)) = event::read() else {
                 continue;
             };
@@ -180,6 +197,16 @@ impl Editor {
                         }
                     } else {
                         selected = (selected + 1) % items.len();
+                    }
+                }
+                KeyCode::BackTab => {
+                    if let Some(callback) = on_shift_tab.as_deref_mut() {
+                        footer = callback();
+                    }
+                }
+                KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    if let Some(callback) = on_shift_tab.as_deref_mut() {
+                        footer = callback();
                     }
                 }
                 KeyCode::Tab => {

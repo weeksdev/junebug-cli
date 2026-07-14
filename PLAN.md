@@ -1,8 +1,8 @@
-# Febo CLI — product and implementation plan
+# Junebug CLI — product and implementation plan
 
 ## 1. Product definition
 
-Febo CLI is an open-source, local-first coding agent that runs in a terminal and connects to Febo-hosted models. It must work with both an **OpenAI-compatible** and an **Anthropic-compatible** REST API so Febo model serving can evolve independently from the CLI. It should be useful as an interactive developer companion and dependable in CI/automation.
+Junebug CLI is an open-source, local-first coding agent that runs in a terminal and connects to Junebug-hosted models. It must work with both an **OpenAI-compatible** and an **Anthropic-compatible** REST API so Junebug model serving can evolve independently from the CLI. It should be useful as an interactive developer companion and dependable in CI/automation.
 
 ### Product principles
 
@@ -16,7 +16,7 @@ Febo CLI is an open-source, local-first coding agent that runs in a terminal and
 
 Leading coding CLIs converge on a few categories:
 
-| Category | Requirement for Febo CLI |
+| Category | Requirement for Junebug CLI |
 | --- | --- |
 | Interaction | REPL, one-shot/headless prompt, plan mode, file/image input, model selection, session resume/fork, searchable history, streaming and cancellation. |
 | Agent loop | Model-driven tool calls; structured tool results; token/context accounting; compaction/summarization; recovery from transient API/tool failures. |
@@ -32,9 +32,9 @@ These are not speculative features: Claude Code documents instructions/skills/su
 
 ### v0.1 — trustworthy single-agent CLI (MVP)
 
-**Goal:** A developer can ask Febo to inspect a repository, make a small change, approve every material action, review the diff, and resume the conversation later.
+**Goal:** A developer can ask Junebug to inspect a repository, make a small change, approve every material action, review the diff, and resume the conversation later.
 
-- CLI: `febo`, `febo "prompt"`, `febo exec "prompt"`, `--model`, `--provider`, `--cwd`, `--resume`, `--json`, `--version`.
+- CLI: `junebug`, `junebug "prompt"`, `junebug exec "prompt"`, `--model`, `--provider`, `--cwd`, `--resume`, `--json`, `--version`.
 - Full-screen terminal UI with streaming markdown/code, activity timeline, approval dialog, diff view, Ctrl-C stop, and slash commands: `/help`, `/model`, `/status`, `/diff`, `/undo`, `/compact`, `/exit`.
 - Agent runtime: a bounded iterative tool loop; max-turn/max-token limits; cancellation; tool-result truncation; retries with exponential backoff; visible failure state.
 - Built-in tools: `list_dir`, `search` (ripgrep), `read_file`, `apply_patch`, `write_file`, `run_command`, `git_status`, `git_diff`.
@@ -52,7 +52,7 @@ These are not speculative features: Claude Code documents instructions/skills/su
 **Goal:** Expand context and integrations without weakening the trust model.
 
 - OpenAI-compatible Responses/Chat Completions adapter and Anthropic Messages adapter, both supporting SSE streaming and normalized tool calls. Publish exact supported request/event subsets and conformance fixtures.
-- Authentication profiles: API key from environment/keychain/config, custom base URL, organization/project headers where applicable, redacted diagnostics, health check, and `febo auth login/logout/status`.
+- Authentication profiles: API key from environment/keychain/config, custom base URL, organization/project headers where applicable, redacted diagnostics, health check, and `junebug auth login/logout/status`.
 - Attach local images and files, `@path` mentions, clipboard/piped stdin, ignore rules, binary/large-file protection, and token-aware repository context selection.
 - MCP client: local stdio servers first; per-server enablement and tool approvals; namespaced tool names; explicit startup/trust prompt; tool list pinning/audit record. Add Streamable HTTP and OAuth/PKCE only after the local client is robust.
 - Hooks with allow/deny/observe decisions at lifecycle points (`session_start`, `before_tool`, `after_tool`, `session_end`). Repository hooks remain disabled until a user trusts that workspace.
@@ -106,12 +106,12 @@ TUI / one-shot CLI / JSONL exec / future app server
 
 ### API compatibility strategy
 
-Febo servers should ideally expose both front doors:
+Junebug servers should ideally expose both front doors:
 
 1. **OpenAI-compatible:** `POST /v1/responses` (preferred) and, if needed for ecosystem compatibility, `POST /v1/chat/completions`; `GET /v1/models`; Bearer auth; SSE streaming; JSON Schema function tools.
-2. **Anthropic-compatible:** `POST /v1/messages`; `GET /v1/models` if Febo chooses to offer it; `x-api-key` and `anthropic-version` handling; SSE streaming; `tool_use` / `tool_result` blocks.
+2. **Anthropic-compatible:** `POST /v1/messages`; `GET /v1/models` if Junebug chooses to offer it; `x-api-key` and `anthropic-version` handling; SSE streaming; `tool_use` / `tool_result` blocks.
 
-The CLI's canonical internal model must be richer than either API, then adapters translate at the edge. Start with the exact subset Febo models need for multi-turn text and tool calling. Add vision, prompt caching, structured output, and extended thinking as negotiated capabilities—not accidental assumptions based on a model name.
+The CLI's canonical internal model must be richer than either API, then adapters translate at the edge. Start with the exact subset Junebug models need for multi-turn text and tool calling. Add vision, prompt caching, structured output, and extended thinking as negotiated capabilities—not accidental assumptions based on a model name.
 
 Define a capability endpoint or model metadata fields early: context-window, max-output, streaming, tools, parallel tool calls, images, structured output, reasoning visibility, and prompt caching. The UI must gracefully hide unsupported capabilities.
 
@@ -129,10 +129,10 @@ Define a capability endpoint or model metadata fields early: context-window, max
 
 | Milestone | Exit criteria |
 | --- | --- |
-| M0: foundation | Repository, language/toolchain decision, formatter/linter/test runner, release CI, architecture decision records, fake Febo provider, and threat model are in place. |
+| M0: foundation | Repository, language/toolchain decision, formatter/linter/test runner, release CI, architecture decision records, fake Junebug provider, and threat model are in place. |
 | M1: read-only agent | Interactive and headless prompts stream from fake/real provider; safe read/search tools work; `AGENTS.md`, session persistence, cancellation, and JSONL contracts are tested. |
 | M2: guarded edits | Patch/write and shell tools use approval engine; diffs and undo work; integration fixtures prove no unapproved write/command executes. |
-| M3: Febo API compatibility | Real OpenAI- and Anthropic-shaped servers pass adapter contract suite for streaming, errors, multi-turn tool use, usage, and cancellation. |
+| M3: Junebug API compatibility | Real OpenAI- and Anthropic-shaped servers pass adapter contract suite for streaming, errors, multi-turn tool use, usage, and cancellation. |
 | M4: beta | Authentication profiles, operational diagnostics, package/install artifacts for three OSes, docs/tutorials, opt-in telemetry decision, and a public issue/security process. |
 | M5: v1 | Stable compatibility and extension contracts, policy profiles, plugin integrity model, app-server decision, and backwards-compatible migration tooling. |
 
@@ -141,13 +141,13 @@ Define a capability endpoint or model metadata fields early: context-window, max
 1. **Implementation language:** Rust is a strong default for a cross-platform, single-binary CLI with process/sandbox control; TypeScript is faster for an ecosystem with mature terminal/MCP libraries. Make this an ADR after a one-day spike for TUI, PTY, and packaging—not a taste decision.
 2. **License and governance:** choose an OSI license, contribution process, code of conduct, security policy, and whether extensions may use different licenses.
 3. **Sandbox targets:** define the minimum supported behavior on macOS, Linux, and Windows; never market equivalent security guarantees without per-OS proof.
-4. **Data posture:** decide whether Febo servers retain prompts/tool traces, whether self-hosting is supported, and the exact telemetry default. Document this before beta.
-5. **API contract ownership:** version Febo API compatibility separately from the CLI. Publish fixtures early so server and client teams cannot drift.
+4. **Data posture:** decide whether Junebug servers retain prompts/tool traces, whether self-hosting is supported, and the exact telemetry default. Document this before beta.
+5. **API contract ownership:** version Junebug API compatibility separately from the CLI. Publish fixtures early so server and client teams cannot drift.
 6. **Initial target audience:** individual local developers vs. managed enterprise teams. The first shapes onboarding; the second materially expands policy/audit/SAML/egress scope.
 
 ## 8. Definition of done for v0.1
 
-v0.1 is ready when a fresh developer can install one signed artifact, authenticate/configure a local Febo server, run `febo` in a Git repository, ask it to change code, see and approve each write/command, inspect the final diff and test output, resume the session, and use `febo exec --json` reliably in a script. The project must publish a threat model, permission documentation, API adapter contract tests, and a reproducible demo repository—not merely a feature list.
+v0.1 is ready when a fresh developer can install one signed artifact, authenticate/configure a local Junebug server, run `junebug` in a Git repository, ask it to change code, see and approve each write/command, inspect the final diff and test output, resume the session, and use `junebug exec --json` reliably in a script. The project must publish a threat model, permission documentation, API adapter contract tests, and a reproducible demo repository—not merely a feature list.
 
 ## Appendix A — research sources
 
