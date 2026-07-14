@@ -3,7 +3,18 @@
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Seconds a command may run when the model does not set `timeout_seconds`.
+pub const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 120;
+/// Largest `timeout_seconds` a model may request.
+pub const MAX_COMMAND_TIMEOUT_SECS: u64 = 3600;
+
+/// Combined stdout+stderr size beyond which a command fails.
+const COMMAND_OUTPUT_CAP: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolRisk {
@@ -273,21 +284,30 @@ impl Workspace {
 
     /// # Errors
     ///
-    /// Returns an error when the command cannot be started, fails, or emits more than 1 MiB of output.
+    /// Returns an error when the command cannot be started, fails, emits more
+    /// than 1 MiB of output, or runs past the default timeout.
     pub fn run_command(&self, command: &str) -> Result<String, String> {
-        self.run_command_with_access(command, false)
+        self.run_command_with_access(
+            command,
+            false,
+            Duration::from_secs(DEFAULT_COMMAND_TIMEOUT_SECS),
+        )
     }
 
     /// Run a command, inheriting the launching environment only for
     /// unrestricted yolo access. Other modes retain the sanitized environment.
+    /// The command and every descendant are killed at `timeout`, so a
+    /// long-running foreground process (e.g. a server) cannot hang the turn.
     ///
     /// # Errors
     ///
-    /// Returns an error when the command cannot start, fails, or emits excessive output.
+    /// Returns an error when the command cannot start, fails, emits excessive
+    /// output, or exceeds `timeout`.
     pub fn run_command_with_access(
         &self,
         command: &str,
         unrestricted: bool,
+        timeout: Duration,
     ) -> Result<String, String> {
         if command.trim().is_empty() {
             return Err("command cannot be empty".to_owned());
@@ -310,16 +330,54 @@ impl Workspace {
             process.env_clear().env("PATH", default_path());
             apply_windows_environment(&mut process);
         }
-        let output = process.output().map_err(|error| error.to_string())?;
-        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
-        if text.len() > 1024 * 1024 {
+        process
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            // Lead a fresh process group so a timeout can kill the whole
+            // command tree, not just the shell.
+            use std::os::unix::process::CommandExt as _;
+            process.process_group(0);
+        }
+        let mut child = process.spawn().map_err(|error| error.to_string())?;
+        let stdout = drain_stream(child.stdout.take());
+        let stderr = drain_stream(child.stderr.take());
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Err(error) => return Err(error.to_string()),
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+            }
+            if started.elapsed() >= timeout {
+                kill_command_tree(&mut child);
+                let _ = child.wait();
+                let (partial, _) = collect_output(&stdout, &stderr);
+                let tail = tail_chars(&partial, 2000);
+                return Err(if tail.is_empty() {
+                    format!(
+                        "command timed out after {}s and was killed",
+                        timeout.as_secs()
+                    )
+                } else {
+                    format!(
+                        "command timed out after {}s and was killed; output so far:\n{tail}",
+                        timeout.as_secs()
+                    )
+                });
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let (text, total) = collect_output(&stdout, &stderr);
+        if total > COMMAND_OUTPUT_CAP {
             return Err("command output exceeds the 1 MiB limit".to_owned());
         }
-        if output.status.success() {
+        if status.success() {
             Ok(text)
         } else {
-            Err(format!("command exited with {}: {text}", output.status))
+            Err(format!("command exited with {status}: {text}"))
         }
     }
 
@@ -419,6 +477,93 @@ impl Workspace {
     }
 }
 
+/// Output captured from one child stream. `total` keeps the true byte count
+/// even after `bytes` stops growing at the cap, so the 1 MiB error is exact
+/// while memory stays bounded.
+struct StreamCapture {
+    bytes: Vec<u8>,
+    total: usize,
+}
+
+/// Captured stream state plus an EOF signal for timed joins.
+struct DrainedStream {
+    state: Arc<Mutex<StreamCapture>>,
+    eof: mpsc::Receiver<()>,
+}
+
+/// Read a child stream to EOF on its own thread, storing at most the output
+/// cap. The EOF channel lets the caller wait with a timeout: an orphaned
+/// grandchild can hold the pipe open long after the shell exits, and the
+/// command must not hang on it.
+fn drain_stream(stream: Option<impl std::io::Read + Send + 'static>) -> DrainedStream {
+    let state = Arc::new(Mutex::new(StreamCapture {
+        bytes: Vec::new(),
+        total: 0,
+    }));
+    let (eof_tx, eof) = mpsc::channel();
+    if let Some(mut stream) = stream {
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || {
+            let mut chunk = [0_u8; 8192];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => {
+                        if let Ok(mut capture) = state.lock() {
+                            capture.total += count;
+                            let room = (COMMAND_OUTPUT_CAP + 1).saturating_sub(capture.bytes.len());
+                            capture.bytes.extend_from_slice(&chunk[..count.min(room)]);
+                        }
+                    }
+                }
+            }
+            let _ = eof_tx.send(());
+        });
+    } else {
+        let _ = eof_tx.send(());
+    }
+    DrainedStream { state, eof }
+}
+
+/// Concatenate captured stdout then stderr, waiting briefly for EOF on each
+/// stream first. Returns the text plus the true combined byte count.
+fn collect_output(stdout: &DrainedStream, stderr: &DrainedStream) -> (String, usize) {
+    let mut text = String::new();
+    let mut total = 0;
+    for stream in [stdout, stderr] {
+        let _ = stream.eof.recv_timeout(Duration::from_secs(2));
+        if let Ok(capture) = stream.state.lock() {
+            text.push_str(&String::from_utf8_lossy(&capture.bytes));
+            total += capture.total;
+        }
+    }
+    (text, total)
+}
+
+/// Kill the command and every descendant. On unix the child leads its own
+/// process group (see `process_group(0)` at spawn), so the group is
+/// signalled; on Windows `taskkill /T` walks the process tree.
+fn kill_command_tree(child: &mut Child) {
+    let id = child.id();
+    if cfg!(windows) {
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &id.to_string()])
+            .output();
+    } else {
+        let _ = Command::new("/bin/sh")
+            .args(["-c", &format!("kill -9 -- -{id} 2>/dev/null")])
+            .output();
+    }
+    let _ = child.kill();
+}
+
+/// The last `cap` characters of `text`, trimmed.
+fn tail_chars(text: &str, cap: usize) -> String {
+    let count = text.chars().count();
+    let skipped: String = text.chars().skip(count.saturating_sub(cap)).collect();
+    skipped.trim().to_owned()
+}
+
 const fn default_path() -> &'static str {
     if cfg!(windows) {
         "C:\\Windows\\System32"
@@ -505,10 +650,10 @@ pub fn is_dangerous_command(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::Workspace;
+    use super::{DEFAULT_COMMAND_TIMEOUT_SECS, Workspace};
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn temporary_workspace() -> PathBuf {
         let name = format!(
@@ -603,6 +748,40 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_command_is_killed_with_its_children_and_reports_partial_output() {
+        let root = temporary_workspace();
+        let workspace = Workspace::new(root.clone());
+        let started = Instant::now();
+        // The `sleep` is a grandchild of the spawned shell once the compound
+        // command forks; the process-group kill must take it down too.
+        let error = workspace
+            .run_command_with_access("echo started; sleep 30", false, Duration::from_secs(1))
+            .expect_err("must time out");
+        assert!(started.elapsed() < Duration::from_secs(10), "kill was slow");
+        assert!(error.contains("timed out after 1s"), "got: {error}");
+        assert!(error.contains("started"), "partial output missing: {error}");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_returns_when_a_background_child_holds_the_output_pipe() {
+        let root = temporary_workspace();
+        let workspace = Workspace::new(root.clone());
+        let started = Instant::now();
+        // The shell exits immediately while `sleep` keeps the inherited
+        // stdout pipe open; the old `Command::output` path blocked on it
+        // until the background child exited.
+        let output = workspace
+            .run_command("sleep 30 & echo done")
+            .expect("command must not hang on the orphaned pipe");
+        assert!(started.elapsed() < Duration::from_secs(10), "join was slow");
+        assert_eq!(output.trim_end(), "done");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     #[test]
     fn git_tools_explain_when_workspace_is_not_a_repository() {
         let root = temporary_workspace();
@@ -644,7 +823,11 @@ mod tests {
         );
         assert_ne!(
             workspace
-                .run_command_with_access("printf %s \"${HOME-unset}\"", true)
+                .run_command_with_access(
+                    "printf %s \"${HOME-unset}\"",
+                    true,
+                    Duration::from_secs(DEFAULT_COMMAND_TIMEOUT_SECS),
+                )
                 .expect("yolo command"),
             "unset"
         );

@@ -437,7 +437,16 @@ pub fn execute_tool(
                     .get("command")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                workspace.run_command_with_access(command, unrestricted)
+                let timeout_seconds = arguments
+                    .get("timeout_seconds")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(crate::tool::DEFAULT_COMMAND_TIMEOUT_SECS)
+                    .clamp(1, crate::tool::MAX_COMMAND_TIMEOUT_SECS);
+                workspace.run_command_with_access(
+                    command,
+                    unrestricted,
+                    std::time::Duration::from_secs(timeout_seconds),
+                )
             }
             "git_status" => workspace.git_status_at(Path::new(path), unrestricted),
             "git_diff" => workspace.git_diff_at(Path::new(path), unrestricted),
