@@ -59,3 +59,7 @@ The CLI uses standard provider environment variables and also reads an ignored `
 - `junebug --version` / `junebug --help`.
 
 Sessions are recorded locally in `.junebug/sessions/` as JSON Lines, and legacy `.febo/sessions/` remain resumable. Cloud providers receive prompts over HTTPS; Ollama requests stay on the configured `OLLAMA_HOST` endpoint. Built-in workspace tools can list directories, read files, search with ripgrep, create/replace files (including new nested directories), inspect Git status/diffs, and propose a shell command. Git inspection reports cleanly when the workspace is not a Git repository. Outside `yolo`, commands require interactive approval and destructive/network patterns get an explicit ⚠ warning in the approval prompt; yolo bypasses both. Every tool call is gated by a deterministic policy engine before it runs. Outside `yolo`, `.env*`, `.git`, `.junebug`, and legacy `.febo` paths are protected at any depth and symlinks may not escape the workspace. Repository hooks and MCP servers stay disabled unless explicitly enabled per run. Remote MCP, plugins, and subagents are not available yet.
+
+## License
+
+Junebug is dual-licensed under your choice of the [MIT License](LICENSE-MIT) or the [Apache License 2.0](LICENSE-APACHE).
