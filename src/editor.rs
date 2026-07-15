@@ -25,7 +25,10 @@ pub const SLASH_COMMANDS: [(&str, &str); 14] = [
         "restore workspace files to an earlier checkpoint",
     ),
     ("/status", "provider, model, permissions, session"),
-    ("/swarm", "run a boss/worker/checker model swarm on a goal"),
+    (
+        "/swarm",
+        "run a boss/worker/checker model swarm on a goal (resume continues an aborted one)",
+    ),
     ("/swarm-setup", "assign models to swarm roles"),
 ];
 

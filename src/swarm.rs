@@ -102,7 +102,7 @@ pub fn save_to(roles: &SwarmRoles, path: &Path) -> Result<(), String> {
 }
 
 /// One unit of work in the boss's plan.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     #[serde(default)]
     pub id: usize,
@@ -138,6 +138,95 @@ pub fn parse_tasks(text: &str) -> Result<Vec<Task>, String> {
         task.id = index + 1;
     }
     Ok(tasks)
+}
+
+/// On-disk progress of a swarm run, written after planning and after every
+/// finished task so an aborted swarm can resume where it left off with
+/// `/swarm resume`. Cleared when the swarm completes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmState {
+    pub goal: String,
+    pub constitution: String,
+    pub tasks: Vec<Task>,
+    /// `(task id, "done" | "FAILED")` for finished tasks; ids not listed are
+    /// still pending.
+    pub outcomes: Vec<(usize, String)>,
+    pub reworks: usize,
+    pub failures: usize,
+}
+
+impl SwarmState {
+    #[must_use]
+    pub fn is_finished(&self, task_id: usize) -> bool {
+        self.outcomes.iter().any(|(id, _)| *id == task_id)
+    }
+}
+
+#[must_use]
+pub fn state_path(workspace: &Path) -> PathBuf {
+    workspace.join(".junebug").join("swarm_state.json")
+}
+
+/// Load the saved progress of an aborted swarm, if any.
+///
+/// # Errors
+///
+/// Returns an error when a state file exists but cannot be parsed.
+pub fn load_state(workspace: &Path) -> Result<Option<SwarmState>, String> {
+    let path = state_path(workspace);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let contents = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    serde_json::from_str(&contents)
+        .map(Some)
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// # Errors
+///
+/// Returns an error when the state file cannot be written.
+pub fn save_state(workspace: &Path, state: &SwarmState) -> Result<(), String> {
+    let path = state_path(workspace);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let contents = serde_json::to_string_pretty(state).map_err(|error| error.to_string())?;
+    fs::write(path, contents).map_err(|error| error.to_string())
+}
+
+/// Remove the state file after a completed swarm. Best effort.
+pub fn clear_state(workspace: &Path) {
+    let _ = fs::remove_file(state_path(workspace));
+}
+
+/// True when a provider error looks like a transient stream or network
+/// hiccup (e.g. reqwest's "request or response body error" when a stream
+/// dies mid-turn) rather than a configuration problem, so the agent turn is
+/// worth retrying from scratch instead of aborting the whole swarm.
+#[must_use]
+pub fn is_transient_provider_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "body error",
+        "connection",
+        "timed out",
+        "timeout",
+        "reset",
+        "broken pipe",
+        "unexpected eof",
+        "temporarily",
+        "overloaded",
+        "too many requests",
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "incomplete message",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
 }
 
 /// The constitution portion of the plan: everything before the task array.
@@ -329,6 +418,51 @@ mod tests {
             Ruling::Checker
         );
         assert_eq!(parse_ruling("hmm, unclear"), Ruling::Checker);
+    }
+
+    #[test]
+    fn swarm_state_round_trips_and_clears() {
+        let root = std::env::temp_dir().join(format!(
+            "junebug-swarm-state-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("root");
+        assert_eq!(load_state(&root).expect("empty"), None);
+        let state = SwarmState {
+            goal: "build the thing".to_owned(),
+            constitution: "1. honesty".to_owned(),
+            tasks: vec![Task {
+                id: 1,
+                title: "a".to_owned(),
+                instructions: "do a".to_owned(),
+                check: "verify a".to_owned(),
+            }],
+            outcomes: vec![(1, "done".to_owned())],
+            reworks: 2,
+            failures: 0,
+        };
+        save_state(&root, &state).expect("save");
+        let loaded = load_state(&root).expect("load").expect("present");
+        assert_eq!(loaded, state);
+        assert!(loaded.is_finished(1));
+        assert!(!loaded.is_finished(2));
+        clear_state(&root);
+        assert_eq!(load_state(&root).expect("cleared"), None);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn transient_provider_errors_are_recognized() {
+        assert!(is_transient_provider_error(
+            "request or response body error"
+        ));
+        assert!(is_transient_provider_error("Connection reset by peer"));
+        assert!(is_transient_provider_error("HTTP 503 Service Unavailable"));
+        assert!(!is_transient_provider_error("invalid API key"));
+        assert!(!is_transient_provider_error("model not found: deepseek-v9"));
     }
 
     #[test]
