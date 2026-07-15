@@ -1,6 +1,12 @@
+<p align="center">
+  <img src="images/image.png" alt="Junebug CLI logo" width="220">
+</p>
+
 # Junebug CLI
 
 Junebug CLI is an open-source, local-first coding agent for Junebug models.
+
+**Website:** <https://weeksdev.github.io/junebug-cli/>
 
 This initial foundation intentionally defaults to read-only workspace access. It includes a provider-neutral event contract, safe read/search tools, and streaming REST support for OpenAI, OpenRouter, DeepSeek, Anthropic Claude, and local Ollama models.
 
