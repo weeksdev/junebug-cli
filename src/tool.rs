@@ -158,6 +158,12 @@ impl Workspace {
     ) -> Result<String, String> {
         let path = self.checked_path(requested, unrestricted)?;
         let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
+        if metadata.is_dir() {
+            return Err(
+                "requested path is a directory, not a file — use list_dir to see its entries"
+                    .to_owned(),
+            );
+        }
         if !metadata.is_file() {
             return Err("requested path is not a regular file".to_owned());
         }
@@ -240,7 +246,16 @@ impl Workspace {
             .map(|entry| entry.map_err(|error| error.to_string()))
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .map(|entry| {
+                let mut name = entry.file_name().to_string_lossy().into_owned();
+                // Mark directories the way `ls -p` does; without the marker
+                // the model cannot tell a directory from an extensionless
+                // file and wastes turns calling read_file on directories.
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    name.push('/');
+                }
+                name
+            })
             .collect::<Vec<_>>();
         entries.sort_unstable();
         Ok(entries)
@@ -650,10 +665,14 @@ pub fn is_dangerous_command(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_COMMAND_TIMEOUT_SECS, Workspace};
+    #[cfg(unix)]
+    use super::DEFAULT_COMMAND_TIMEOUT_SECS;
+    use super::Workspace;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temporary_workspace() -> PathBuf {
         let name = format!(
@@ -914,6 +933,23 @@ mod tests {
         let workspace = Workspace::new(root.clone());
         let entries = workspace.list_dir(Path::new(".")).expect("list root");
         assert!(entries.contains(&"visible.txt".to_owned()));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn list_dir_marks_directories_and_read_file_explains_them() {
+        let root = temporary_workspace();
+        fs::create_dir(root.join("tests")).expect("dir");
+        fs::write(root.join("tests.rs"), "x").expect("file");
+        let workspace = Workspace::new(root.clone());
+        let entries = workspace.list_dir(Path::new(".")).expect("list root");
+        assert!(entries.contains(&"tests/".to_owned()), "got: {entries:?}");
+        assert!(entries.contains(&"tests.rs".to_owned()), "got: {entries:?}");
+        let error = workspace
+            .read_file(Path::new("tests"))
+            .expect_err("directories are not readable");
+        assert!(error.contains("directory"), "got: {error}");
+        assert!(error.contains("list_dir"), "got: {error}");
         fs::remove_dir_all(root).expect("cleanup");
     }
 
