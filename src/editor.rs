@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 
-pub const SLASH_COMMANDS: [(&str, &str); 14] = [
+pub const SLASH_COMMANDS: [(&str, &str); 15] = [
     ("/changes", "browse changed files and per-file diffs"),
     ("/compact", "summarize the conversation to free context"),
     ("/diff", "show the uncommitted Git diff"),
@@ -28,6 +28,10 @@ pub const SLASH_COMMANDS: [(&str, &str); 14] = [
     (
         "/swarm",
         "run a boss/worker/checker model swarm on a goal (resume continues an aborted one)",
+    ),
+    (
+        "/swarm-status",
+        "progress readout of the saved swarm (add ai for a model summary)",
     ),
     ("/swarm-setup", "assign models to swarm roles"),
 ];

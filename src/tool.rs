@@ -203,6 +203,21 @@ impl Workspace {
             return Err("search query cannot be empty".to_owned());
         }
         let path = self.checked_path(requested, unrestricted)?;
+        // Models regularly pass a file as the search path; search within it
+        // rather than failing with rg's opaque "Not a directory" spawn error.
+        let (working_dir, target) = if path.is_file() {
+            let file = path.file_name().map_or_else(
+                || ".".to_owned(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map_or_else(|| self.root.clone(), Path::to_path_buf);
+            (parent, file)
+        } else {
+            (path, ".".to_owned())
+        };
         let output = Command::new("rg")
             .args([
                 "--line-number",
@@ -212,9 +227,9 @@ impl Workspace {
                 "!.git",
                 "--",
                 query,
-                ".",
+                &target,
             ])
-            .current_dir(path)
+            .current_dir(working_dir)
             .env_clear()
             .env("PATH", default_path())
             .output()
@@ -859,6 +874,27 @@ mod tests {
             .search("homebrew-rg-marker")
             .expect("search with sanitized PATH");
         assert!(result.contains("needle.txt"), "got: {result}");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn search_with_a_file_path_searches_within_that_file() {
+        if !Path::new("/opt/homebrew/bin/rg").is_file() && !Path::new("/usr/bin/rg").is_file() {
+            return;
+        }
+        let root = temporary_workspace();
+        fs::create_dir(root.join("src")).expect("dir");
+        fs::write(root.join("src/main.py"), "in_target_file_marker").expect("target");
+        fs::write(root.join("src/other.py"), "in_target_file_marker").expect("other");
+        let workspace = Workspace::new(root.clone());
+        let result = workspace
+            .search_at("in_target_file_marker", Path::new("src/main.py"), false)
+            .expect("file-path search");
+        assert!(result.contains("in_target_file_marker"), "got: {result}");
+        assert!(
+            !result.contains("other.py"),
+            "must not search siblings: {result}"
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 

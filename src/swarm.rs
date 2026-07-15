@@ -200,6 +200,38 @@ pub fn clear_state(workspace: &Path) {
     let _ = fs::remove_file(state_path(workspace));
 }
 
+/// A deterministic progress readout built purely from the saved state — no
+/// model call. Used by `/swarm-status` and the in-run `s` control.
+#[must_use]
+pub fn format_status(state: &SwarmState, phase: Option<&str>) -> String {
+    let done = state
+        .outcomes
+        .iter()
+        .filter(|(_, status)| status == "done")
+        .count();
+    let failed = state.outcomes.len() - done;
+    let pending = state.tasks.len() - state.outcomes.len();
+    let mut out = String::new();
+    let _ = writeln!(out, "swarm — {}", state.goal);
+    let _ = writeln!(
+        out,
+        "{done} done · {failed} failed · {pending} pending · {} reworks",
+        state.reworks
+    );
+    for task in &state.tasks {
+        let marker = match state.outcomes.iter().find(|(id, _)| *id == task.id) {
+            Some((_, status)) if status == "done" => "✓",
+            Some(_) => "✗",
+            None => "·",
+        };
+        let _ = writeln!(out, "  {marker} {:>2}. {}", task.id, task.title);
+    }
+    if let Some(phase) = phase {
+        let _ = writeln!(out, "currently: {phase}");
+    }
+    out
+}
+
 /// True when a provider error looks like a transient stream or network
 /// hiccup (e.g. reqwest's "request or response body error" when a stream
 /// dies mid-turn) rather than a configuration problem, so the agent turn is
@@ -452,6 +484,30 @@ mod tests {
         clear_state(&root);
         assert_eq!(load_state(&root).expect("cleared"), None);
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn status_readout_marks_done_failed_and_pending() {
+        let task = |id: usize, title: &str| Task {
+            id,
+            title: title.to_owned(),
+            instructions: String::new(),
+            check: String::new(),
+        };
+        let state = SwarmState {
+            goal: "ship it".to_owned(),
+            constitution: String::new(),
+            tasks: vec![task(1, "first"), task(2, "second"), task(3, "third")],
+            outcomes: vec![(1, "done".to_owned()), (2, "FAILED".to_owned())],
+            reworks: 3,
+            failures: 1,
+        };
+        let status = format_status(&state, Some("task 3/3 — worker"));
+        assert!(status.contains("1 done · 1 failed · 1 pending · 3 reworks"));
+        assert!(status.contains("✓  1. first"));
+        assert!(status.contains("✗  2. second"));
+        assert!(status.contains("·  3. third"));
+        assert!(status.contains("currently: task 3/3 — worker"));
     }
 
     #[test]

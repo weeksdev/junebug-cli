@@ -18,7 +18,7 @@ use junebug_cli::provider::{
     ModelProvider, OpenAiCompatibleProvider, ProviderKind, store_credential,
 };
 use junebug_cli::router::{RouteDecision, RoutedModel};
-use junebug_cli::session::{SessionWriter, load_messages};
+use junebug_cli::session::{self, SessionWriter, load_messages};
 use junebug_cli::swarm::{self, Ruling, SwarmRoles, Target, Verdict};
 use junebug_cli::tool::Workspace;
 use junebug_cli::{PermissionMode, browser, context, hooks, instructions, mcp};
@@ -763,7 +763,7 @@ fn repl(
             match name {
                 "exit" | "quit" => break,
                 "help" => eprintln!(
-                    "{BOLD}/keys{RESET}          set or replace a provider API key (input hidden)\n{BOLD}/model{RESET}         pick or switch the model (↑/↓, enter)\n{BOLD}/permissions{RESET}   change what Junebug may do without asking\n{BOLD}/rewind{RESET}        restore workspace files to an earlier checkpoint\n{BOLD}/swarm-setup{RESET}   assign models to swarm roles (boss/worker/checker)\n{BOLD}/swarm{RESET} GOAL    run a boss/worker/checker model swarm on a goal\n{BOLD}/swarm resume{RESET}  continue an aborted swarm where it left off\n{BOLD}/compact{RESET}       summarize the conversation to free context\n{BOLD}/status{RESET}        provider, model, permissions, session\n{BOLD}/changes{RESET}       browse changed files and per-file diffs\n{BOLD}/explorer{RESET}      browse and search workspace files; e opens $EDITOR\n{BOLD}/diff{RESET}          print the uncommitted Git diff\n{BOLD}/exit{RESET}          quit (Ctrl-D also works)\n\n{DIM}⇧tab cycles permissions while typing or during a turn · @path attaches a file · esc interrupts{RESET}"
+                    "{BOLD}/keys{RESET}          set or replace a provider API key (input hidden)\n{BOLD}/model{RESET}         pick or switch the model (↑/↓, enter)\n{BOLD}/permissions{RESET}   change what Junebug may do without asking\n{BOLD}/rewind{RESET}        restore workspace files to an earlier checkpoint\n{BOLD}/swarm-setup{RESET}   assign models to swarm roles (boss/worker/checker)\n{BOLD}/swarm{RESET} GOAL    run a boss/worker/checker model swarm on a goal\n{BOLD}/swarm resume{RESET}  continue an aborted or paused swarm where it left off\n{BOLD}/swarm-status{RESET}  progress readout of the saved swarm; add {BOLD}ai{RESET} for a model summary\n{BOLD}/compact{RESET}       summarize the conversation to free context\n{BOLD}/status{RESET}        provider, model, permissions, session\n{BOLD}/changes{RESET}       browse changed files and per-file diffs\n{BOLD}/explorer{RESET}      browse and search workspace files; e opens $EDITOR\n{BOLD}/diff{RESET}          print the uncommitted Git diff\n{BOLD}/exit{RESET}          quit (Ctrl-D also works)\n\n{DIM}⇧tab cycles permissions while typing or during a turn · @path attaches a file · esc interrupts{RESET}"
                 ),
                 "status" => eprintln!(
                     "routing={} provider={} model={} band={} switches_this_task={} permission={} plan={} messages={} checkpoints={} session={}",
@@ -830,6 +830,9 @@ fn repl(
                 }
                 "rewind" | "undo" => handle_rewind_command(checkpointer, session),
                 "swarm-setup" => handle_swarm_setup(root),
+                "swarm-status" => {
+                    handle_swarm_status(root, argument, provider.as_ref());
+                }
                 "swarm" => {
                     if argument.is_empty() {
                         eprintln!("usage: /swarm <goal>   (assign models with /swarm-setup first)");
@@ -1660,44 +1663,35 @@ fn handle_keys_command(
     }
 }
 
-/// Turn activity display for swarm agents: tool lines and diffs always show;
-/// streamed prose only for boss phases (plans, rulings, reviews) — worker
-/// and checker chatter would drown the terminal.
-struct SwarmObserver {
-    show_text: bool,
+/// Live controls for a running swarm, owned by the main thread. Each swarm
+/// agent turn runs on a worker thread while the main thread renders its
+/// events in raw mode (the same architecture as normal REPL turns), so
+/// single keypresses work with no input race against approval prompts:
+/// `s` prints a status readout, `p` pauses after the current task, and
+/// Esc/Ctrl-C interrupt the current turn and pause immediately.
+struct SwarmControls {
+    root: PathBuf,
+    phase: String,
+    pause: bool,
 }
 
-impl TurnObserver for SwarmObserver {
-    fn on_text(&mut self, text: &str) {
-        if self.show_text {
-            print!("{text}");
-            let _ = io::stdout().flush();
-        }
-    }
+/// Distinguishes a user-requested pause from a real failure at the shared
+/// abort sites in `run_swarm`.
+const SWARM_PAUSED: &str = "paused by user";
 
-    fn on_tool_call(&mut self, name: &str, arguments: &str) {
-        eprintln!("{DIM}  ⏺ {name}({}){RESET}", tool_call_detail(arguments));
-    }
-
-    fn on_tool_result(&mut self, _name: &str, result: &str) {
-        let color = if result.starts_with("ERROR") {
-            RED
-        } else {
-            DIM
-        };
-        eprintln!("{color}  ⎿ {}{RESET}", tool_result_summary(result));
-    }
-
-    fn on_file_diff(&mut self, _path: &str, diff: &str) {
-        for line in junebug_cli::diff::clip(diff, 80).lines() {
-            let styled = if line.starts_with('+') {
-                format!("{GREEN}{line}{RESET}")
-            } else if line.starts_with('-') {
-                format!("{RED}{line}{RESET}")
-            } else {
-                format!("{DIM}{line}{RESET}")
-            };
-            eprintln!("    {styled}");
+impl SwarmControls {
+    fn print_status(&self, ending: &str) {
+        match swarm::load_state(&self.root) {
+            Ok(Some(state)) => {
+                eprint!("{ending}");
+                for line in swarm::format_status(&state, Some(&self.phase)).lines() {
+                    eprint!("{CYAN}{line}{RESET}{ending}");
+                }
+            }
+            _ => eprint!(
+                "{ending}{DIM}(no task list yet — {}; the readout is available once planning finishes){RESET}{ending}",
+                self.phase
+            ),
         }
     }
 }
@@ -1719,8 +1713,12 @@ fn final_assistant_text(messages: &[Value]) -> String {
 }
 
 /// Run one swarm agent turn: fresh history, pinned role model, shared
-/// workspace/session/approvals. Returns the agent's final text.
-#[allow(clippy::too_many_arguments)]
+/// workspace/session. The `run_loop` runs on a worker thread while the main
+/// thread renders its events in raw mode and handles the live controls;
+/// approvals are routed back over a channel exactly like normal REPL turns.
+/// Returns the agent's final text, or `SWARM_PAUSED` when the user
+/// interrupted the turn with Esc/Ctrl-C.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn swarm_agent(
     provider: &OpenAiCompatibleProvider,
     model: &str,
@@ -1730,10 +1728,10 @@ fn swarm_agent(
     policy: &PolicyEngine,
     workspace: &Workspace,
     session: &SessionWriter,
-    approve: &mut dyn FnMut(&str) -> bool,
-    checkpoint: &mut dyn FnMut(&str),
+    checkpointer: Option<&Checkpointer>,
     max_context_chars: usize,
     show_text: bool,
+    controls: &mut SwarmControls,
 ) -> Result<String, String> {
     // A transient stream/network failure must not abort a long swarm run:
     // each agent turn starts from a fresh message list, so retrying the
@@ -1745,25 +1743,192 @@ fn swarm_agent(
             json!({"role": "system", "content": format!("{system}\nThe startup workspace is exactly: {}\nAll relative tool paths and commands start there. Do not guess /workspace, /home/user, an operating system, or a language runtime; inspect the workspace and its project environment first. A shell cd affects only that one command.", workspace.root().display())}),
             json!({"role": "user", "content": request}),
         ];
-        let mut source = agent::PinnedModel::new(provider, model);
-        let mut observer = SwarmObserver { show_text };
-        let mut clients: Vec<McpClient> = Vec::new();
-        match agent::run_loop(
-            &mut source,
-            workspace,
-            tools,
-            policy,
-            &mut agent_messages,
-            &mut clients,
-            session,
-            approve,
-            checkpoint,
-            max_context_chars,
-            MAX_TURNS,
-            &AtomicBool::new(false),
-            &mut observer,
-        ) {
-            Ok(_) => {
+        let (events_tx, events_rx) = mpsc::channel::<TurnEvent>();
+        let (answer_tx, answer_rx) = mpsc::channel::<bool>();
+        let cancel = AtomicBool::new(false);
+        let raw = terminal::enable_raw_mode().is_ok();
+        let started = Instant::now();
+        let result = thread::scope(|scope| {
+            let observer_tx = events_tx.clone();
+            let approve_tx = events_tx;
+            let cancel_ref = &cancel;
+            let messages_ref = &mut agent_messages;
+            let worker = scope.spawn(move || {
+                let mut observer = ChannelObserver {
+                    events: observer_tx,
+                };
+                let mut approve = |message: &str| -> bool {
+                    approve_tx
+                        .send(TurnEvent::ApprovalRequest(message.to_owned()))
+                        .is_ok()
+                        && answer_rx.recv().unwrap_or(false)
+                };
+                let mut checkpoint = |label: &str| take_checkpoint(checkpointer, session, label);
+                let mut source = agent::PinnedModel::new(provider, model);
+                let mut clients: Vec<McpClient> = Vec::new();
+                agent::run_loop(
+                    &mut source,
+                    workspace,
+                    tools,
+                    policy,
+                    messages_ref,
+                    &mut clients,
+                    session,
+                    &mut approve,
+                    &mut checkpoint,
+                    max_context_chars,
+                    MAX_TURNS,
+                    cancel_ref,
+                    &mut observer,
+                )
+            });
+            let mut renderer = markdown::Renderer::new(raw);
+            let mut frame = 0usize;
+            let mut spinner_shown = false;
+            let ending = if raw { "\r\n" } else { "\n" };
+            loop {
+                let mut drained = false;
+                while let Ok(turn_event) = events_rx.try_recv() {
+                    drained = true;
+                    if spinner_shown {
+                        eprint!("{CLEAR_LINE}");
+                        spinner_shown = false;
+                    }
+                    match turn_event {
+                        TurnEvent::Text(text) => {
+                            if show_text {
+                                let output = renderer.push(&text);
+                                if !output.is_empty() {
+                                    print!("{output}");
+                                    let _ = io::stdout().flush();
+                                }
+                            }
+                        }
+                        TurnEvent::ToolCall(name, arguments) => {
+                            if show_text {
+                                let pending = renderer.finish();
+                                if !pending.is_empty() {
+                                    print!("{pending}");
+                                    let _ = io::stdout().flush();
+                                }
+                            }
+                            eprint!(
+                                "{DIM}  ⏺ {name}({}){RESET}{ending}",
+                                tool_call_detail(&arguments)
+                            );
+                        }
+                        TurnEvent::ToolResult(result) => {
+                            let color = if result.starts_with("ERROR") {
+                                RED
+                            } else {
+                                DIM
+                            };
+                            eprint!("{color}  ⎿ {}{RESET}{ending}", tool_result_summary(&result));
+                        }
+                        TurnEvent::FileDiff(diff) => {
+                            for line in junebug_cli::diff::clip(&diff, 80).lines() {
+                                let styled = if line.starts_with('+') {
+                                    format!("{GREEN}{line}{RESET}")
+                                } else if line.starts_with('-') {
+                                    format!("{RED}{line}{RESET}")
+                                } else {
+                                    format!("{DIM}{line}{RESET}")
+                                };
+                                eprint!("    {styled}{ending}");
+                            }
+                        }
+                        TurnEvent::ApprovalRequest(message) => {
+                            if raw {
+                                let _ = terminal::disable_raw_mode();
+                            }
+                            eprintln!("\n{message}\nApprove? {BOLD}[y/N]{RESET}");
+                            let mut answer = String::new();
+                            let approved = io::stdin().read_line(&mut answer).is_ok()
+                                && parse_approval_answer(&answer);
+                            if raw {
+                                let _ = terminal::enable_raw_mode();
+                            }
+                            let _ = answer_tx.send(approved);
+                        }
+                        TurnEvent::RouteChanged(_) => {}
+                    }
+                }
+                if worker.is_finished() {
+                    if !drained {
+                        break;
+                    }
+                    continue;
+                }
+                if raw {
+                    if event::poll(Duration::from_millis(80)).unwrap_or(false) {
+                        if let Ok(Event::Key(key)) = event::read() {
+                            if key.kind != KeyEventKind::Press {
+                                continue;
+                            }
+                            let ctrl_c = key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL);
+                            if spinner_shown {
+                                eprint!("{CLEAR_LINE}");
+                                spinner_shown = false;
+                            }
+                            match key.code {
+                                KeyCode::Char('s' | 'S') => controls.print_status(ending),
+                                KeyCode::Char('p' | 'P') => {
+                                    controls.pause = true;
+                                    eprint!(
+                                        "{YELLOW}pausing after the current task — /swarm resume will continue{RESET}{ending}"
+                                    );
+                                }
+                                KeyCode::Esc | KeyCode::Char('c')
+                                    if (key.code == KeyCode::Esc || ctrl_c)
+                                        && !cancel.load(Ordering::Relaxed) =>
+                                {
+                                    cancel.store(true, Ordering::Relaxed);
+                                    eprint!(
+                                        "{YELLOW}pausing now — finishing the current step…{RESET}{ending}"
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                    } else {
+                        frame = (frame + 1) % SPINNER_FRAMES.len();
+                        eprint!(
+                            "{CLEAR_LINE}{CYAN}{}{RESET} {DIM}{} · {}s · s status · p pause · esc pause now{RESET}",
+                            SPINNER_FRAMES[frame],
+                            controls.phase,
+                            started.elapsed().as_secs()
+                        );
+                        spinner_shown = true;
+                    }
+                } else {
+                    thread::sleep(Duration::from_millis(80));
+                }
+            }
+            if spinner_shown {
+                eprint!("{CLEAR_LINE}");
+            }
+            if show_text {
+                let pending = renderer.finish();
+                if !pending.is_empty() {
+                    print!("{pending}");
+                    let _ = io::stdout().flush();
+                }
+            }
+            worker.join()
+        });
+        if raw {
+            let _ = terminal::disable_raw_mode();
+        }
+        let Ok(outcome) = result else {
+            return Err("swarm agent thread panicked".to_owned());
+        };
+        match outcome {
+            Ok(outcome) => {
+                if outcome.interrupted || cancel.load(Ordering::Relaxed) {
+                    let _ = session.record("swarm_pause", "turn interrupted by user");
+                    return Err(SWARM_PAUSED.to_owned());
+                }
                 if show_text {
                     println!();
                 }
@@ -1783,6 +1948,63 @@ fn swarm_agent(
         }
     }
     unreachable!("the retry loop always returns")
+}
+
+/// `/swarm-status [ai]` — a deterministic progress readout from the saved
+/// swarm state (works during a run from another junebug in the same
+/// workspace, after an abort or pause, or mid-run alongside the in-run `s`
+/// control). With `ai`, the current model additionally narrates the status
+/// plus the tail of the newest swarm session log.
+fn handle_swarm_status(root: &Path, argument: &str, provider: Option<&OpenAiCompatibleProvider>) {
+    let state = match swarm::load_state(root) {
+        Ok(Some(state)) => state,
+        Ok(None) => {
+            eprintln!(
+                "{DIM}no swarm progress saved here — a swarm is either finished (state is cleared on completion) or was never started{RESET}"
+            );
+            return;
+        }
+        Err(error) => {
+            eprintln!("{RED}error:{RESET} {error}");
+            return;
+        }
+    };
+    let status = swarm::format_status(&state, None);
+    eprint!("{CYAN}{status}{RESET}");
+    if !argument.trim().eq_ignore_ascii_case("ai") {
+        return;
+    }
+    let Some(provider) = provider else {
+        eprintln!("{DIM}(no model for the ai summary — /keys or start Ollama){RESET}");
+        return;
+    };
+    let log_tail = session::latest_swarm_log_tail(root, 12_000).unwrap_or_default();
+    eprintln!("{DIM}summarizing with {}…{RESET}", provider.model());
+    let request = vec![
+        json!({"role": "system", "content": "You summarize the progress of an in-flight or aborted coding swarm for its human operator. Be concrete and honest: what was accomplished, what failed or was reworked and why, and what remains. A few short paragraphs at most. No preamble."}),
+        json!({"role": "user", "content": format!("Deterministic status:\n{status}\n\nRecent swarm log (newest last):\n{log_tail}")}),
+    ];
+    let never = AtomicBool::new(false);
+    match provider.stream_turn(provider.model(), &request, &[], &never) {
+        Ok(turn) => {
+            let summary = turn
+                .assistant_message
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            if summary.is_empty() {
+                eprintln!("{DIM}(the model returned an empty summary){RESET}");
+            } else {
+                let mut renderer = markdown::Renderer::new(false);
+                print!("{}", renderer.push(&format!("{summary}\n")));
+                print!("{}", renderer.finish());
+                let _ = io::stdout().flush();
+            }
+        }
+        Err(error) => eprintln!("{RED}summary failed:{RESET} {error}"),
+    }
 }
 
 /// `/swarm-setup` — assign a model from any available provider to each
@@ -1914,17 +2136,16 @@ fn run_swarm(
     };
     let _ = session.record("swarm_goal", goal);
     let _ = main_session.record("swarm_session", &session.path().display().to_string());
-    let mut approve = |message: &str| -> bool {
-        eprintln!("\n{message}\nApprove? {BOLD}[y/N]{RESET}");
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer).is_ok() && parse_approval_answer(&answer)
-    };
-    let mut checkpoint = |label: &str| take_checkpoint(checkpointer, &session, label);
     take_checkpoint(
         checkpointer,
         &session,
         &format!("before swarm: {}", truncate_chars(goal, 48)),
     );
+    let mut controls = SwarmControls {
+        root: root.to_path_buf(),
+        phase: "starting".to_owned(),
+        pause: false,
+    };
     eprintln!(
         "{BOLD}swarm{RESET} {DIM}· boss {} · worker {} · checker {} · log {}{RESET}",
         roles.boss.model,
@@ -1932,16 +2153,16 @@ fn run_swarm(
         roles.checker.model,
         session.path().display()
     );
+    eprintln!(
+        "{DIM}controls: s = status · p = pause after current task · esc = pause now · all resumable with /swarm resume{RESET}"
+    );
 
     // Phase 1: the boss plans with read-only access, hard-guarded — unless
     // this is `/swarm resume`, which continues an aborted run from the
     // progress saved in `.junebug/swarm_state.json`.
     let plan_tools = tool_schemas(true);
     let boss_policy = PolicyEngine::new(PermissionMode::ReadOnly, true);
-    let boss_run = |system: &str,
-                    request: &str,
-                    approve: &mut dyn FnMut(&str) -> bool,
-                    checkpoint: &mut dyn FnMut(&str)| {
+    let boss_run = |system: &str, request: &str, controls: &mut SwarmControls| {
         swarm_agent(
             &boss,
             &roles.boss.model,
@@ -1951,10 +2172,10 @@ fn run_swarm(
             &boss_policy,
             workspace,
             &session,
-            approve,
-            checkpoint,
+            checkpointer,
             max_context_chars,
             true,
+            controls,
         )
     };
     let resume = goal.trim().eq_ignore_ascii_case("resume");
@@ -1988,13 +2209,19 @@ fn run_swarm(
             );
         }
         eprintln!("{CYAN}◆ boss ({}) planning…{RESET}", roles.boss.model);
+        "boss planning".clone_into(&mut controls.phase);
         let plan_text = match boss_run(
             swarm::BOSS_PLAN_SYSTEM,
             &swarm::plan_request(goal),
-            &mut approve,
-            &mut checkpoint,
+            &mut controls,
         ) {
             Ok(text) => text,
+            Err(error) if error == SWARM_PAUSED => {
+                eprintln!(
+                    "{YELLOW}swarm stopped during planning{RESET} — nothing saved yet; start again with {BOLD}/swarm <goal>{RESET}"
+                );
+                return;
+            }
             Err(error) => {
                 eprintln!("{RED}swarm aborted:{RESET} {error}");
                 return;
@@ -2011,8 +2238,7 @@ fn run_swarm(
                     &format!(
                         "Your previous reply:\n{plan_text}\n\nReply again with the CONSTITUTION and ONLY a valid ```json task array as specified."
                     ),
-                    &mut approve,
-                    &mut checkpoint,
+                    &mut controls,
                 );
                 match retry.map(|text| swarm::parse_tasks(&text).map(|tasks| (text, tasks))) {
                     Ok(Ok((_, tasks))) => tasks,
@@ -2058,8 +2284,16 @@ fn run_swarm(
             .map_or("", |task| task.title.as_str());
         let _ = writeln!(outcomes, "task {id} ({title}): {status}");
     }
-    let resume_hint =
-        || eprintln!("{DIM}progress is saved — continue with {BOLD}/swarm resume{RESET}");
+    let report_stop = |error: &str| {
+        if error == SWARM_PAUSED {
+            eprintln!(
+                "{YELLOW}swarm paused{RESET} — the in-flight task will rerun · continue with {BOLD}/swarm resume{RESET}"
+            );
+        } else {
+            eprintln!("{RED}swarm aborted:{RESET} {error}");
+            eprintln!("{DIM}progress is saved — continue with {BOLD}/swarm resume{RESET}");
+        }
+    };
     for task in &tasks {
         if state.is_finished(task.id) {
             eprintln!(
@@ -2069,6 +2303,15 @@ fn run_swarm(
                 task.title
             );
             continue;
+        }
+        if controls.pause {
+            let _ = session.record("swarm_pause", &format!("before task {}", task.id));
+            eprintln!(
+                "{YELLOW}swarm paused{RESET} — {} of {} tasks finished · continue with {BOLD}/swarm resume{RESET}",
+                state.outcomes.len(),
+                tasks.len()
+            );
+            return;
         }
         eprintln!(
             "\n{BOLD}task {}/{} — {}{RESET}",
@@ -2082,14 +2325,23 @@ fn run_swarm(
         let mut passed = false;
         let verify = |request_feedback: Option<&str>,
                       worker_report: &mut String,
-                      approve: &mut dyn FnMut(&str) -> bool,
-                      checkpoint: &mut dyn FnMut(&str)|
+                      controls: &mut SwarmControls|
          -> Result<Verdict, String> {
             eprintln!(
                 "{MAGENTA}⛏ worker ({}){}{RESET}",
                 roles.worker.model,
                 if request_feedback.is_some() {
                     " reworking"
+                } else {
+                    ""
+                }
+            );
+            controls.phase = format!(
+                "task {}/{} — worker{}",
+                task.id,
+                tasks.len(),
+                if request_feedback.is_some() {
+                    " (rework)"
                 } else {
                     ""
                 }
@@ -2103,15 +2355,16 @@ fn run_swarm(
                 &worker_policy,
                 workspace,
                 &session,
-                approve,
-                checkpoint,
+                checkpointer,
                 max_context_chars,
                 false,
+                controls,
             )?;
             eprintln!(
                 "{CYAN}⚖ checker ({}) verifying…{RESET}",
                 roles.checker.model
             );
+            controls.phase = format!("task {}/{} — checker", task.id, tasks.len());
             let check_text = swarm_agent(
                 &checker,
                 &roles.checker.model,
@@ -2121,24 +2374,18 @@ fn run_swarm(
                 &worker_policy,
                 workspace,
                 &session,
-                approve,
-                checkpoint,
+                checkpointer,
                 max_context_chars,
                 false,
+                controls,
             )?;
             Ok(swarm::parse_verdict(&check_text))
         };
         for attempt in 1..=swarm::MAX_ATTEMPTS {
-            let verdict = match verify(
-                feedback.as_deref(),
-                &mut worker_report,
-                &mut approve,
-                &mut checkpoint,
-            ) {
+            let verdict = match verify(feedback.as_deref(), &mut worker_report, &mut controls) {
                 Ok(verdict) => verdict,
                 Err(error) => {
-                    eprintln!("{RED}swarm aborted:{RESET} {error}");
-                    resume_hint();
+                    report_stop(&error);
                     return;
                 }
             };
@@ -2169,6 +2416,7 @@ fn run_swarm(
                 "{CYAN}◆ boss ({}) ruling on the dispute…{RESET}",
                 roles.boss.model
             );
+            controls.phase = format!("task {}/{} — boss ruling", task.id, tasks.len());
             let ruling_text = match boss_run(
                 swarm::BOSS_RULING_SYSTEM,
                 &swarm::ruling_request(
@@ -2177,13 +2425,11 @@ fn run_swarm(
                     &worker_report,
                     feedback.as_deref().unwrap_or("(none)"),
                 ),
-                &mut approve,
-                &mut checkpoint,
+                &mut controls,
             ) {
                 Ok(text) => text,
                 Err(error) => {
-                    eprintln!("{RED}swarm aborted:{RESET} {error}");
-                    resume_hint();
+                    report_stop(&error);
                     return;
                 }
             };
@@ -2197,12 +2443,7 @@ fn run_swarm(
                     let _ = session.record("swarm_ruling", &format!("{}: checker", task.id));
                     eprintln!("{DIM}  ⚖ boss upheld the checker — one final guided rework{RESET}");
                     reworks += 1;
-                    match verify(
-                        Some(&ruling_text),
-                        &mut worker_report,
-                        &mut approve,
-                        &mut checkpoint,
-                    ) {
+                    match verify(Some(&ruling_text), &mut worker_report, &mut controls) {
                         Ok(Verdict::Pass) => {
                             eprintln!("{GREEN}  ✓ check passed{RESET}");
                             passed = true;
@@ -2215,8 +2456,7 @@ fn run_swarm(
                             failures += 1;
                         }
                         Err(error) => {
-                            eprintln!("{RED}swarm aborted:{RESET} {error}");
-                            resume_hint();
+                            report_stop(&error);
                             return;
                         }
                     }
@@ -2233,16 +2473,16 @@ fn run_swarm(
         }
     }
 
-    // Phase 3: the boss reviews the finished build. All tasks have an
-    // outcome now, so the saved progress has served its purpose.
-    swarm::clear_state(root);
+    // Phase 3: the boss reviews the finished build. The saved progress
+    // stays on disk until the review ends so the `s` readout keeps working
+    // (and a pause here resumes straight back into the review).
+    "boss final review".clone_into(&mut controls.phase);
     eprintln!("\n{CYAN}◆ boss ({}) final review{RESET}", roles.boss.model);
     let diff = workspace.git_diff().unwrap_or_default();
     let review = boss_run(
         swarm::BOSS_REVIEW_SYSTEM,
         &swarm::review_request(&goal, &outcomes, &truncate_chars(&diff, 20_000)),
-        &mut approve,
-        &mut checkpoint,
+        &mut controls,
     )
     .unwrap_or_else(|error| format!("(final review failed: {error})"));
     eprintln!(
@@ -2257,6 +2497,9 @@ fn run_swarm(
             tasks.len()
         ),
     );
+    // The swarm is complete, including the review: the saved progress has
+    // served its purpose.
+    swarm::clear_state(root);
     // Give the main conversation the outcome so follow-up chat is informed.
     let summary = json!({"role": "user", "content": format!("[A model swarm just completed work in this workspace.\nGoal: {goal}\nOutcomes:\n{outcomes}\nBoss report:\n{review}]")});
     let ack = json!({"role": "assistant", "content": "Understood — I have the swarm results and the current workspace state in mind."});

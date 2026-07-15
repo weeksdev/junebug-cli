@@ -148,6 +148,49 @@ pub fn list_sessions(workspace: &Path) -> Result<Vec<SessionSummary>, String> {
     Ok(summaries)
 }
 
+/// The last `max_chars` of the newest session log that contains a
+/// `swarm_goal` event — the raw material for an AI progress summary of a
+/// running or aborted swarm. `None` when no swarm log exists.
+#[must_use]
+pub fn latest_swarm_log_tail(workspace: &Path, max_chars: usize) -> Option<String> {
+    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for directory in [
+        workspace.join(".junebug").join("sessions"),
+        workspace.join(".febo").join("sessions"),
+    ] {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+                continue;
+            };
+            if newest.as_ref().is_some_and(|(when, _)| *when >= modified) {
+                continue;
+            }
+            let Ok(head) = fs::read_to_string(&path) else {
+                continue;
+            };
+            if head.contains("\"swarm_goal\"") {
+                newest = Some((modified, path));
+            }
+        }
+    }
+    let (_, path) = newest?;
+    let contents = fs::read_to_string(path).ok()?;
+    let count = contents.chars().count();
+    Some(
+        contents
+            .chars()
+            .skip(count.saturating_sub(max_chars))
+            .collect(),
+    )
+}
+
 fn summarize_session(path: &Path) -> Option<SessionSummary> {
     let file = File::open(path).ok()?;
     let modified = path.metadata().and_then(|meta| meta.modified()).ok()?;
