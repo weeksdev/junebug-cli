@@ -1736,9 +1736,14 @@ fn swarm_agent(
     // A transient stream/network failure must not abort a long swarm run:
     // each agent turn starts from a fresh message list, so retrying the
     // whole turn from scratch is safe (checkpoints cover repeated tool
-    // side effects, exactly like a rework does).
-    const EXTRA_ATTEMPTS: usize = 2;
-    for attempt in 0..=EXTRA_ATTEMPTS {
+    // side effects, exactly like a rework does). Rate limits get their own
+    // budget with waits long enough to outlast the limit window — three
+    // roles sharing one API key trip them routinely on long swarms.
+    const TRANSIENT_DELAYS: [u64; 2] = [2, 5];
+    const RATE_LIMIT_DELAYS: [u64; 4] = [15, 30, 60, 60];
+    let mut transient_retries = 0usize;
+    let mut rate_limit_retries = 0usize;
+    loop {
         let mut agent_messages = vec![
             json!({"role": "system", "content": format!("{system}\nThe startup workspace is exactly: {}\nAll relative tool paths and commands start there. Do not guess /workspace, /home/user, an operating system, or a language runtime; inspect the workspace and its project environment first. A shell cd affects only that one command.", workspace.root().display())}),
             json!({"role": "user", "content": request}),
@@ -1934,20 +1939,36 @@ fn swarm_agent(
                 }
                 return Ok(final_assistant_text(&agent_messages));
             }
-            Err(error)
-                if attempt < EXTRA_ATTEMPTS && swarm::is_transient_provider_error(&error) =>
-            {
-                let delay = if attempt == 0 { 2 } else { 5 };
-                eprintln!(
-                    "{DIM}transient provider error ({error}) — retrying this agent turn in {delay}s{RESET}"
-                );
+            Err(error) => {
+                let delay = match swarm::classify_provider_error(&error) {
+                    swarm::ProviderErrorClass::RateLimit
+                        if rate_limit_retries < RATE_LIMIT_DELAYS.len() =>
+                    {
+                        let delay = RATE_LIMIT_DELAYS[rate_limit_retries];
+                        rate_limit_retries += 1;
+                        eprintln!(
+                            "{YELLOW}rate limited by the provider{RESET} {DIM}({error}) — waiting {delay}s before retrying (attempt {rate_limit_retries}/{}){RESET}",
+                            RATE_LIMIT_DELAYS.len()
+                        );
+                        delay
+                    }
+                    swarm::ProviderErrorClass::Transient
+                        if transient_retries < TRANSIENT_DELAYS.len() =>
+                    {
+                        let delay = TRANSIENT_DELAYS[transient_retries];
+                        transient_retries += 1;
+                        eprintln!(
+                            "{DIM}transient provider error ({error}) — retrying this agent turn in {delay}s{RESET}"
+                        );
+                        delay
+                    }
+                    _ => return Err(error),
+                };
                 let _ = session.record("swarm_retry", &error);
                 std::thread::sleep(std::time::Duration::from_secs(delay));
             }
-            Err(error) => return Err(error),
         }
     }
-    unreachable!("the retry loop always returns")
 }
 
 /// `/swarm-status [ai]` — a deterministic progress readout from the saved

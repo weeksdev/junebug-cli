@@ -232,14 +232,36 @@ pub fn format_status(state: &SwarmState, phase: Option<&str>) -> String {
     out
 }
 
-/// True when a provider error looks like a transient stream or network
-/// hiccup (e.g. reqwest's "request or response body error" when a stream
-/// dies mid-turn) rather than a configuration problem, so the agent turn is
-/// worth retrying from scratch instead of aborting the whole swarm.
+/// How a failed provider call should be handled by the swarm's retry logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderErrorClass {
+    /// The provider is rate limiting: retry, but wait out the limit window
+    /// (tens of seconds) — short backoffs just burn the retry budget.
+    RateLimit,
+    /// A transient stream/network hiccup (e.g. reqwest's "request or
+    /// response body error" when a stream dies mid-turn): retry quickly.
+    Transient,
+    /// A configuration or request problem retries cannot fix.
+    Fatal,
+}
+
+/// Classify a provider error string for the swarm's retry logic.
 #[must_use]
-pub fn is_transient_provider_error(error: &str) -> bool {
+pub fn classify_provider_error(error: &str) -> ProviderErrorClass {
     let error = error.to_ascii_lowercase();
-    [
+    if [
+        "429",
+        "too many requests",
+        "rate limit",
+        "rate_limit",
+        "quota",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+    {
+        return ProviderErrorClass::RateLimit;
+    }
+    if [
         "body error",
         "connection",
         "timed out",
@@ -249,8 +271,6 @@ pub fn is_transient_provider_error(error: &str) -> bool {
         "unexpected eof",
         "temporarily",
         "overloaded",
-        "too many requests",
-        "429",
         "500",
         "502",
         "503",
@@ -259,6 +279,10 @@ pub fn is_transient_provider_error(error: &str) -> bool {
     ]
     .iter()
     .any(|needle| error.contains(needle))
+    {
+        return ProviderErrorClass::Transient;
+    }
+    ProviderErrorClass::Fatal
 }
 
 /// The constitution portion of the plan: everything before the task array.
@@ -511,14 +535,30 @@ mod tests {
     }
 
     #[test]
-    fn transient_provider_errors_are_recognized() {
-        assert!(is_transient_provider_error(
-            "request or response body error"
-        ));
-        assert!(is_transient_provider_error("Connection reset by peer"));
-        assert!(is_transient_provider_error("HTTP 503 Service Unavailable"));
-        assert!(!is_transient_provider_error("invalid API key"));
-        assert!(!is_transient_provider_error("model not found: deepseek-v9"));
+    fn provider_errors_classify_into_rate_limit_transient_and_fatal() {
+        use ProviderErrorClass::{Fatal, RateLimit, Transient};
+        assert_eq!(
+            classify_provider_error("HTTP 429 Too Many Requests"),
+            RateLimit
+        );
+        assert_eq!(classify_provider_error("Rate limit exceeded"), RateLimit);
+        assert_eq!(
+            classify_provider_error("request or response body error"),
+            Transient
+        );
+        assert_eq!(
+            classify_provider_error("Connection reset by peer"),
+            Transient
+        );
+        assert_eq!(
+            classify_provider_error("HTTP 503 Service Unavailable"),
+            Transient
+        );
+        assert_eq!(classify_provider_error("invalid API key"), Fatal);
+        assert_eq!(
+            classify_provider_error("model not found: deepseek-v9"),
+            Fatal
+        );
     }
 
     #[test]
