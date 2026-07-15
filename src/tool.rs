@@ -87,14 +87,17 @@ impl Workspace {
                 self.root.join(requested)
             });
         }
-        if requested.is_absolute()
-            || requested
-                .components()
-                .any(|part| matches!(part, Component::ParentDir))
-        {
+        if requested.is_absolute() {
             return Err(
-                "path must be relative to the workspace and cannot contain '..'".to_owned(),
+                "absolute paths need yolo permission — use a path relative to the workspace"
+                    .to_owned(),
             );
+        }
+        if requested
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+        {
+            return Err("path cannot contain '..'".to_owned());
         }
         // Component-based so `.git\config` on Windows and nested entries like
         // `vendor/.env` are protected too, not only `/`-separated root paths.
@@ -157,7 +160,11 @@ impl Workspace {
         unrestricted: bool,
     ) -> Result<String, String> {
         let path = self.checked_path(requested, unrestricted)?;
-        let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
+        // Name the failing path: the raw OS error ("No such file or
+        // directory (os error 2)") does not say which path failed, and the
+        // model needs that to correct a guessed filename.
+        let metadata =
+            fs::metadata(&path).map_err(|error| format!("{}: {error}", requested.display()))?;
         if metadata.is_dir() {
             return Err(
                 "requested path is a directory, not a file — use list_dir to see its entries"
@@ -211,7 +218,7 @@ impl Workspace {
             .env_clear()
             .env("PATH", default_path())
             .output()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| describe_rg_spawn_error(&error))?;
         let text = String::from_utf8_lossy(&output.stdout).into_owned();
         if text.len() > 256 * 1024 {
             return Err("search output exceeds the 256 KiB limit".to_owned());
@@ -242,7 +249,7 @@ impl Workspace {
     ) -> Result<Vec<String>, String> {
         let path = self.checked_path(requested, unrestricted)?;
         let mut entries = fs::read_dir(path)
-            .map_err(|error| error.to_string())?
+            .map_err(|error| format!("{}: {error}", requested.display()))?
             .map(|entry| entry.map_err(|error| error.to_string()))
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
@@ -577,6 +584,19 @@ fn tail_chars(text: &str, cap: usize) -> String {
     let count = text.chars().count();
     let skipped: String = text.chars().skip(count.saturating_sub(cap)).collect();
     skipped.trim().to_owned()
+}
+
+/// A search failure the model (and user) can act on: a missing `rg` binary
+/// otherwise surfaces as a bare "No such file or directory (os error 2)"
+/// that looks like the searched path is at fault.
+fn describe_rg_spawn_error(error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        "ripgrep (rg) is not installed or not on Junebug's sanitized PATH; the search tool \
+         requires it (e.g. brew install ripgrep / apt install ripgrep)"
+            .to_owned()
+    } else {
+        format!("cannot run rg: {error}")
+    }
 }
 
 const fn default_path() -> &'static str {
@@ -933,6 +953,29 @@ mod tests {
         let workspace = Workspace::new(root.clone());
         let entries = workspace.list_dir(Path::new(".")).expect("list root");
         assert!(entries.contains(&"visible.txt".to_owned()));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn missing_paths_and_missing_ripgrep_produce_actionable_errors() {
+        let root = temporary_workspace();
+        let workspace = Workspace::new(root.clone());
+        let error = workspace
+            .read_file(Path::new("requirements-dev.txt"))
+            .expect_err("missing file");
+        assert!(
+            error.contains("requirements-dev.txt"),
+            "error must name the path: {error}"
+        );
+        let error = workspace
+            .search_at("query", Path::new("/outside"), false)
+            .expect_err("absolute path");
+        assert!(error.contains("yolo"), "got: {error}");
+        assert!(!error.contains(".."), "'..' is not the problem: {error}");
+        let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let described = super::describe_rg_spawn_error(&not_found);
+        assert!(described.contains("ripgrep"), "got: {described}");
+        assert!(described.contains("install"), "got: {described}");
         fs::remove_dir_all(root).expect("cleanup");
     }
 
