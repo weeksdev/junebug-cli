@@ -70,6 +70,10 @@ pub struct Editor {
     /// Workspace file list, gathered lazily once per process.
     files: Option<Vec<String>>,
     history: Vec<String>,
+    /// Multi-line paste contents, referenced from the input line by
+    /// `[pasted #N +L lines]` placeholders and expanded on submit. Kept for
+    /// the whole session so history recall keeps working.
+    pastes: Vec<String>,
 }
 
 impl Editor {
@@ -79,7 +83,27 @@ impl Editor {
             root,
             files: None,
             history: Vec::new(),
+            pastes: Vec::new(),
         }
+    }
+
+    /// The placeholder inserted into the input line for paste `index`.
+    fn paste_placeholder(&self, index: usize) -> String {
+        format!(
+            "[pasted #{} +{} lines]",
+            index + 1,
+            self.pastes[index].lines().count().max(1)
+        )
+    }
+
+    /// Replace every intact paste placeholder with its stored content.
+    /// Placeholders the user edited no longer match and stay literal text.
+    fn expand_pastes(&self, text: &str) -> String {
+        let mut expanded = text.to_owned();
+        for index in 0..self.pastes.len() {
+            expanded = expanded.replace(&self.paste_placeholder(index), &self.pastes[index]);
+        }
+        expanded
     }
 
     /// Read one input line, drawing the prompt and a styled `footer` hint below
@@ -100,14 +124,20 @@ impl Editor {
         if !io::stdin().is_terminal() || terminal::enable_raw_mode().is_err() {
             return fallback_read_line();
         }
+        // With bracketed paste on, a paste arrives as one atomic event
+        // instead of keystrokes — so newlines in it cannot submit the line.
+        let _ = crossterm::execute!(io::stderr(), event::EnableBracketedPaste);
         let result = self.edit_loop(footer.to_owned(), on_shift_tab);
+        let _ = crossterm::execute!(io::stderr(), event::DisableBracketedPaste);
         let _ = terminal::disable_raw_mode();
         if let Some(line) = &result
             && !line.is_empty()
         {
+            // History keeps the compact placeholder form; expansion happens
+            // on the returned line (and again on any history resubmit).
             self.history.push(line.clone());
         }
-        result
+        result.map(|line| self.expand_pastes(&line))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -129,8 +159,27 @@ impl Editor {
                 selected = 0;
             }
             draw(&text, cursor, &items, selected, &footer);
-            let Ok(Event::Key(key)) = event::read() else {
-                continue;
+            let key = match event::read() {
+                Ok(Event::Key(key)) => key,
+                Ok(Event::Paste(pasted)) => {
+                    let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
+                    let insert = if pasted.contains('\n') {
+                        // Collapse a multi-line paste to a placeholder so the
+                        // single-row editor stays editable; it expands back
+                        // to the full text when the line is submitted.
+                        self.pastes.push(pasted);
+                        self.paste_placeholder(self.pastes.len() - 1)
+                    } else {
+                        pasted
+                    };
+                    for character in insert.chars() {
+                        buffer.insert(cursor, character);
+                        cursor += 1;
+                    }
+                    selected = 0;
+                    continue;
+                }
+                _ => continue,
             };
             if key.kind != KeyEventKind::Press {
                 continue;
@@ -583,7 +632,8 @@ fn filter_files(files: &[String], query: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Choice, CompletionContext, completion_context, filter_files, next_selectable, select_window,
+        Choice, CompletionContext, Editor, completion_context, filter_files, next_selectable,
+        select_window,
     };
 
     fn chars(text: &str) -> Vec<char> {
@@ -653,5 +703,26 @@ mod tests {
         assert_eq!(select_window(100, 50, 10), (45, 55));
         assert_eq!(select_window(100, 99, 10), (90, 100));
         assert_eq!(select_window(5, 4, 10), (0, 5));
+    }
+
+    #[test]
+    fn paste_placeholders_expand_back_to_full_text_on_submit() {
+        let mut editor = Editor::new(std::env::temp_dir());
+        editor
+            .pastes
+            .push("line one\nline two\nline three".to_owned());
+        editor.pastes.push("alpha\nbeta".to_owned());
+        let first = editor.paste_placeholder(0);
+        let second = editor.paste_placeholder(1);
+        assert_eq!(first, "[pasted #1 +3 lines]");
+        assert_eq!(second, "[pasted #2 +2 lines]");
+        let line = format!("explain this: {first} and compare with {second} thanks");
+        let expanded = editor.expand_pastes(&line);
+        assert!(expanded.contains("line two"), "got: {expanded}");
+        assert!(expanded.contains("alpha\nbeta"), "got: {expanded}");
+        assert!(!expanded.contains("[pasted"), "got: {expanded}");
+        // An edited placeholder no longer matches and stays literal.
+        let edited = editor.expand_pastes("[pasted #1 +99 lines]");
+        assert_eq!(edited, "[pasted #1 +99 lines]");
     }
 }
