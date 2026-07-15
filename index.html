@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Junebug CLI — a safe, local-first coding agent</title>
+<meta name="description" content="Junebug CLI is an open-source, local-first coding agent: streamed agentic coding in your terminal with a deterministic safety policy, workspace checkpoints, model swarms, and support for OpenAI, Anthropic, DeepSeek, OpenRouter, and local Ollama models.">
+<link rel="icon" type="image/png" href="junebug.png">
+<style>
+  :root {
+    --bg: #060a09;
+    --panel: #0b1210;
+    --panel-2: #0e1714;
+    --border: #1b2b26;
+    --text: #cfe3da;
+    --muted: #7fa093;
+    --accent: #34e8a0;
+    --accent-dim: #1d8f66;
+    --amber: #e8b04a;
+    --red: #e86a5f;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    line-height: 1.65;
+    font-size: 16.5px;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, pre, kbd {
+    font-family: var(--mono);
+    font-size: 0.92em;
+  }
+  code {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 0.08em 0.38em;
+    color: #a9f2d3;
+    white-space: nowrap;
+  }
+  pre {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1rem 1.2rem;
+    overflow-x: auto;
+    line-height: 1.55;
+  }
+  pre code { background: none; border: none; padding: 0; white-space: pre; color: #bfe9d6; }
+  .prompt { color: var(--accent); user-select: none; }
+  .dim { color: var(--muted); }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 1.4rem; }
+
+  header.hero {
+    padding: 4.2rem 0 3.2rem;
+    text-align: center;
+    background:
+      radial-gradient(ellipse 60% 45% at 50% 0%, rgba(52,232,160,0.10), transparent 70%),
+      var(--bg);
+    border-bottom: 1px solid var(--border);
+  }
+  .hero img.logo {
+    width: 168px; height: 168px;
+    border-radius: 36px;
+    box-shadow: 0 0 60px rgba(52,232,160,0.22), 0 8px 40px rgba(0,0,0,0.6);
+  }
+  .hero h1 {
+    font-family: var(--mono);
+    font-size: clamp(2rem, 5vw, 3rem);
+    margin-top: 1.4rem;
+    letter-spacing: -0.5px;
+  }
+  .hero h1 .cursor {
+    display: inline-block; width: 0.55em; height: 1.05em;
+    background: var(--accent); vertical-align: text-bottom;
+    margin-left: 0.12em;
+    animation: blink 1.15s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  .hero p.tag {
+    color: var(--muted);
+    font-size: 1.18rem;
+    max-width: 620px;
+    margin: 0.9rem auto 0;
+  }
+  .hero .buttons { margin-top: 1.9rem; display: flex; gap: 0.8rem; justify-content: center; flex-wrap: wrap; }
+  .btn {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 0.95rem;
+    padding: 0.62rem 1.25rem;
+    border-radius: 9px;
+    border: 1px solid var(--accent-dim);
+    color: var(--accent);
+    background: rgba(52,232,160,0.06);
+    transition: background 0.15s, transform 0.15s;
+  }
+  .btn:hover { background: rgba(52,232,160,0.14); text-decoration: none; transform: translateY(-1px); }
+  .btn.solid { background: var(--accent); color: #04140d; font-weight: 600; border-color: var(--accent); }
+  .btn.solid:hover { background: #52f0b2; }
+
+  nav.toc {
+    position: sticky; top: 0; z-index: 5;
+    background: rgba(6,10,9,0.92);
+    backdrop-filter: blur(6px);
+    border-bottom: 1px solid var(--border);
+    font-family: var(--mono);
+    font-size: 0.86rem;
+  }
+  nav.toc .wrap { display: flex; gap: 1.35rem; overflow-x: auto; padding: 0.72rem 1.4rem; white-space: nowrap; }
+  nav.toc a { color: var(--muted); }
+  nav.toc a:hover { color: var(--accent); text-decoration: none; }
+
+  main section { padding: 3.4rem 0 0.6rem; }
+  main section:last-of-type { padding-bottom: 3rem; }
+  h2 {
+    font-family: var(--mono);
+    font-size: 1.5rem;
+    color: var(--accent);
+    margin-bottom: 1.1rem;
+  }
+  h2::before { content: "» "; color: var(--accent-dim); }
+  h3 { font-size: 1.08rem; margin: 1.6rem 0 0.5rem; color: #e6f4ee; }
+  p + p { margin-top: 0.8rem; }
+  section > .wrap > p { max-width: 74ch; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 1rem; margin-top: 1.4rem; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.15rem 1.25rem;
+  }
+  .card h3 { margin: 0 0 0.45rem; font-size: 1.02rem; font-family: var(--mono); color: var(--accent); }
+  .card p { color: var(--muted); font-size: 0.95rem; }
+  .card code { font-size: 0.85em; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1.2rem 0;
+    font-size: 0.95rem;
+  }
+  .table-scroll { overflow-x: auto; }
+  th, td { text-align: left; padding: 0.55rem 0.8rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { font-family: var(--mono); color: var(--accent); font-weight: 600; white-space: nowrap; }
+  td:first-child { font-family: var(--mono); white-space: nowrap; color: #a9f2d3; }
+  tr:hover td { background: rgba(52,232,160,0.03); }
+
+  .term {
+    background: #070d0b;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    margin: 1.4rem 0;
+    box-shadow: 0 10px 44px rgba(0,0,0,0.45);
+  }
+  .term .bar {
+    display: flex; align-items: center; gap: 0.42rem;
+    background: var(--panel-2);
+    padding: 0.55rem 0.9rem;
+    border-bottom: 1px solid var(--border);
+    font-family: var(--mono); font-size: 0.78rem; color: var(--muted);
+  }
+  .term .dot { width: 11px; height: 11px; border-radius: 50%; background: #274238; }
+  .term .dot.r { background: #b3564d; } .term .dot.y { background: #b99a45; } .term .dot.g { background: #3f9f76; }
+  .term pre { border: none; border-radius: 0; margin: 0; }
+  .ok { color: var(--accent); } .warn { color: var(--amber); } .err { color: var(--red); }
+
+  .flow {
+    display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center;
+    font-family: var(--mono); font-size: 0.92rem;
+    margin: 1.3rem 0 0.4rem;
+  }
+  .flow .node {
+    border: 1px solid var(--accent-dim);
+    background: rgba(52,232,160,0.05);
+    color: var(--accent);
+    border-radius: 9px; padding: 0.45rem 0.85rem;
+  }
+  .flow .arrow { color: var(--muted); }
+
+  .callout {
+    border-left: 3px solid var(--accent-dim);
+    background: var(--panel);
+    border-radius: 0 10px 10px 0;
+    padding: 0.85rem 1.1rem;
+    margin: 1.2rem 0;
+    color: var(--muted);
+    font-size: 0.96rem;
+  }
+  .callout strong { color: var(--text); }
+
+  footer {
+    border-top: 1px solid var(--border);
+    margin-top: 3.4rem;
+    padding: 2.2rem 0 2.8rem;
+    text-align: center;
+    color: var(--muted);
+    font-size: 0.92rem;
+  }
+  footer .wrap { display: flex; flex-direction: column; gap: 0.5rem; }
+  @media (max-width: 560px) {
+    body { font-size: 15.5px; }
+    .hero img.logo { width: 128px; height: 128px; border-radius: 28px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <img class="logo" src="junebug.png" alt="Junebug CLI — a tortoiseshell cat in a glowing terminal frame">
+    <h1>junebug<span class="cursor"></span></h1>
+    <p class="tag">A safe, local-first coding agent for your terminal. Bring any model — cloud or fully local — and keep a deterministic policy engine between it and your machine.</p>
+    <div class="buttons">
+      <a class="btn solid" href="https://github.com/weeksdev/junebug-cli">GitHub</a>
+      <a class="btn" href="https://github.com/weeksdev/junebug-cli/releases">Downloads</a>
+      <a class="btn" href="#quick-start">Quick start</a>
+    </div>
+  </div>
+</header>
+
+<nav class="toc">
+  <div class="wrap">
+    <a href="#quick-start">quick-start</a>
+    <a href="#providers">providers</a>
+    <a href="#safety">safety</a>
+    <a href="#repl">repl</a>
+    <a href="#checkpoints">checkpoints</a>
+    <a href="#swarms">swarms</a>
+    <a href="#sessions">sessions</a>
+    <a href="#commands">commands</a>
+    <a href="#faq">faq</a>
+  </div>
+</nav>
+
+<main>
+
+<section id="quick-start">
+  <div class="wrap">
+    <h2>Quick start</h2>
+    <p>Junebug needs <a href="https://github.com/BurntSushi/ripgrep">ripgrep</a> for its search tool (the macOS installer takes care of it) and, to build from source, a <a href="https://rustup.rs">Rust toolchain</a>. Prebuilt binaries for macOS (arm64/x86_64), Linux, and Windows ship on every tagged release.</p>
+    <div class="term">
+      <div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>&nbsp;terminal</div>
+      <pre><code><span class="prompt">$</span> git clone https://github.com/weeksdev/junebug-cli && cd junebug-cli
+<span class="prompt">$</span> ./install-macos.sh          <span class="dim"># builds, installs ripgrep if needed, puts junebug in ~/.local/bin</span>
+<span class="prompt">$</span> junebug set --provider deepseek YOUR_API_KEY
+<span class="dim">saved — starting the REPL…</span>
+
+<span class="dim">╭──────────────────────────────────────────────╮
+│ ✻ Junebug CLI                                │
+│ deepseek · deepseek-v4-flash · read-only     │
+╰──────────────────────────────────────────────╯</span>
+<span class="prompt">❯</span> explain this repository</code></pre>
+    </div>
+    <p>Keys are stored once in <code>~/.junebug/credentials.env</code> (mode <code>0600</code>) — or use environment variables or a workspace <code>.env</code>. With no key at all, the REPL still opens and <code>/keys</code> sets one up in place, with the input hidden. Keys never enter the conversation, the session log, or the model.</p>
+  </div>
+</section>
+
+<section id="providers">
+  <div class="wrap">
+    <h2>Any model, including fully local</h2>
+    <p>Junebug speaks OpenAI-compatible Chat Completions and the Anthropic Messages API natively, with real SSE streaming, tool calls, usage accounting, and mid-session provider switching. One <code>/model</code> menu lists every provider you have credentials for — including a running Ollama — and switches in a single step.</p>
+    <div class="grid">
+      <div class="card"><h3>openrouter</h3><p>Default cloud provider. One key, hundreds of models. <code>OPENROUTER_API_KEY</code></p></div>
+      <div class="card"><h3>openai · deepseek</h3><p>Direct Chat Completions with streamed tool calls; DeepSeek thinking-mode output is handled across provider switches.</p></div>
+      <div class="card"><h3>anthropic</h3><p>Native Messages API: SSE text/tool streaming, model discovery, canonical <code>tool_use</code> transcripts.</p></div>
+      <div class="card"><h3>ollama · local-openai</h3><p>Fully local, no key. Auto-detects the runtime; LM&nbsp;Studio, vLLM, and llama.cpp work via <code>LOCAL_OPENAI_BASE_URL</code>.</p></div>
+    </div>
+    <p style="margin-top:1.3rem;">There is also opt-in per-call <strong>routing</strong> (<code>--model auto</code>): cheap turns go to cheap models, hard turns to strong ones, with visible route notices and safe switching between turns — never mid-tool-call.</p>
+  </div>
+</section>
+
+<section id="safety">
+  <div class="wrap">
+    <h2>Safety is the architecture, not a feature</h2>
+    <p>Every tool call — built-in or MCP — passes through a deterministic <code>PolicyEngine</code> before any side effect runs. Its decision comes from the permission mode and plan mode only: no model output, no tool arguments, no heuristics. The default is <strong>read-only</strong>.</p>
+    <div class="table-scroll"><table>
+      <tr><th>Mode</th><th>Reads</th><th>Workspace writes</th><th>Commands</th></tr>
+      <tr><td>read-only <span class="dim">(default)</span></td><td>allowed</td><td>denied</td><td>denied</td></tr>
+      <tr><td>ask</td><td>allowed</td><td>prompt with a diff preview</td><td>prompt</td></tr>
+      <tr><td>workspace-write</td><td>allowed</td><td>allowed, workspace only</td><td>prompt</td></tr>
+      <tr><td>yolo</td><td colspan="3">everything pre-approved, full filesystem, inherited environment — a deliberate, clearly-warned choice</td></tr>
+    </table></div>
+    <p>Cycle modes mid-session with <kbd>Shift</kbd>+<kbd>Tab</kbd> — even while a turn is running — and a colored badge under the prompt always shows the effective level. <code>--plan</code> is a hard read-only guard on top of everything.</p>
+    <h3>Defense in depth</h3>
+    <div class="grid">
+      <div class="card"><h3>protected paths</h3><p><code>.env*</code>, <code>.git</code>, and <code>.junebug</code> are untouchable at any depth outside yolo, matched per path component — Windows separators and nested entries included.</p></div>
+      <div class="card"><h3>symlink containment</h3><p>Symlinks are fully resolved; a link inside the workspace cannot read or create anything outside it. Traversal (<code>..</code>) is rejected.</p></div>
+      <div class="card"><h3>command hygiene</h3><p>Destructive/network patterns get a ⚠ warning in the approval prompt (token-based matching, so <code>git add .</code> is fine and <code>;rm -rf /</code> is not). Commands run with a sanitized environment.</p></div>
+      <div class="card"><h3>command timeouts</h3><p>Every command is killed — with its whole process tree — after a model-settable timeout (default 120s). A foreground server can't hang a turn.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="repl">
+  <div class="wrap">
+    <h2>A real terminal UI</h2>
+    <p>Streamed Markdown with ANSI styling, a spinner with elapsed time, <code>⏺ tool(args)</code> / <code>⎿ result</code> activity lines, and <kbd>Esc</kbd> to interrupt a running turn cleanly — partial tool calls are discarded and the transcript stays valid.</p>
+    <div class="grid">
+      <div class="card"><h3>completions</h3><p><code>/</code> opens the command menu; <code>@</code> searches workspace files and attaches them to your message.</p></div>
+      <div class="card"><h3>/explorer</h3><p>Searchable workspace tree with a syntax-highlighted viewer. Press <code>e</code> to open the file in your own <code>$EDITOR</code> — checkpointed first, so even manual edits are rewindable.</p></div>
+      <div class="card"><h3>/changes · /diff</h3><p>Full-screen changed-file browser with per-file diffs — real Git when present, the latest shadow checkpoint otherwise.</p></div>
+      <div class="card"><h3>file diffs</h3><p>Every write is shown as a colored diff hunk, embedded in approval prompts in <code>ask</code> mode. Diffs are UI-only and never sent to the model.</p></div>
+      <div class="card"><h3>/compact</h3><p>Model-written summary replaces the in-memory history to free context; the session log keeps the full record.</p></div>
+      <div class="card"><h3>/model · /keys · /permissions</h3><p>Arrow-key menus for switching models across all configured providers, saving keys with hidden input, and changing permissions live.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="checkpoints">
+  <div class="wrap">
+    <h2>Checkpoints: undo for agents</h2>
+    <p>Before every prompt and before every mutating tool — <em>including shell commands</em> — Junebug snapshots the workspace into a shadow Git repository under <code>~/.junebug/checkpoints/</code>. Your own repo is never touched, and non-Git workspaces work fine.</p>
+    <p><code>/rewind</code> lists checkpoints in a menu and restores any of them; the pre-restore state is checkpointed first, so a rewind is itself undoable. Snapshots respect your <code>.gitignore</code> and never capture <code>.env*</code>, <code>.junebug/</code>, or build caches — proven by tests that secrets are neither captured nor overwritten on restore.</p>
+    <div class="callout"><strong>Why it matters:</strong> file-write checkpoints are easy. Checkpointing before <em>commands</em> is what saves you when a script the agent ran rewrites half the project.</div>
+  </div>
+</section>
+
+<section id="swarms">
+  <div class="wrap">
+    <h2>Model swarms</h2>
+    <p>One strong model plans and judges; cheap models do the work; nothing is accepted unverified. That's <code>/swarm</code>.</p>
+    <div class="flow">
+      <span class="node">boss plans <span class="dim">(read-only)</span></span><span class="arrow">→</span>
+      <span class="node">worker executes</span><span class="arrow">→</span>
+      <span class="node">checker verifies</span><span class="arrow">→</span>
+      <span class="node">boss reviews</span>
+    </div>
+    <p>The boss inspects the workspace under a hard read-only guard and writes a constitution plus a task list. For each task, a worker gets full tools and a checker independently re-verifies with its own tools — it cannot write files and must end with an explicit <code>VERDICT:</code> line, where silence counts as failure. Failed checks send specific feedback back to the worker; persistent disputes escalate to the boss, whose unclear rulings default to the checker, so unverified work is never accepted.</p>
+    <div class="term">
+      <div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>&nbsp;junebug — /swarm</div>
+      <pre><code><span class="prompt">❯</span> /swarm Add todo CRUD endpoints and a minimal HTML page
+<span class="dim">swarm · boss deepseek-v4-flash · worker qwen3:8b · checker deepseek-v4-flash</span>
+◆ boss planning…
+<b>task 1/3 — Add in-memory todo store and CRUD routes</b>
+⛏ worker  →  ⚖ checker verifying…
+<span class="ok">  ✓ check passed</span>
+<b>task 2/3 — Serve the HTML frontend at GET /</b>
+⛏ worker  →  ⚖ checker verifying…
+<span class="err">  ✗ check failed:</span> page does not refresh the list after adding
+⛏ worker reworking  →  ⚖ checker verifying…
+<span class="ok">  ✓ check passed</span>
+<span class="dim">swarm done — 3 tasks · 1 rework · 0 failed</span></code></pre>
+    </div>
+    <h3>Built for long runs</h3>
+    <p>Transient provider errors (a stream dying mid-turn, a 502, a rate limit) retry the affected agent turn with backoff instead of killing the run. Progress is saved after planning and after every task, so if a swarm does abort, <code>/swarm resume</code> continues exactly where it left off. Checkpoints are taken throughout — <code>/rewind</code> can undo an entire swarm. Mix providers freely: a cloud boss with local Ollama workers is a fine (and cheap) setup, assigned in one <code>/swarm-setup</code> menu.</p>
+  </div>
+</section>
+
+<section id="sessions">
+  <div class="wrap">
+    <h2>Sessions, resume, and headless mode</h2>
+    <p>Every conversation is recorded as JSON Lines under <code>.junebug/sessions/</code> — structured messages plus an audit trail of tool calls, route switches, checkpoints, and swarm events. <code>--resume</code> with no path lists this workspace's conversations newest-first with a preview; <code>--resume-compact</code> summarizes a large history before the first turn so resuming a 28&nbsp;KB session costs ~1.4k input tokens instead of ~7k.</p>
+    <p>For scripts and CI there's <code>junebug exec --json "prompt"</code>: newline-delimited events (<code>text.delta</code>, <code>tool.call</code>, <code>tool.result</code>, <code>file.diff</code>, <code>completed</code>) on stdout, serialized with stable keys.</p>
+    <p>Local stdio MCP servers (<code>--enable-mcp</code>) and lifecycle hooks (<code>--enable-hooks</code>) are off unless you turn them on, and MCP tool calls pass through the same policy engine as built-ins.</p>
+  </div>
+</section>
+
+<section id="commands">
+  <div class="wrap">
+    <h2>Command reference</h2>
+    <h3>Slash commands</h3>
+    <div class="table-scroll"><table>
+      <tr><th>Command</th><th>What it does</th></tr>
+      <tr><td>/model</td><td>Grouped arrow-key picker across every available provider's live model list; <code>/model auto</code> enables routing</td></tr>
+      <tr><td>/permissions</td><td>Switch read-only / ask / workspace-write / yolo mid-session</td></tr>
+      <tr><td>/keys</td><td>Save or replace a provider API key, input hidden</td></tr>
+      <tr><td>/explorer</td><td>Browse and search the workspace; <code>e</code> edits in your $EDITOR</td></tr>
+      <tr><td>/changes · /diff</td><td>Changed-file browser with per-file diffs · print the raw diff</td></tr>
+      <tr><td>/rewind</td><td>Restore the workspace to any checkpoint (undoably)</td></tr>
+      <tr><td>/swarm GOAL</td><td>Run a boss/worker/checker swarm; <code>/swarm resume</code> continues an aborted one</td></tr>
+      <tr><td>/swarm-setup</td><td>Assign a model to each swarm role</td></tr>
+      <tr><td>/compact</td><td>Summarize the conversation to free context</td></tr>
+      <tr><td>/status · /help · /exit</td><td>Session info · help · quit</td></tr>
+    </table></div>
+    <h3>CLI flags</h3>
+    <div class="table-scroll"><table>
+      <tr><th>Flag</th><th>What it does</th></tr>
+      <tr><td>--provider, --model</td><td>Pick provider/model; both default from your last session in the workspace</td></tr>
+      <tr><td>--permission MODE</td><td>read-only (default) · ask · workspace-write · yolo</td></tr>
+      <tr><td>--plan</td><td>Hard read-only guard; write/command tools are hidden from the model</td></tr>
+      <tr><td>--resume [file]</td><td>Continue a session; no path opens a picker. <code>--resume-compact</code> summarizes first</td></tr>
+      <tr><td>exec --json</td><td>Headless single prompt with JSONL events</td></tr>
+      <tr><td>--no-checkpoints</td><td>Disable workspace snapshots</td></tr>
+      <tr><td>--enable-mcp · --enable-hooks</td><td>Opt in to local MCP servers / repository hooks</td></tr>
+      <tr><td>set --provider NAME KEY</td><td>Save a credential, then start the REPL on that provider</td></tr>
+    </table></div>
+  </div>
+</section>
+
+<section id="faq">
+  <div class="wrap">
+    <h2>FAQ</h2>
+    <h3>Is my code sent anywhere?</h3>
+    <p>Only to the provider you choose, over HTTPS — and with Ollama or a local OpenAI-compatible server, nothing leaves your machine at all. Sessions, checkpoints, credentials, and configuration are all local files.</p>
+    <h3>What keeps the agent from wrecking my machine?</h3>
+    <p>The default mode can't write or run anything. Above that: a deterministic policy gate on every tool call, protected paths, symlink containment, command warnings and timeouts, approval prompts with diffs, and checkpoints before every mutation so <code>/rewind</code> can undo it. Yolo mode exists, but you have to ask for it and it tells you exactly what you're giving up.</p>
+    <h3>What do I need installed?</h3>
+    <p><a href="https://github.com/BurntSushi/ripgrep">ripgrep</a> (the installer handles it on macOS; Junebug warns at startup if it's missing). Git is optional. Rust only if you build from source.</p>
+    <h3>Where did the name come from?</h3>
+    <p>Junebug is the tortoiseshell cat in the logo. The project was previously called Febo; legacy <code>.febo</code> state stays readable.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <div><a href="https://github.com/weeksdev/junebug-cli">github.com/weeksdev/junebug-cli</a> · <a href="https://github.com/weeksdev/junebug-cli/releases">releases</a></div>
+    <div>Dual-licensed under MIT or Apache-2.0 · built in Rust</div>
+  </div>
+</footer>
+
+</body>
+</html>
