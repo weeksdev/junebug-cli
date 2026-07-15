@@ -42,15 +42,18 @@ struct Change {
     status: String,
 }
 
-/// Open a read-only tree/file browser for `root`.
+/// Open a tree/file browser for `root`. Files can be opened in the user's
+/// own `$VISUAL`/`$EDITOR`; protected paths and symlinks never appear in the
+/// tree (see `should_hide`), and a checkpoint is taken before each edit so
+/// `/rewind` covers manual changes.
 ///
 /// # Errors
 ///
 /// Returns an error when the workspace cannot be scanned or terminal input
 /// cannot be initialized.
-pub fn explorer(root: &Path) -> Result<(), String> {
+pub fn explorer(root: &Path, checkpointer: Option<&Checkpointer>) -> Result<(), String> {
     let nodes = scan_tree(root)?;
-    run_explorer(root, &nodes)
+    run_explorer(root, &nodes, checkpointer)
 }
 
 /// Open a read-only changed-file tree with a per-file Git diff pane.
@@ -272,7 +275,11 @@ fn highlighted_file_lines(path: &Path, contents: &str) -> Vec<String> {
 }
 
 #[allow(clippy::too_many_lines)]
-fn run_explorer(root: &Path, nodes: &[Node]) -> Result<(), String> {
+fn run_explorer(
+    root: &Path,
+    nodes: &[Node],
+    checkpointer: Option<&Checkpointer>,
+) -> Result<(), String> {
     if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
         return Err("/explorer requires an interactive terminal".to_owned());
     }
@@ -284,6 +291,7 @@ fn run_explorer(root: &Path, nodes: &[Node]) -> Result<(), String> {
     let mut query = String::new();
     let mut searching = false;
     let mut detail_focused = false;
+    let mut notice = None::<String>;
     let mut cached_path = None::<PathBuf>;
     let mut cached_lines = Vec::<String>::new();
     let result = loop {
@@ -318,6 +326,7 @@ fn run_explorer(root: &Path, nodes: &[Node]) -> Result<(), String> {
             searching,
             false,
             detail_focused,
+            notice.as_deref(),
         );
         let event = match event::read() {
             Ok(event) => event,
@@ -327,6 +336,7 @@ fn run_explorer(root: &Path, nodes: &[Node]) -> Result<(), String> {
         if key.kind != KeyEventKind::Press {
             continue;
         }
+        notice = None;
         if searching {
             match key.code {
                 KeyCode::Enter => searching = false,
@@ -366,6 +376,15 @@ fn run_explorer(root: &Path, nodes: &[Node]) -> Result<(), String> {
                 }
                 KeyCode::Home => scroll = 0,
                 KeyCode::End => scroll = lines.len().saturating_sub(view_height()),
+                KeyCode::Char('e') => {
+                    if let Some(node) = selected_node.filter(|node| !node.directory) {
+                        notice = Some(match edit_file(root, &node.path, checkpointer) {
+                            Ok(()) => format!("edited {}", node.path.display()),
+                            Err(error) => error,
+                        });
+                        cached_path = None;
+                    }
+                }
                 _ => {}
             }
             continue;
@@ -404,6 +423,15 @@ fn run_explorer(root: &Path, nodes: &[Node]) -> Result<(), String> {
             KeyCode::Left => {
                 if let Some(node) = selected_node.filter(|node| node.directory) {
                     collapsed.insert(node.path.clone());
+                }
+            }
+            KeyCode::Char('e') => {
+                if let Some(node) = selected_node.filter(|node| !node.directory) {
+                    notice = Some(match edit_file(root, &node.path, checkpointer) {
+                        Ok(()) => format!("edited {}", node.path.display()),
+                        Err(error) => error,
+                    });
+                    cached_path = None;
                 }
             }
             KeyCode::PageDown => {
@@ -480,6 +508,7 @@ fn run_changes(
             searching,
             true,
             detail_focused,
+            None,
         );
         let event = match event::read() {
             Ok(event) => event,
@@ -568,6 +597,56 @@ fn run_changes(
     result
 }
 
+/// The user's editor: `$VISUAL`, else `$EDITOR`, else a platform default.
+/// Extra words in the variable become arguments (e.g. `code --wait`).
+fn editor_command() -> (String, Vec<String>) {
+    let configured = std::env::var("VISUAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        });
+    parse_editor(configured.as_deref())
+}
+
+fn parse_editor(configured: Option<&str>) -> (String, Vec<String>) {
+    let fallback = if cfg!(windows) { "notepad" } else { "vi" };
+    let mut words = configured
+        .unwrap_or(fallback)
+        .split_whitespace()
+        .map(str::to_owned);
+    let program = words.next().unwrap_or_else(|| fallback.to_owned());
+    (program, words.collect())
+}
+
+/// Suspend the browser TUI and open `path` in the user's own editor. This is
+/// a user-driven edit, not a model tool call, so the policy engine is not
+/// consulted — but protected paths and symlinks are never listed in the tree
+/// (`should_hide`), and a checkpoint is taken first so `/rewind` can undo it.
+fn edit_file(root: &Path, path: &Path, checkpointer: Option<&Checkpointer>) -> Result<(), String> {
+    if let Some(checkpointer) = checkpointer {
+        // Best effort, like every other checkpoint: never block the edit.
+        let _ = checkpointer.snapshot(&format!("before edit: {}", path.display()));
+    }
+    let (program, arguments) = editor_command();
+    leave_screen();
+    let _ = terminal::disable_raw_mode();
+    let status = Command::new(&program)
+        .args(&arguments)
+        .arg(root.join(path))
+        .current_dir(root)
+        .status();
+    let _ = terminal::enable_raw_mode();
+    enter_screen();
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("{program} exited with {status}")),
+        Err(error) => Err(format!("cannot launch {program}: {error}")),
+    }
+}
+
 fn visible_nodes<'a>(
     nodes: &'a [Node],
     collapsed: &HashSet<PathBuf>,
@@ -629,6 +708,7 @@ fn draw_screen(
     searching: bool,
     diff: bool,
     detail_focused: bool,
+    notice: Option<&str>,
 ) {
     let (columns, rows) = terminal::size().unwrap_or((100, 30));
     let columns = usize::from(columns).max(40);
@@ -688,20 +768,30 @@ fn draw_screen(
         };
         let _ = write!(output, "{left} │ {right}\r\n");
     }
+    // The explorer (`!diff`) supports opening the file in $EDITOR; the
+    // changes browser stays read-only.
     let footer = if detail_focused {
-        "FILE/DIFF FOCUS · ↑↓ scroll · pgup/pgdn · ← back to tree · q close"
+        if diff {
+            "DIFF FOCUS · ↑↓ scroll · pgup/pgdn · ← back to tree · q close"
+        } else {
+            "FILE FOCUS · ↑↓ scroll · pgup/pgdn · e edit · ← back to tree · q close"
+        }
     } else if columns >= 100 {
         if diff {
             "↑↓ files · → focus diff · / search · read-only · q/esc close"
         } else {
-            "↑↓ files · → focus file · / search · ←/→ tree · read-only · q/esc close"
+            "↑↓ files · → focus file · / search · e edit · ←/→ tree · q/esc close"
         }
     } else if diff {
         "↑↓ files · pgup/pgdn diff · / search · q close"
     } else {
-        "↑↓ files · pgup/pgdn view · / search · ←/→ tree · q close"
+        "↑↓ files · pgup/pgdn view · / search · e edit · q close"
     };
-    let _ = write!(output, "{DIM}{}{RESET}", fit(footer, columns));
+    if let Some(notice) = notice {
+        let _ = write!(output, "{YELLOW}{}{RESET}", fit(notice, columns));
+    } else {
+        let _ = write!(output, "{DIM}{}{RESET}", fit(footer, columns));
+    }
     let _ = output.flush();
 }
 
@@ -719,22 +809,66 @@ fn color_diff(original: &str, fitted: &str) -> String {
     }
 }
 
+/// Terminal display columns for one character. Terminals render East Asian
+/// wide/fullwidth characters and emoji across two cells, and combining
+/// marks/joiners/variation selectors across none; counting `chars()` as one
+/// column each made such lines overflow their pane and wrap into the tree
+/// column. Range table, not a Unicode library — pragmatic, like `sanitize`.
+const fn char_columns(character: char) -> usize {
+    match character as u32 {
+        // Zero width: combining marks, joiners/format controls, variation
+        // selectors (VS16 turns the preceding character into emoji).
+        0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x200B..=0x200F | 0x20D0..=0x20FF | 0xFE00..=0xFE0F => {
+            0
+        }
+        // East Asian wide/fullwidth blocks plus the common emoji planes.
+        0x1100..=0x115F
+        | 0x2E80..=0x303E
+        | 0x3041..=0x33FF
+        | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF
+        | 0xA000..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x1F300..=0x1F64F
+        | 0x1F680..=0x1F6FF
+        | 0x1F900..=0x1FAFF
+        | 0x20000..=0x3FFFD => 2,
+        _ => 1,
+    }
+}
+
 fn fit(value: &str, width: usize) -> String {
     let sanitized = sanitize(value);
-    let mut chars = sanitized.chars();
-    let mut output = chars.by_ref().take(width).collect::<String>();
-    if chars.next().is_some() && width > 0 {
-        output.pop();
-        output.push('…');
+    let truncated = sanitized.chars().map(char_columns).sum::<usize>() > width;
+    let target = if truncated {
+        width.saturating_sub(1)
+    } else {
+        width
+    };
+    let mut output = String::new();
+    let mut used = 0usize;
+    for character in sanitized.chars() {
+        let columns = char_columns(character);
+        if used + columns > target {
+            break;
+        }
+        output.push(character);
+        used += columns;
     }
-    let length = output.chars().count();
-    output.push_str(&" ".repeat(width.saturating_sub(length)));
+    if truncated && width > 0 {
+        output.push('…');
+        used += 1;
+    }
+    output.push_str(&" ".repeat(width.saturating_sub(used)));
     output
 }
 
 fn fit_ansi(value: &str, width: usize) -> String {
-    let visible = visible_ansi_width(value);
-    let truncated = visible > width;
+    let truncated = visible_ansi_width(value) > width;
     let target = if truncated {
         width.saturating_sub(1)
     } else {
@@ -752,12 +886,14 @@ fn fit_ansi(value: &str, width: usize) -> String {
                     break;
                 }
             }
-        } else if used < target {
-            output.push(character);
-            used += 1;
-        } else {
+            continue;
+        }
+        let columns = char_columns(character);
+        if used + columns > target {
             break;
         }
+        output.push(character);
+        used += columns;
     }
     if truncated && width > 0 {
         output.push('…');
@@ -768,6 +904,7 @@ fn fit_ansi(value: &str, width: usize) -> String {
     output
 }
 
+/// Display columns of `value`, ignoring ANSI color escapes.
 fn visible_ansi_width(value: &str) -> usize {
     let mut visible = 0usize;
     let mut escaped = false;
@@ -779,7 +916,7 @@ fn visible_ansi_width(value: &str) -> usize {
         } else if character == '\x1b' {
             escaped = true;
         } else {
-            visible += 1;
+            visible += char_columns(character);
         }
     }
     visible
@@ -833,6 +970,36 @@ mod tests {
     }
 
     #[test]
+    fn wide_characters_fit_by_display_columns_not_chars() {
+        // 👂 and 👀 render across two terminal cells; fitting them by char
+        // count overflowed the pane and wrapped rows into the tree column.
+        assert_eq!(visible_ansi_width("👂👀"), 4);
+        assert_eq!(visible_ansi_width("あア亜"), 6);
+        // The emoji does not fit in the last remaining column: ellipsis+pad.
+        assert_eq!(fit("ab👂", 3), "ab…");
+        assert_eq!(fit("👂👀", 3), "👂…");
+        // Exact fit is not truncated.
+        assert_eq!(fit("a👂", 3), "a👂");
+        // Variation selector renders zero-width.
+        assert_eq!(visible_ansi_width("❤\u{fe0f}"), 1);
+        for width in 1..=6 {
+            assert_eq!(
+                visible_ansi_width(&fit_ansi("\x1b[32m👂+👀\x1b[0m", width)),
+                width,
+                "fit_ansi must fill exactly {width} columns"
+            );
+            assert_eq!(
+                fit("👂+👀x", width)
+                    .chars()
+                    .map(super::char_columns)
+                    .sum::<usize>(),
+                width,
+                "fit must fill exactly {width} columns"
+            );
+        }
+    }
+
+    #[test]
     fn collapsed_directories_hide_descendants_and_search_finds_them() {
         let nodes = vec![
             Node {
@@ -870,5 +1037,19 @@ mod tests {
         assert_eq!(changes.len(), 2);
         assert_eq!(changes[0].path, PathBuf::from("new.txt"));
         assert_eq!(changes[1].path, PathBuf::from("src/main.rs"));
+    }
+
+    #[test]
+    fn editor_resolution_prefers_configuration_and_splits_arguments() {
+        let fallback = if cfg!(windows) { "notepad" } else { "vi" };
+        assert_eq!(super::parse_editor(None), (fallback.to_owned(), vec![]));
+        assert_eq!(
+            super::parse_editor(Some("nano")),
+            ("nano".to_owned(), vec![])
+        );
+        assert_eq!(
+            super::parse_editor(Some("code --wait")),
+            ("code".to_owned(), vec!["--wait".to_owned()])
+        );
     }
 }

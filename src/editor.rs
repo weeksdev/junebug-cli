@@ -14,7 +14,7 @@ pub const SLASH_COMMANDS: [(&str, &str); 14] = [
     ("/compact", "summarize the conversation to free context"),
     ("/diff", "show the uncommitted Git diff"),
     ("/exit", "quit (Ctrl-D also works)"),
-    ("/explorer", "browse and search workspace files"),
+    ("/explorer", "browse, search, and edit workspace files"),
     ("/help", "show help"),
     ("/keys", "set or replace a provider API key"),
     ("/model", "pick or switch the model"),

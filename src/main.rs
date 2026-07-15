@@ -758,7 +758,7 @@ fn repl(
             match name {
                 "exit" | "quit" => break,
                 "help" => eprintln!(
-                    "{BOLD}/keys{RESET}          set or replace a provider API key (input hidden)\n{BOLD}/model{RESET}         pick or switch the model (↑/↓, enter)\n{BOLD}/permissions{RESET}   change what Junebug may do without asking\n{BOLD}/rewind{RESET}        restore workspace files to an earlier checkpoint\n{BOLD}/swarm-setup{RESET}   assign models to swarm roles (boss/worker/checker)\n{BOLD}/swarm{RESET} GOAL    run a boss/worker/checker model swarm on a goal\n{BOLD}/compact{RESET}       summarize the conversation to free context\n{BOLD}/status{RESET}        provider, model, permissions, session\n{BOLD}/changes{RESET}       browse changed files and per-file diffs\n{BOLD}/explorer{RESET}      browse and search workspace files (read-only)\n{BOLD}/diff{RESET}          print the uncommitted Git diff\n{BOLD}/exit{RESET}          quit (Ctrl-D also works)\n\n{DIM}⇧tab cycles permissions while typing or during a turn · @path attaches a file · esc interrupts{RESET}"
+                    "{BOLD}/keys{RESET}          set or replace a provider API key (input hidden)\n{BOLD}/model{RESET}         pick or switch the model (↑/↓, enter)\n{BOLD}/permissions{RESET}   change what Junebug may do without asking\n{BOLD}/rewind{RESET}        restore workspace files to an earlier checkpoint\n{BOLD}/swarm-setup{RESET}   assign models to swarm roles (boss/worker/checker)\n{BOLD}/swarm{RESET} GOAL    run a boss/worker/checker model swarm on a goal\n{BOLD}/compact{RESET}       summarize the conversation to free context\n{BOLD}/status{RESET}        provider, model, permissions, session\n{BOLD}/changes{RESET}       browse changed files and per-file diffs\n{BOLD}/explorer{RESET}      browse and search workspace files; e opens $EDITOR\n{BOLD}/diff{RESET}          print the uncommitted Git diff\n{BOLD}/exit{RESET}          quit (Ctrl-D also works)\n\n{DIM}⇧tab cycles permissions while typing or during a turn · @path attaches a file · esc interrupts{RESET}"
                 ),
                 "status" => eprintln!(
                     "routing={} provider={} model={} band={} switches_this_task={} permission={} plan={} messages={} checkpoints={} session={}",
@@ -788,7 +788,7 @@ fn repl(
                     }
                 }
                 "explorer" => {
-                    if let Err(error) = browser::explorer(root) {
+                    if let Err(error) = browser::explorer(root, checkpointer) {
                         eprintln!("{RED}error:{RESET} {error}");
                     }
                 }
