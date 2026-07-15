@@ -4,13 +4,19 @@ Junebug CLI is an open-source, local-first coding agent for Junebug models.
 
 This initial foundation intentionally defaults to read-only workspace access. It includes a provider-neutral event contract, safe read/search tools, and streaming REST support for OpenAI, OpenRouter, DeepSeek, Anthropic Claude, and local Ollama models.
 
-Install on macOS (builds from source, installs to `~/.local/bin/junebug`):
+## Requirements
+
+- **[ripgrep](https://github.com/BurntSushi/ripgrep)** (`rg`) — the built-in `search` tool shells out to it. The macOS installer installs it via Homebrew; otherwise use `brew install ripgrep`, `apt install ripgrep`, or `winget install BurntSushi.ripgrep.MSVC`. Junebug warns at startup when it is missing.
+- **Git** (optional) — for `git_status`/`git_diff`/`/changes`; non-Git workspaces work everywhere else.
+- **Rust (cargo)** — only when building from source.
+
+Install on macOS (builds from source, installs ripgrep if needed, installs to `~/.local/bin/junebug`):
 
 ```sh
 ./install-macos.sh
 ```
 
-Tagged versions (`v*`) publish prebuilt binaries for macOS (arm64/x86_64), Linux, and Windows on the [GitHub releases page](https://github.com/weeksdev/junebug-cli/releases).
+Tagged versions (`v*`) publish prebuilt binaries for macOS (arm64/x86_64), Linux, and Windows on the [GitHub releases page](https://github.com/weeksdev/junebug-cli/releases) — install ripgrep separately when using these.
 
 Save a provider API key once (stored in `~/.junebug/credentials.env`, `0600`) and start chatting. Existing `.febo` credentials, configuration, sessions, swarm setup, and checkpoints remain readable after the rename; all new state is written under `.junebug`. When you omit `--provider` and `--model`, Junebug defaults to the provider **and model** from your last session in this workspace (falling back to whichever key it can find and the provider's default model):
 

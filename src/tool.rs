@@ -586,6 +586,19 @@ fn tail_chars(text: &str, cap: usize) -> String {
     skipped.trim().to_owned()
 }
 
+/// Whether ripgrep is reachable on the sanitized PATH the search tool uses.
+/// The REPL warns at startup when it is not, because every `search` call
+/// will fail until it is installed.
+#[must_use]
+pub fn ripgrep_available() -> bool {
+    ripgrep_available_on(default_path())
+}
+
+fn ripgrep_available_on(path: &str) -> bool {
+    let binary = if cfg!(windows) { "rg.exe" } else { "rg" };
+    std::env::split_paths(&std::ffi::OsString::from(path)).any(|dir| dir.join(binary).is_file())
+}
+
 /// A search failure the model (and user) can act on: a missing `rg` binary
 /// otherwise surfaces as a bare "No such file or directory (os error 2)"
 /// that looks like the searched path is at fault.
@@ -953,6 +966,16 @@ mod tests {
         let workspace = Workspace::new(root.clone());
         let entries = workspace.list_dir(Path::new(".")).expect("list root");
         assert!(entries.contains(&"visible.txt".to_owned()));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn ripgrep_detection_follows_the_given_path() {
+        let root = temporary_workspace();
+        assert!(!super::ripgrep_available_on(&root.to_string_lossy()));
+        let binary = if cfg!(windows) { "rg.exe" } else { "rg" };
+        fs::write(root.join(binary), "stub").expect("stub rg");
+        assert!(super::ripgrep_available_on(&root.to_string_lossy()));
         fs::remove_dir_all(root).expect("cleanup");
     }
 

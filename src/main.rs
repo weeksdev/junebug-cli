@@ -729,6 +729,11 @@ fn repl(
             "{BOLD}no model provider available{RESET} — run {BOLD}/keys{RESET} to add an API key or start Ollama"
         );
     }
+    if !junebug_cli::tool::ripgrep_available() {
+        eprintln!(
+            "{YELLOW}⚠ ripgrep (rg) is not installed{RESET} {DIM}— the search tool will fail until it is (brew install ripgrep / apt install ripgrep){RESET}"
+        );
+    }
     let mut editor = Editor::new(root.to_path_buf());
     // Permission can change mid-session via /permissions; plan mode is fixed
     // for the run and keeps a hard read-only guard on top of any mode.
