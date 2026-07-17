@@ -385,6 +385,10 @@ fn approval_prompt(
             let query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
             format!("Junebug requests a web search (the query is sent to DuckDuckGo):\n  {query}")
         }
+        "fetch_url" => {
+            let url = arguments.get("url").and_then(Value::as_str).unwrap_or("");
+            format!("Junebug requests to fetch a URL over the network:\n  {url}")
+        }
         "edit_file" => {
             let old = workspace.read_file(Path::new(path)).unwrap_or_default();
             match planned_edit(&old, arguments) {
@@ -509,6 +513,15 @@ pub fn execute_tool(
                     .and_then(|value| usize::try_from(value).ok())
                     .unwrap_or(crate::websearch::DEFAULT_RESULTS);
                 crate::websearch::web_search(query, max_results)
+            }
+            "fetch_url" => {
+                let url = arguments.get("url").and_then(Value::as_str).unwrap_or("");
+                let max_chars = arguments
+                    .get("max_chars")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(crate::webfetch::DEFAULT_MAX_CHARS);
+                crate::webfetch::fetch_url(url, max_chars)
             }
             "edit_file" => {
                 let old_text = arguments

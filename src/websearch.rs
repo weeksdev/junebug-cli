@@ -188,7 +188,7 @@ fn strip_tags(value: &str) -> String {
     output.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn decode_entities(value: &str) -> String {
+pub(crate) fn decode_entities(value: &str) -> String {
     value
         .replace("&lt;", "<")
         .replace("&gt;", ">")

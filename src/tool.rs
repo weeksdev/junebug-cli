@@ -30,7 +30,7 @@ pub struct ToolDefinition {
     pub risk: ToolRisk,
 }
 
-pub const BUILTIN_TOOLS: [ToolDefinition; 9] = [
+pub const BUILTIN_TOOLS: [ToolDefinition; 10] = [
     ToolDefinition {
         name: "list_dir",
         risk: ToolRisk::Read,
@@ -66,6 +66,10 @@ pub const BUILTIN_TOOLS: [ToolDefinition; 9] = [
     ToolDefinition {
         name: "edit_file",
         risk: ToolRisk::Write,
+    },
+    ToolDefinition {
+        name: "fetch_url",
+        risk: ToolRisk::Network,
     },
 ];
 
