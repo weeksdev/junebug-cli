@@ -236,11 +236,7 @@ fn read_tail_chars(path: &Path, max_chars: usize) -> Option<String> {
         .unwrap_or(bytes.len());
     let text = String::from_utf8_lossy(&bytes[boundary..]);
     let count = text.chars().count();
-    Some(
-        text.chars()
-            .skip(count.saturating_sub(max_chars))
-            .collect(),
-    )
+    Some(text.chars().skip(count.saturating_sub(max_chars)).collect())
 }
 
 fn summarize_session(path: &Path) -> Option<SessionSummary> {
@@ -345,9 +341,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<Value>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        SessionWriter, last_model, latest_swarm_log_tail, list_sessions, load_messages,
-    };
+    use super::{SessionWriter, last_model, latest_swarm_log_tail, list_sessions, load_messages};
     use serde_json::json;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};

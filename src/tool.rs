@@ -911,7 +911,11 @@ mod tests {
         // On Windows these parse as Prefix/RootDir components without being
         // absolute; on unix the same call must fail for `/`-rooted paths via
         // the absolute-path guard. Either way the write is refused.
-        assert!(workspace.write_file(Path::new("/rooted.txt"), "no").is_err());
+        assert!(
+            workspace
+                .write_file(Path::new("/rooted.txt"), "no")
+                .is_err()
+        );
     }
 
     #[test]

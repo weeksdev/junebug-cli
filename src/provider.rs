@@ -175,7 +175,10 @@ fn normalize_base_url(value: &str) -> String {
     // Endpoints append `/v1/...`, and OpenAI-compatible servers (LM Studio,
     // vLLM, llama.cpp) commonly display their base as `.../v1`; accept
     // either spelling instead of producing `/v1/v1/chat/completions`.
-    let value = value.strip_suffix("/v1").unwrap_or(value).trim_end_matches('/');
+    let value = value
+        .strip_suffix("/v1")
+        .unwrap_or(value)
+        .trim_end_matches('/');
     if value.starts_with("http://") || value.starts_with("https://") {
         value.to_owned()
     } else {

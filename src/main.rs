@@ -2756,10 +2756,7 @@ mod tests {
     fn resume_with_a_missing_path_is_an_error_not_a_prompt() {
         let error = parse_args(args(&["--resume", "no-such-session.jsonl", "do work"]))
             .expect_err("a nonexistent session path must fail loudly");
-        assert!(
-            error.contains("session does not exist"),
-            "got: {error}"
-        );
+        assert!(error.contains("session does not exist"), "got: {error}");
     }
 
     #[test]
@@ -2786,7 +2783,9 @@ mod tests {
 
     #[test]
     fn bare_resume_opens_the_picker() {
-        let parsed = parse_args(args(&["--resume"])).expect("parse").expect("args");
+        let parsed = parse_args(args(&["--resume"]))
+            .expect("parse")
+            .expect("args");
         assert!(parsed.resume.is_none());
         assert!(parsed.resume_pick);
 
