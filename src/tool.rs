@@ -30,7 +30,7 @@ pub struct ToolDefinition {
     pub risk: ToolRisk,
 }
 
-pub const BUILTIN_TOOLS: [ToolDefinition; 8] = [
+pub const BUILTIN_TOOLS: [ToolDefinition; 9] = [
     ToolDefinition {
         name: "list_dir",
         risk: ToolRisk::Read,
@@ -62,6 +62,10 @@ pub const BUILTIN_TOOLS: [ToolDefinition; 8] = [
     ToolDefinition {
         name: "web_search",
         risk: ToolRisk::Network,
+    },
+    ToolDefinition {
+        name: "edit_file",
+        risk: ToolRisk::Write,
     },
 ];
 
@@ -190,6 +194,63 @@ impl Workspace {
             return Err("requested file exceeds the 256 KiB read limit".to_owned());
         }
         fs::read_to_string(path).map_err(|error| error.to_string())
+    }
+
+    /// Read a line range of a file: `offset` is the 1-based first line,
+    /// `limit` the number of lines. Unlike whole-file reads there is no file
+    /// size cap — only the returned slice is bounded — so large files stay
+    /// readable in chunks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for disallowed paths, non-files, an offset past the
+    /// end, an oversized slice, or I/O failures.
+    pub fn read_file_slice_with_access(
+        &self,
+        requested: &Path,
+        offset: usize,
+        limit: usize,
+        unrestricted: bool,
+    ) -> Result<String, String> {
+        use std::io::{BufRead, BufReader};
+        let path = self.checked_path(requested, unrestricted)?;
+        let metadata =
+            fs::metadata(&path).map_err(|error| format!("{}: {error}", requested.display()))?;
+        if !metadata.is_file() {
+            return Err("requested path is not a regular file".to_owned());
+        }
+        let offset = offset.max(1);
+        let limit = limit.clamp(1, 10_000);
+        let file =
+            fs::File::open(&path).map_err(|error| format!("{}: {error}", requested.display()))?;
+        let mut output = String::new();
+        let mut seen = 0usize;
+        let mut taken = 0usize;
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|error| error.to_string())?;
+            seen += 1;
+            if seen < offset {
+                continue;
+            }
+            if taken == limit {
+                break;
+            }
+            output.push_str(&line);
+            output.push('\n');
+            taken += 1;
+            if output.len() > 256 * 1024 {
+                return Err(
+                    "requested line range exceeds the 256 KiB read limit — use a smaller limit"
+                        .to_owned(),
+                );
+            }
+        }
+        if taken == 0 {
+            return Err(format!(
+                "offset {offset} is past the end of the file ({seen} lines)"
+            ));
+        }
+        Ok(output)
     }
 
     /// # Errors
@@ -329,6 +390,50 @@ impl Workspace {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
         fs::write(path, contents).map_err(|error| error.to_string())
+    }
+
+    /// Replace `old_text` with `new_text` in one file — the surgical
+    /// alternative to rewriting a whole file with `write_file`. Without
+    /// `replace_all`, `old_text` must match exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for disallowed paths, a missing or ambiguous match,
+    /// oversized files, or I/O failures.
+    pub fn edit_file_with_access(
+        &self,
+        requested: &Path,
+        old_text: &str,
+        new_text: &str,
+        replace_all: bool,
+        unrestricted: bool,
+    ) -> Result<String, String> {
+        let path = self.checked_path(requested, unrestricted)?;
+        if !unrestricted
+            && let Ok(metadata) = path.symlink_metadata()
+            && metadata.file_type().is_symlink()
+        {
+            return Err("refusing to edit a symbolic link".to_owned());
+        }
+        let metadata =
+            fs::metadata(&path).map_err(|error| format!("{}: {error}", requested.display()))?;
+        if !metadata.is_file() {
+            return Err("requested path is not a regular file".to_owned());
+        }
+        if metadata.len() > 1024 * 1024 {
+            return Err("file exceeds the 1 MiB edit limit".to_owned());
+        }
+        let contents = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        let (updated, count) = edit_outcome(&contents, old_text, new_text, replace_all)?;
+        if updated.len() > 1024 * 1024 {
+            return Err("edit exceeds the 1 MiB content limit".to_owned());
+        }
+        fs::write(&path, &updated).map_err(|error| error.to_string())?;
+        Ok(format!(
+            "edited {} ({count} replacement{})",
+            requested.display(),
+            if count == 1 { "" } else { "s" }
+        ))
     }
 
     /// # Errors
@@ -646,6 +751,47 @@ const fn default_path() -> &'static str {
     }
 }
 
+/// The updated contents after replacing `old_text` with `new_text`, plus
+/// the replacement count. Pure so the approval diff preview and the actual
+/// edit share one definition of the outcome.
+///
+/// # Errors
+///
+/// Returns an error for an empty or unchanged `old_text`, no match, or an
+/// ambiguous match without `replace_all`.
+pub fn edit_outcome(
+    contents: &str,
+    old_text: &str,
+    new_text: &str,
+    replace_all: bool,
+) -> Result<(String, usize), String> {
+    if old_text.is_empty() {
+        return Err("old_text cannot be empty".to_owned());
+    }
+    if old_text == new_text {
+        return Err("old_text and new_text are identical".to_owned());
+    }
+    let count = contents.matches(old_text).count();
+    if count == 0 {
+        return Err(
+            "old_text was not found — read the file first and copy its content exactly, \
+             including whitespace"
+                .to_owned(),
+        );
+    }
+    if count > 1 && !replace_all {
+        return Err(format!(
+            "old_text matches {count} times; include more surrounding context to make it \
+             unique, or set replace_all"
+        ));
+    }
+    if replace_all {
+        Ok((contents.replace(old_text, new_text), count))
+    } else {
+        Ok((contents.replacen(old_text, new_text, 1), 1))
+    }
+}
+
 /// Why a path component is disallowed, or `None` when it is fine. On
 /// Windows, NTFS alternate data streams (`.env:secret`, `file::$DATA`) and
 /// Win32 trailing dot/space stripping (`.env `, `.git.`) let a component
@@ -953,6 +1099,90 @@ mod tests {
 
         fs::remove_dir_all(root).expect("cleanup root");
         fs::remove_dir_all(outside).expect("cleanup outside");
+    }
+
+    #[test]
+    fn edit_file_replaces_a_unique_match_and_rejects_ambiguity() {
+        let root = temporary_workspace();
+        let workspace = Workspace::new(root.clone());
+        workspace
+            .write_file(
+                Path::new("code.rs"),
+                "fn a() {}\nfn b() {}\nfn a_helper() {}\n",
+            )
+            .expect("seed");
+
+        let report = workspace
+            .edit_file_with_access(
+                Path::new("code.rs"),
+                "fn b() {}",
+                "fn b() { body(); }",
+                false,
+                false,
+            )
+            .expect("unique edit");
+        assert!(report.contains("1 replacement"), "got: {report}");
+        assert_eq!(
+            workspace.read_file(Path::new("code.rs")).expect("read"),
+            "fn a() {}\nfn b() { body(); }\nfn a_helper() {}\n"
+        );
+
+        let error = workspace
+            .edit_file_with_access(Path::new("code.rs"), "fn a", "fn c", false, false)
+            .expect_err("ambiguous must fail");
+        assert!(error.contains("2 times"), "got: {error}");
+        let error = workspace
+            .edit_file_with_access(Path::new("code.rs"), "not present", "x", false, false)
+            .expect_err("missing must fail");
+        assert!(error.contains("not found"), "got: {error}");
+
+        let report = workspace
+            .edit_file_with_access(Path::new("code.rs"), "fn a", "fn renamed_a", true, false)
+            .expect("replace_all");
+        assert!(report.contains("2 replacements"), "got: {report}");
+        assert!(
+            workspace
+                .read_file(Path::new("code.rs"))
+                .expect("read")
+                .contains("fn renamed_a_helper"),
+        );
+
+        // Protected paths stay protected for edits too.
+        assert!(
+            workspace
+                .edit_file_with_access(Path::new(".env"), "a", "b", false, false)
+                .is_err()
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn read_file_slice_returns_the_requested_lines_and_ignores_the_size_cap() {
+        let root = temporary_workspace();
+        let workspace = Workspace::new(root.clone());
+        // A file over the 256 KiB whole-read cap must still be readable in
+        // ranges.
+        let mut big = String::new();
+        for n in 1..=30_000 {
+            use std::fmt::Write as _;
+            let _ = writeln!(big, "line {n}");
+        }
+        assert!(big.len() > 256 * 1024);
+        fs::write(root.join("big.txt"), &big).expect("seed");
+
+        assert!(
+            workspace.read_file(Path::new("big.txt")).is_err(),
+            "whole-file read keeps its cap"
+        );
+        let slice = workspace
+            .read_file_slice_with_access(Path::new("big.txt"), 29_999, 5, false)
+            .expect("range read");
+        assert_eq!(slice, "line 29999\nline 30000\n");
+        let error = workspace
+            .read_file_slice_with_access(Path::new("big.txt"), 50_000, 5, false)
+            .expect_err("offset past EOF");
+        assert!(error.contains("past the end"), "got: {error}");
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

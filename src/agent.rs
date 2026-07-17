@@ -279,22 +279,41 @@ fn write_preview(
     call: &ToolCall,
     unrestricted: bool,
 ) -> Option<(String, String, String)> {
-    if call.name != "write_file" {
-        return None;
-    }
     let arguments: Value = serde_json::from_str(&call.arguments).ok()?;
     let path = arguments.get("path")?.as_str()?.to_owned();
-    let new = arguments.get("content")?.as_str()?.to_owned();
     let old = workspace
         .read_file_with_access(Path::new(&path), unrestricted)
         .unwrap_or_default();
+    let new = match call.name.as_str() {
+        "write_file" => arguments.get("content")?.as_str()?.to_owned(),
+        "edit_file" => {
+            let (updated, _) = planned_edit(&old, &arguments)?;
+            updated
+        }
+        _ => return None,
+    };
     Some((path, old, new))
+}
+
+/// The post-edit contents an `edit_file` call would produce, from its
+/// arguments — shared by the approval diff and the post-run diff event.
+fn planned_edit(current: &str, arguments: &Value) -> Option<(String, usize)> {
+    crate::tool::edit_outcome(
+        current,
+        arguments.get("old_text").and_then(Value::as_str)?,
+        arguments.get("new_text").and_then(Value::as_str)?,
+        arguments
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    )
+    .ok()
 }
 
 /// Label recorded on the checkpoint taken before a mutating tool runs.
 fn checkpoint_label(call: &ToolCall, arguments: &Value, path: &str) -> String {
     let detail = match call.name.as_str() {
-        "write_file" => path,
+        "write_file" | "edit_file" => path,
         "run_command" => arguments
             .get("command")
             .and_then(Value::as_str)
@@ -366,6 +385,18 @@ fn approval_prompt(
             let query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
             format!("Junebug requests a web search (the query is sent to DuckDuckGo):\n  {query}")
         }
+        "edit_file" => {
+            let old = workspace.read_file(Path::new(path)).unwrap_or_default();
+            match planned_edit(&old, arguments) {
+                Some((updated, _)) => {
+                    let diff = crate::diff::clip(&crate::diff::unified(&old, &updated), 40);
+                    format!("Junebug requests edit access: {path}\n{diff}")
+                }
+                // The edit will fail (no match, ambiguous); still show what
+                // was asked so a decline is informed.
+                None => format!("Junebug requests edit access: {path} (match preview unavailable)"),
+            }
+        }
         other => format!("Junebug requests approval to run {other}"),
     }
 }
@@ -377,6 +408,7 @@ fn approval_prompt(
 /// any permitted mutating tool runs so the prior state can be rewound; it
 /// must never block or fail the tool.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn execute_tool(
     workspace: &Workspace,
     call: &ToolCall,
@@ -423,7 +455,20 @@ pub fn execute_tool(
             "list_dir" => workspace
                 .list_dir_with_access(Path::new(path), unrestricted)
                 .map(|entries| entries.join("\n")),
-            "read_file" => workspace.read_file_with_access(Path::new(path), unrestricted),
+            "read_file" => {
+                let offset = arguments.get("offset").and_then(Value::as_u64);
+                let limit = arguments.get("limit").and_then(Value::as_u64);
+                if offset.is_some() || limit.is_some() {
+                    workspace.read_file_slice_with_access(
+                        Path::new(path),
+                        usize::try_from(offset.unwrap_or(1)).unwrap_or(1),
+                        usize::try_from(limit.unwrap_or(2000)).unwrap_or(2000),
+                        unrestricted,
+                    )
+                } else {
+                    workspace.read_file_with_access(Path::new(path), unrestricted)
+                }
+            }
             "search" => workspace.search_at(
                 arguments.get("query").and_then(Value::as_str).unwrap_or(""),
                 Path::new(arguments.get("path").and_then(Value::as_str).unwrap_or(".")),
@@ -464,6 +509,27 @@ pub fn execute_tool(
                     .and_then(|value| usize::try_from(value).ok())
                     .unwrap_or(crate::websearch::DEFAULT_RESULTS);
                 crate::websearch::web_search(query, max_results)
+            }
+            "edit_file" => {
+                let old_text = arguments
+                    .get("old_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let new_text = arguments
+                    .get("new_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let replace_all = arguments
+                    .get("replace_all")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                workspace.edit_file_with_access(
+                    Path::new(path),
+                    old_text,
+                    new_text,
+                    replace_all,
+                    unrestricted,
+                )
             }
             _ => Err(format!("unknown tool: {}", call.name)),
         }
