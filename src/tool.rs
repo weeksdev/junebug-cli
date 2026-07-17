@@ -102,16 +102,24 @@ impl Workspace {
         // Component-based so `.git\config` on Windows and nested entries like
         // `vendor/.env` are protected too, not only `/`-separated root paths.
         for component in requested.components() {
-            if let Component::Normal(name) = component {
-                let name = name.to_string_lossy();
-                if name == ".git"
-                    || name == ".junebug"
-                    || name == ".febo"
-                    || name == ".env"
-                    || name.starts_with(".env.")
-                {
-                    return Err("path is protected by Junebug policy".to_owned());
+            match component {
+                // A drive or root prefix survives `is_absolute() == false` on
+                // Windows (`C:file`, `\file`) and would make `root.join(..)`
+                // replace the workspace root entirely.
+                Component::Prefix(_) | Component::RootDir => {
+                    return Err(
+                        "path cannot carry a drive or root prefix — use a path relative to the workspace"
+                            .to_owned(),
+                    );
                 }
+                Component::Normal(name) => {
+                    if let Some(reason) =
+                        component_policy_violation(&name.to_string_lossy(), cfg!(windows))
+                    {
+                        return Err(reason.to_owned());
+                    }
+                }
+                Component::CurDir | Component::ParentDir => {}
             }
         }
         let candidate = self.root.join(requested);
@@ -634,6 +642,33 @@ const fn default_path() -> &'static str {
     }
 }
 
+/// Why a path component is disallowed, or `None` when it is fine. On
+/// Windows, NTFS alternate data streams (`.env:secret`, `file::$DATA`) and
+/// Win32 trailing dot/space stripping (`.env `, `.git.`) let a component
+/// address a protected file under a name that defeats exact matching, so
+/// stream syntax is rejected outright and protected-name matching ignores
+/// trailing dots and spaces. `windows` is a parameter (not `cfg!`) so the
+/// Windows rules stay testable on every platform.
+fn component_policy_violation(name: &str, windows: bool) -> Option<&'static str> {
+    if windows && name.contains(':') {
+        return Some("path component contains ':' — NTFS stream syntax is not allowed");
+    }
+    let name = if windows {
+        name.trim_end_matches([' ', '.'])
+    } else {
+        name
+    };
+    if name == ".git"
+        || name == ".junebug"
+        || name == ".febo"
+        || name == ".env"
+        || name.starts_with(".env.")
+    {
+        return Some("path is protected by Junebug policy");
+    }
+    None
+}
+
 /// Environment variables passed through to sanitized subprocesses.
 /// Operational variables only: home/temp locations, locale, timezone,
 /// proxies, the ssh agent socket, and toolchain homes — the settings common
@@ -837,6 +872,46 @@ mod tests {
                 .write_file(Path::new(".git/config"), "nope")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn windows_stream_syntax_cannot_address_protected_files() {
+        use super::component_policy_violation;
+        // NTFS alternate data streams alias a file under a different
+        // component name; on Windows any ':' in a component is rejected.
+        for name in [
+            ".env:payload",
+            ".git:stream",
+            ".junebug:stream",
+            "file.txt::$DATA",
+            "notes.txt:hidden",
+        ] {
+            assert!(
+                component_policy_violation(name, true).is_some(),
+                "{name} must be rejected on Windows"
+            );
+        }
+        // Win32 strips trailing dots and spaces, so `.env ` opens `.env`.
+        for name in [".env ", ".env.", ".git.", ".git ", ".junebug."] {
+            assert_eq!(
+                component_policy_violation(name, true),
+                Some("path is protected by Junebug policy"),
+                "{name:?} must match the protected name it normalizes to"
+            );
+        }
+        // Ordinary names stay usable, and unix filenames may contain ':'.
+        assert!(component_policy_violation("main.rs", true).is_none());
+        assert!(component_policy_violation("time:stamp.txt", false).is_none());
+        assert!(component_policy_violation(".env", false).is_some());
+    }
+
+    #[test]
+    fn drive_and_root_prefixed_paths_are_rejected() {
+        let workspace = Workspace::new(PathBuf::from("."));
+        // On Windows these parse as Prefix/RootDir components without being
+        // absolute; on unix the same call must fail for `/`-rooted paths via
+        // the absolute-path guard. Either way the write is refused.
+        assert!(workspace.write_file(Path::new("/rooted.txt"), "no").is_err());
     }
 
     #[test]
