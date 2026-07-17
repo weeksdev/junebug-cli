@@ -1219,7 +1219,10 @@ mod tests {
         let error = workspace
             .search_at("query", Path::new("/outside"), false)
             .expect_err("absolute path");
-        assert!(error.contains("yolo"), "got: {error}");
+        // On unix `/outside` is absolute ("needs yolo permission"); on
+        // Windows it is root-relative and hits the root-prefix rejection.
+        // Both messages steer to the same remedy.
+        assert!(error.contains("relative to the workspace"), "got: {error}");
         assert!(!error.contains(".."), "'..' is not the problem: {error}");
         let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
         let described = super::describe_rg_spawn_error(&not_found);
