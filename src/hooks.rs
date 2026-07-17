@@ -45,11 +45,8 @@ pub fn run(workspace: &Path, command: &str) -> Result<(), String> {
         process.args(["-c", command]);
         process
     };
-    process
-        .current_dir(workspace)
-        .env_clear()
-        .env("PATH", default_path());
-    crate::tool::apply_windows_environment(&mut process);
+    process.current_dir(workspace);
+    crate::tool::apply_sanitized_environment(&mut process);
     let output = process.output().map_err(|error| error.to_string())?;
     if output.status.success() {
         Ok(())
@@ -59,14 +56,6 @@ pub fn run(workspace: &Path, command: &str) -> Result<(), String> {
             output.status,
             String::from_utf8_lossy(&output.stderr)
         ))
-    }
-}
-
-const fn default_path() -> &'static str {
-    if cfg!(windows) {
-        "C:\\Windows\\System32"
-    } else {
-        "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     }
 }
 

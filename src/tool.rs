@@ -364,8 +364,7 @@ impl Workspace {
         };
         process.current_dir(&self.root);
         if !unrestricted {
-            process.env_clear().env("PATH", default_path());
-            apply_windows_environment(&mut process);
+            apply_sanitized_environment(&mut process);
         }
         process
             .stdin(Stdio::null())
@@ -502,14 +501,11 @@ impl Workspace {
 
     fn git_command(path: &Path, arguments: &[&str]) -> Result<std::process::Output, String> {
         let mut process = Command::new("git");
-        process
-            .arg("--no-pager")
-            .args(arguments)
-            .current_dir(path)
-            .env_clear()
-            .env("PATH", default_path())
-            .env("LC_ALL", "C");
-        apply_windows_environment(&mut process);
+        process.arg("--no-pager").args(arguments).current_dir(path);
+        apply_sanitized_environment(&mut process);
+        // Pinned after the allowlist passthrough so output stays parseable
+        // regardless of the launching locale.
+        process.env("LC_ALL", "C");
         process.output().map_err(|error| error.to_string())
     }
 }
@@ -636,6 +632,97 @@ const fn default_path() -> &'static str {
         // by Homebrew must remain discoverable for the search tool.
         "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     }
+}
+
+/// Environment variables passed through to sanitized subprocesses.
+/// Operational variables only: home/temp locations, locale, timezone,
+/// proxies, the ssh agent socket, and toolchain homes — the settings common
+/// developer commands (`git`, `cargo`, `npm`, `pip`, cloud CLIs) need to
+/// behave normally. API keys and other secrets in the launching environment
+/// are deliberately absent: nothing outside this list survives `env_clear`,
+/// so they can never reach an approved command, the model, or a session log.
+const SANITIZED_ENV_ALLOWLIST: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "TMPDIR",
+    "TZ",
+    "TERM",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_RUNTIME_DIR",
+    // The agent socket grants key *use*, not key material; every command
+    // already requires an explicit interactive approval before it runs.
+    "SSH_AUTH_SOCK",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "all_proxy",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "GOPATH",
+    "GOROOT",
+    "JAVA_HOME",
+    // Windows equivalents; absent elsewhere, so passing them is a no-op.
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "ALLUSERSPROFILE",
+    "TEMP",
+    "TMP",
+    "PATHEXT",
+    "SystemDrive",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "CommonProgramFiles",
+    "USERNAME",
+    "windir",
+];
+
+/// Clear the environment, then rebuild it from the fixed sanitized `PATH`
+/// and the operational-variable allowlist. Used for every non-yolo
+/// subprocess so approved commands work normally while environment secrets
+/// stay out of reach.
+pub(crate) fn apply_sanitized_environment(process: &mut Command) {
+    process.env_clear().env("PATH", sanitized_path());
+    for name in SANITIZED_ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(name) {
+            process.env(name, value);
+        }
+    }
+    apply_windows_environment(process);
+}
+
+/// The fixed sanitized `PATH`, extended with the user's `~/.cargo/bin` when
+/// a home directory is known: rustup installs toolchains only there, and a
+/// `cargo` the agent cannot find defeats the point of preserving its
+/// environment.
+fn sanitized_path() -> std::ffi::OsString {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
+    let Some(home) = home else {
+        return default_path().into();
+    };
+    let cargo_bin = Path::new(&home).join(".cargo").join("bin");
+    let base = std::ffi::OsString::from(default_path());
+    std::env::join_paths(std::env::split_paths(&base).chain([cargo_bin]))
+        .unwrap_or_else(|_| default_path().into())
 }
 
 /// After `env_clear`, cmd.exe pipelines and many Windows programs fail
@@ -900,25 +987,49 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unrestricted_commands_inherit_environment_but_regular_commands_do_not() {
+    fn sanitized_commands_keep_operational_variables_but_not_the_rest() {
         let root = temporary_workspace();
         let workspace = Workspace::new(root.clone());
+        // HOME is on the allowlist: git identity, cargo, and npm need it.
         assert_eq!(
             workspace
                 .run_command("printf %s \"${HOME-unset}\"")
                 .expect("sanitized command"),
+            std::env::var("HOME").expect("test runs with HOME set")
+        );
+        // CARGO_PKG_NAME is set by the cargo test harness but is not on the
+        // allowlist; anything off the list must never reach the child.
+        assert_eq!(
+            workspace
+                .run_command("printf %s \"${CARGO_PKG_NAME-unset}\"")
+                .expect("sanitized command"),
             "unset"
         );
-        assert_ne!(
+        assert_eq!(
             workspace
                 .run_command_with_access(
-                    "printf %s \"${HOME-unset}\"",
+                    "printf %s \"${CARGO_PKG_NAME-unset}\"",
                     true,
                     Duration::from_secs(DEFAULT_COMMAND_TIMEOUT_SECS),
                 )
                 .expect("yolo command"),
-            "unset"
+            "junebug-cli",
+            "yolo commands inherit the full launching environment"
         );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sanitized_git_sees_the_users_global_configuration() {
+        let root = temporary_workspace();
+        let workspace = Workspace::new(root.clone());
+        // `git config --global` resolves through HOME; before the allowlist
+        // this failed or reported nothing under an emptied environment.
+        // The command must at least run without an environment error even
+        // when the host has no global config (empty output, exit 0 or 1).
+        let result = workspace.run_command("git config --global --get user.name || true");
+        assert!(result.is_ok(), "got: {result:?}");
         fs::remove_dir_all(root).expect("cleanup");
     }
 
