@@ -172,6 +172,10 @@ impl ProviderKind {
 
 fn normalize_base_url(value: &str) -> String {
     let value = value.trim().trim_end_matches('/');
+    // Endpoints append `/v1/...`, and OpenAI-compatible servers (LM Studio,
+    // vLLM, llama.cpp) commonly display their base as `.../v1`; accept
+    // either spelling instead of producing `/v1/v1/chat/completions`.
+    let value = value.strip_suffix("/v1").unwrap_or(value).trim_end_matches('/');
     if value.starts_with("http://") || value.starts_with("https://") {
         value.to_owned()
     } else {
@@ -946,8 +950,8 @@ fn parse_sse(reader: impl BufRead, cancel: &AtomicBool) -> Result<ModelTurn, Str
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderKind, anthropic_messages, env_file_value, openai_request_messages,
-        parse_anthropic_sse, parse_sse, store_credential_at,
+        ProviderKind, anthropic_messages, env_file_value, normalize_base_url,
+        openai_request_messages, parse_anthropic_sse, parse_sse, store_credential_at,
     };
     use serde_json::json;
     use std::io::Cursor;
@@ -970,6 +974,33 @@ mod tests {
         assert!(!ProviderKind::LocalOpenAi.requires_api_key());
         assert_eq!(ProviderKind::Ollama.default_model(), "qwen3:8b");
         assert!(ProviderKind::parse("fake").is_err());
+    }
+
+    #[test]
+    fn base_url_normalization_accepts_v1_and_slash_variants() {
+        // Local OpenAI-compatible servers advertise their endpoint with and
+        // without `/v1`; every spelling must yield the same origin so the
+        // appended `/v1/chat/completions` never doubles up.
+        for raw in [
+            "localhost:1234",
+            "http://localhost:1234",
+            "http://localhost:1234/",
+            "http://localhost:1234/v1",
+            "http://localhost:1234/v1/",
+            " http://localhost:1234/v1 ",
+        ] {
+            assert_eq!(normalize_base_url(raw), "http://localhost:1234", "{raw:?}");
+        }
+        // A nested API base keeps its prefix: re-appending `/v1` restores it.
+        assert_eq!(
+            normalize_base_url("https://gateway.example/api/v1"),
+            "https://gateway.example/api"
+        );
+        // `/v1` only strips as a whole path segment.
+        assert_eq!(
+            normalize_base_url("http://host/model-v1"),
+            "http://host/model-v1"
+        );
     }
 
     #[test]
