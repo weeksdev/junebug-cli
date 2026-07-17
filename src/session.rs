@@ -3,9 +3,14 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
+
+/// Distinguishes sessions created in the same millisecond by one process
+/// (e.g. concurrent swarm workers).
+static SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub struct SessionWriter {
     path: PathBuf,
@@ -14,7 +19,8 @@ pub struct SessionWriter {
 impl SessionWriter {
     /// # Errors
     ///
-    /// Returns an error when the local session directory cannot be created.
+    /// Returns an error when the local session directory or a unique session
+    /// file cannot be created.
     pub fn create(workspace: &Path) -> Result<Self, String> {
         let directory = workspace.join(".junebug").join("sessions");
         fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
@@ -22,9 +28,26 @@ impl SessionWriter {
             .duration_since(UNIX_EPOCH)
             .map_err(|error| error.to_string())?
             .as_millis();
-        Ok(Self {
-            path: directory.join(format!("{millis}.jsonl")),
-        })
+        let pid = std::process::id();
+        // Timestamp + pid + sequence is unique across concurrent processes
+        // and rapid creation within one; `create_new` closes what remains
+        // (pid reuse, clock skew) by refusing to adopt an existing file, so
+        // two sessions can never interleave into one log.
+        let mut last_error = String::new();
+        for _ in 0..16 {
+            let sequence = SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = directory.join(format!("{millis}-{pid}-{sequence}.jsonl"));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    last_error = error.to_string();
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err(format!(
+            "could not create a unique session file: {last_error}"
+        ))
     }
 
     /// # Errors
@@ -460,6 +483,46 @@ mod tests {
             list_sessions(&root).expect("list").is_empty(),
             "multi-agent swarm audit histories are not resumable conversations"
         );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn concurrent_session_creation_never_reuses_a_path() {
+        let root = std::env::temp_dir().join(format!(
+            "junebug-session-unique-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("directory");
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    (0..32)
+                        .map(|_| {
+                            SessionWriter::create(&root)
+                                .expect("session")
+                                .path()
+                                .to_path_buf()
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        for handle in handles {
+            for path in handle.join().expect("thread") {
+                assert!(
+                    seen.insert(path.clone()),
+                    "duplicate session path: {}",
+                    path.display()
+                );
+                assert!(path.is_file(), "session file must exist on creation");
+            }
+        }
+        assert_eq!(seen.len(), 256);
         fs::remove_dir_all(root).expect("cleanup");
     }
 
