@@ -750,6 +750,22 @@ fn repl(
         );
     }
     let mut editor = Editor::new(root.to_path_buf());
+    // User-defined prompt templates: `.junebug/commands/<name>.md` becomes
+    // `/<name>`; builtins win a name collision.
+    let custom_commands = junebug_cli::commands::load(root);
+    if !custom_commands.is_empty() {
+        editor.set_custom_commands(
+            custom_commands
+                .iter()
+                .map(|command| (format!("/{}", command.name), command.description.clone()))
+                .collect(),
+        );
+        eprintln!(
+            "{DIM}{} custom command{} loaded from .junebug/commands{RESET}",
+            custom_commands.len(),
+            if custom_commands.len() == 1 { "" } else { "s" }
+        );
+    }
     // Permission can change mid-session via /permissions; plan mode is fixed
     // for the run and keeps a hard read-only guard on top of any mode.
     let permission_state = PermissionState::new(args.permission);
@@ -771,6 +787,9 @@ fn repl(
         if input.is_empty() {
             continue;
         }
+        // A custom slash command expands into a regular prompt and falls
+        // through to the turn below; every builtin ends with `continue`.
+        let mut custom_prompt: Option<String> = None;
         if let Some(command) = input.strip_prefix('/') {
             let (name, argument) = command
                 .split_once(' ')
@@ -778,7 +797,7 @@ fn repl(
             match name {
                 "exit" | "quit" => break,
                 "help" => eprintln!(
-                    "{BOLD}/keys{RESET}          set or replace a provider API key (input hidden)\n{BOLD}/model{RESET}         pick or switch the model (↑/↓, enter)\n{BOLD}/permissions{RESET}   change what Junebug may do without asking\n{BOLD}/rewind{RESET}        restore workspace files to an earlier checkpoint\n{BOLD}/swarm-setup{RESET}   assign models to swarm roles (boss/worker/checker)\n{BOLD}/swarm{RESET} GOAL    run a boss/worker/checker model swarm on a goal\n{BOLD}/swarm resume{RESET}  continue an aborted or paused swarm where it left off\n{BOLD}/swarm-status{RESET}  progress readout of the saved swarm; add {BOLD}ai{RESET} for a model summary\n{BOLD}/compact{RESET}       summarize the conversation to free context\n{BOLD}/status{RESET}        provider, model, permissions, session\n{BOLD}/changes{RESET}       browse changed files and per-file diffs\n{BOLD}/explorer{RESET}      browse and search workspace files; e opens $EDITOR\n{BOLD}/diff{RESET}          print the uncommitted Git diff\n{BOLD}/exit{RESET}          quit (Ctrl-D also works)\n\n{DIM}⇧tab cycles permissions while typing or during a turn · @path attaches a file · esc interrupts{RESET}"
+                    "{BOLD}/keys{RESET}          set or replace a provider API key (input hidden)\n{BOLD}/model{RESET}         pick or switch the model (↑/↓, enter)\n{BOLD}/permissions{RESET}   change what Junebug may do without asking\n{BOLD}/rewind{RESET}        restore workspace files to an earlier checkpoint\n{BOLD}/swarm-setup{RESET}   assign models to swarm roles (boss/worker/checker)\n{BOLD}/swarm{RESET} GOAL    run a boss/worker/checker model swarm on a goal\n{BOLD}/swarm resume{RESET}  continue an aborted or paused swarm where it left off\n{BOLD}/swarm-status{RESET}  progress readout of the saved swarm; add {BOLD}ai{RESET} for a model summary\n{BOLD}/compact{RESET}       summarize the conversation to free context\n{BOLD}/status{RESET}        provider, model, permissions, session\n{BOLD}/changes{RESET}       browse changed files and per-file diffs\n{BOLD}/explorer{RESET}      browse and search workspace files; e opens $EDITOR\n{BOLD}/diff{RESET}          print the uncommitted Git diff\n{BOLD}/exit{RESET}          quit (Ctrl-D also works)\n\n{DIM}⇧tab cycles permissions while typing or during a turn · @path attaches a file · esc interrupts\ncustom commands: .junebug/commands/<name>.md becomes /<name> ($ARGUMENTS is replaced){RESET}"
                 ),
                 "status" => eprintln!(
                     "routing={} provider={} model={} band={} switches_this_task={} permission={} plan={} messages={} checkpoints={} session={}",
@@ -878,17 +897,29 @@ fn repl(
                         Err(error) => eprintln!("{DIM} failed: {error}{RESET}"),
                     }
                 }
-                other => eprintln!("unknown command: /{other} (try /help)"),
+                other => {
+                    if let Some(command) =
+                        custom_commands.iter().find(|command| command.name == other)
+                    {
+                        custom_prompt =
+                            Some(junebug_cli::commands::expand(&command.template, argument));
+                    } else {
+                        eprintln!("unknown command: /{other} (try /help)");
+                    }
+                }
             }
-            continue;
+            if custom_prompt.is_none() {
+                continue;
+            }
         }
+        let turn_input = custom_prompt.as_deref().unwrap_or(input);
         let Some(active) = provider.as_ref() else {
             eprintln!("no model yet — use {BOLD}/keys{RESET} or start Ollama first");
             continue;
         };
         let expanded = expand_mentions(
             workspace,
-            input,
+            turn_input,
             PolicyEngine::with_state(permission_state.clone(), args.plan).unrestricted_access(),
         );
         let policy = PolicyEngine::with_state(permission_state.clone(), args.plan);

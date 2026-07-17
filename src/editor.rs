@@ -74,6 +74,9 @@ pub struct Editor {
     /// `[pasted #N +L lines]` placeholders and expanded on submit. Kept for
     /// the whole session so history recall keeps working.
     pastes: Vec<String>,
+    /// User-defined slash commands as (`/name`, description), appended to
+    /// the builtin list in the `/` completion menu.
+    custom_commands: Vec<(String, String)>,
 }
 
 impl Editor {
@@ -84,7 +87,12 @@ impl Editor {
             files: None,
             history: Vec::new(),
             pastes: Vec::new(),
+            custom_commands: Vec::new(),
         }
+    }
+
+    pub fn set_custom_commands(&mut self, commands: Vec<(String, String)>) {
+        self.custom_commands = commands;
     }
 
     /// The placeholder inserted into the input line for paste `index`.
@@ -315,6 +323,15 @@ impl Editor {
                     insert: (*name).to_owned(),
                     label: format!("{name}  {DIM}{description}{RESET}"),
                 })
+                .chain(
+                    self.custom_commands
+                        .iter()
+                        .filter(|(name, _)| name[1..].starts_with(query.as_str()))
+                        .map(|(name, description)| MenuItem {
+                            insert: name.clone(),
+                            label: format!("{name}  {DIM}{description}{RESET}"),
+                        }),
+                )
                 .take(MENU_LIMIT)
                 .collect(),
             CompletionContext::File { query, .. } => {

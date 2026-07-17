@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod browser;
 pub mod checkpoint;
+pub mod commands;
 pub mod config;
 pub mod context;
 pub mod diff;
