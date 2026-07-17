@@ -195,20 +195,49 @@ pub fn latest_swarm_log_tail(workspace: &Path, max_chars: usize) -> Option<Strin
             if newest.as_ref().is_some_and(|(when, _)| *when >= modified) {
                 continue;
             }
-            let Ok(head) = fs::read_to_string(&path) else {
-                continue;
-            };
-            if head.contains("\"swarm_goal\"") {
+            if contains_swarm_goal(&path) {
                 newest = Some((modified, path));
             }
         }
     }
     let (_, path) = newest?;
-    let contents = fs::read_to_string(path).ok()?;
-    let count = contents.chars().count();
+    read_tail_chars(&path, max_chars)
+}
+
+/// Whether a session log records a `swarm_goal` event. Scans line by line
+/// and stops at the first hit — the goal is recorded when a swarm starts,
+/// so for swarm logs this touches only the head of the file instead of
+/// loading multi-megabyte histories whole.
+fn contains_swarm_goal(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .any(|line| line.contains("\"swarm_goal\""))
+}
+
+/// The last `max_chars` characters of a file, read via `seek` so only the
+/// tail is loaded. A UTF-8 character is at most 4 bytes, so the tail lives
+/// within the last `4 * max_chars` bytes; torn continuation bytes at the
+/// seek point are dropped so the text decodes cleanly.
+fn read_tail_chars(path: &Path, max_chars: usize) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub((max_chars as u64).saturating_mul(4));
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let boundary = bytes
+        .iter()
+        .position(|byte| byte & 0b1100_0000 != 0b1000_0000)
+        .unwrap_or(bytes.len());
+    let text = String::from_utf8_lossy(&bytes[boundary..]);
+    let count = text.chars().count();
     Some(
-        contents
-            .chars()
+        text.chars()
             .skip(count.saturating_sub(max_chars))
             .collect(),
     )
@@ -316,7 +345,9 @@ pub fn load_messages(path: &Path) -> Result<Vec<Value>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionWriter, last_model, list_sessions, load_messages};
+    use super::{
+        SessionWriter, last_model, latest_swarm_log_tail, list_sessions, load_messages,
+    };
     use serde_json::json;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -483,6 +514,83 @@ mod tests {
             list_sessions(&root).expect("list").is_empty(),
             "multi-agent swarm audit histories are not resumable conversations"
         );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn swarm_log_tail_picks_the_newest_swarm_log_and_returns_only_the_tail() {
+        let root = std::env::temp_dir().join(format!(
+            "junebug-swarm-tail-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("directory");
+        assert!(
+            latest_swarm_log_tail(&root, 100).is_none(),
+            "no sessions yet"
+        );
+
+        let plain = SessionWriter::create(&root).expect("plain session");
+        plain.record("user_prompt", "not a swarm").expect("prompt");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let older_swarm = SessionWriter::create(&root).expect("older swarm");
+        older_swarm
+            .record("swarm_goal", "older goal")
+            .expect("goal");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let newer_swarm = SessionWriter::create(&root).expect("newer swarm");
+        newer_swarm
+            .record("swarm_goal", "newer goal")
+            .expect("goal");
+        for index in 0..200 {
+            newer_swarm
+                .record("worker_output", &format!("progress line {index}"))
+                .expect("event");
+        }
+
+        let tail = latest_swarm_log_tail(&root, 120).expect("tail");
+        assert!(tail.chars().count() <= 120);
+        assert!(
+            tail.contains("progress line 199"),
+            "must end with the newest swarm log's last events: {tail}"
+        );
+        assert!(
+            !tail.contains("older goal") && !tail.contains("not a swarm"),
+            "must come from the newest swarm log only: {tail}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn swarm_log_tail_repairs_utf8_at_the_seek_boundary() {
+        let root = std::env::temp_dir().join(format!(
+            "junebug-swarm-utf8-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("directory");
+        let session = SessionWriter::create(&root).expect("session");
+        session.record("swarm_goal", "goal").expect("goal");
+        // Multi-byte characters make it likely that a byte-offset seek lands
+        // inside a character; the tail must still decode without panics or
+        // replacement characters.
+        session
+            .record("worker_output", &"éü漢🦀".repeat(2000))
+            .expect("event");
+
+        let tail = latest_swarm_log_tail(&root, 50).expect("tail");
+        assert_eq!(tail.chars().count(), 50);
+        assert!(
+            !tail.contains('\u{FFFD}'),
+            "torn boundary bytes must be dropped, not decoded lossily: {tail}"
+        );
+        assert!(tail.contains('🦀'));
         fs::remove_dir_all(root).expect("cleanup");
     }
 
