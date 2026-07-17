@@ -56,6 +56,7 @@ const MAGENTA: &str = "\x1b[35m";
 const CLEAR_LINE: &str = "\r\x1b[2K";
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+#[derive(Debug)]
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
     prompt: String,
@@ -161,26 +162,21 @@ fn parse_args(arguments: Vec<String>) -> Result<Option<Args>, String> {
                 )?;
             }
             "--no-project-instructions" => project_instructions = false,
-            "--resume" => {
-                // Consume the next token only when it names an existing
-                // session file; otherwise --resume opens the session picker
-                // and the token (if any) stays available as the prompt.
-                match arguments.get(index + 1) {
-                    Some(next) if Path::new(next).is_file() => {
-                        index += 1;
-                        resume = Some(PathBuf::from(next));
-                    }
-                    _ => resume_pick = true,
+            "--resume" => match parse_resume_value(&arguments, index)? {
+                Some(path) => {
+                    index += 1;
+                    resume = Some(path);
                 }
-            }
+                None => resume_pick = true,
+            },
             "--resume-compact" => {
                 resume_compact = true;
-                match arguments.get(index + 1) {
-                    Some(next) if Path::new(next).is_file() => {
+                match parse_resume_value(&arguments, index)? {
+                    Some(path) => {
                         index += 1;
-                        resume = Some(PathBuf::from(next));
+                        resume = Some(path);
                     }
-                    _ => resume_pick = true,
+                    None => resume_pick = true,
                 }
             }
             "--max-context-chars" => {
@@ -267,6 +263,25 @@ fn handle_set(args: &mut Args) -> bool {
 
 fn parse_permission(value: &str) -> Result<PermissionMode, String> {
     PermissionMode::parse(value).map_err(|error| format!("--permission {error}"))
+}
+
+/// The session path following `--resume`/`--resume-compact` at `index`, or
+/// `None` when the flag is bare (next token absent or another flag) and the
+/// picker should open. A given path must name an existing session file:
+/// silently reinterpreting a typo'd or deleted path as prompt text sent the
+/// model on unintended work.
+fn parse_resume_value(arguments: &[String], index: usize) -> Result<Option<PathBuf>, String> {
+    match arguments.get(index + 1) {
+        Some(next) if !next.starts_with('-') => {
+            let path = PathBuf::from(next);
+            if path.is_file() {
+                Ok(Some(path))
+            } else {
+                Err(format!("session does not exist: {}", path.display()))
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Resolve which provider to use: the explicit `--provider`, else the one
@@ -2713,7 +2728,7 @@ fn tool_schemas(plan: bool) -> Vec<Value> {
 
 fn print_help() {
     println!(
-        "Junebug CLI {VERSION}\n\nUSAGE:\n  junebug [OPTIONS] [prompt]     interactive REPL when prompt is omitted\n  junebug exec --json [OPTIONS] <prompt>\n  junebug set --provider NAME API_KEY   save the key to ~/.junebug/credentials.env, then start the REPL\n\nOPTIONS:\n  --provider openrouter|openai|deepseek|anthropic|ollama|local-openai\n  --model MODEL|auto\n  --permission read-only|ask|workspace-write|yolo   (default read-only)\n  --plan                        hard read-only guard regardless of --permission\n  --resume [SESSION]            continue a session; with no path, pick from a list\n  --resume-compact [SESSION]    like --resume but summarizes large histories first\n  --max-context-chars COUNT\n  --no-project-instructions\n  --no-checkpoints              disable automatic workspace snapshots (/rewind)\n  --enable-hooks / --enable-mcp\n\nREPL: /help /model /permissions /rewind /compact /status /changes /explorer /diff /exit — esc interrupts a running turn.\n\nPROVIDERS:\n  OPENROUTER_API_KEY   provider=openrouter\n  OPENAI_API_KEY       provider=openai\n  DEEPSEEK_API_KEY     provider=deepseek\n  ANTHROPIC_API_KEY    provider=anthropic (Claude)\n  OLLAMA_HOST          provider=ollama (optional; defaults to http://127.0.0.1:11434)\n  LOCAL_OPENAI_BASE_URL provider=local-openai (LM Studio, vLLM, llama.cpp)\n  LOCAL_OPENAI_API_KEY  optional bearer token for local-openai\n\nRepository hooks and MCP servers are disabled unless explicitly enabled."
+        "Junebug CLI {VERSION}\n\nUSAGE:\n  junebug [OPTIONS] [prompt]     interactive REPL when prompt is omitted\n  junebug exec --json [OPTIONS] <prompt>\n  junebug set --provider NAME API_KEY   save the key to ~/.junebug/credentials.env, then start the REPL\n\nOPTIONS:\n  --provider openrouter|openai|deepseek|anthropic|ollama|local-openai\n  --model MODEL|auto\n  --permission read-only|ask|workspace-write|yolo   (default read-only)\n  --plan                        hard read-only guard regardless of --permission\n  --resume [SESSION]            continue a session (the path must exist); with no path, pick from a list\n  --resume-compact [SESSION]    like --resume but summarizes large histories first\n  --max-context-chars COUNT\n  --no-project-instructions\n  --no-checkpoints              disable automatic workspace snapshots (/rewind)\n  --enable-hooks / --enable-mcp\n\nREPL: /help /model /permissions /rewind /compact /status /changes /explorer /diff /exit — esc interrupts a running turn.\n\nPROVIDERS:\n  OPENROUTER_API_KEY   provider=openrouter\n  OPENAI_API_KEY       provider=openai\n  DEEPSEEK_API_KEY     provider=deepseek\n  ANTHROPIC_API_KEY    provider=anthropic (Claude)\n  OLLAMA_HOST          provider=ollama (optional; defaults to http://127.0.0.1:11434)\n  LOCAL_OPENAI_BASE_URL provider=local-openai (LM Studio, vLLM, llama.cpp)\n  LOCAL_OPENAI_API_KEY  optional bearer token for local-openai\n\nRepository hooks and MCP servers are disabled unless explicitly enabled."
     );
 }
 
@@ -2725,4 +2740,74 @@ fn exit_argument_error(error: &str) -> ! {
 fn exit_runtime_error(error: &str) -> ! {
     eprintln!("error: {error}");
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_args;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|item| (*item).to_owned()).collect()
+    }
+
+    #[test]
+    fn resume_with_a_missing_path_is_an_error_not_a_prompt() {
+        let error = parse_args(args(&["--resume", "no-such-session.jsonl", "do work"]))
+            .expect_err("a nonexistent session path must fail loudly");
+        assert!(
+            error.contains("session does not exist"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn resume_with_an_existing_file_takes_the_path_out_of_the_prompt() {
+        let path = std::env::temp_dir().join(format!(
+            "junebug-resume-arg-{}.jsonl",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::write(&path, "{}\n").expect("session file");
+        let path_text = path.to_string_lossy().into_owned();
+
+        let parsed = parse_args(args(&["--resume", &path_text, "continue"]))
+            .expect("parse")
+            .expect("args");
+        assert_eq!(parsed.resume.as_deref(), Some(path.as_path()));
+        assert!(!parsed.resume_pick);
+        assert_eq!(parsed.prompt, "continue");
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn bare_resume_opens_the_picker() {
+        let parsed = parse_args(args(&["--resume"])).expect("parse").expect("args");
+        assert!(parsed.resume.is_none());
+        assert!(parsed.resume_pick);
+
+        // A following flag also means "bare": the flag is not a path.
+        let parsed = parse_args(args(&["--resume", "--permission", "yolo"]))
+            .expect("parse")
+            .expect("args");
+        assert!(parsed.resume.is_none());
+        assert!(parsed.resume_pick);
+    }
+
+    #[test]
+    fn resume_compact_validates_its_path_the_same_way() {
+        let error = parse_args(args(&["--resume-compact", "gone.jsonl"]))
+            .expect_err("a nonexistent session path must fail loudly");
+        assert!(error.contains("session does not exist"), "got: {error}");
+
+        let parsed = parse_args(args(&["--resume-compact"]))
+            .expect("parse")
+            .expect("args");
+        assert!(parsed.resume_compact);
+        assert!(parsed.resume_pick);
+    }
 }
