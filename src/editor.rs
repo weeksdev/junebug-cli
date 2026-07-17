@@ -151,6 +151,9 @@ impl Editor {
         let mut selected = 0usize;
         let mut history_index: Option<usize> = None;
         let mut draft: Vec<char> = Vec::new();
+        // Which wrapped row of the input block the cursor rests on; redraws
+        // must climb back to the prompt row before clearing.
+        let mut cursor_row = 0usize;
         loop {
             let text: String = buffer.iter().collect();
             let context = completion_context(&buffer, cursor);
@@ -158,9 +161,17 @@ impl Editor {
             if selected >= items.len() {
                 selected = 0;
             }
-            draw(&text, cursor, &items, selected, &footer);
+            draw(&text, cursor, &items, selected, &footer, &mut cursor_row);
             let key = match event::read() {
                 Ok(Event::Key(key)) => key,
+                Ok(Event::Resize(..)) => {
+                    // A resize rewraps the scrollback unpredictably; forget
+                    // the row tracking rather than climbing into unrelated
+                    // lines, and let the next draw start from wherever the
+                    // terminal left the cursor.
+                    cursor_row = 0;
+                    continue;
+                }
                 Ok(Event::Paste(pasted)) => {
                     let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
                     let insert = if pasted.contains('\n') {
@@ -187,11 +198,11 @@ impl Editor {
             let control = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
                 KeyCode::Char('c') if control => {
-                    clear_menu_and_break_line(&text, &items);
+                    clear_menu_and_break_line(&text, cursor_row);
                     return Some(String::new());
                 }
                 KeyCode::Char('d') if control && buffer.is_empty() => {
-                    clear_menu_and_break_line(&text, &items);
+                    clear_menu_and_break_line(&text, cursor_row);
                     return None;
                 }
                 KeyCode::Char('a') if control => cursor = 0,
@@ -287,7 +298,7 @@ impl Editor {
                         continue;
                     }
                     let final_text: String = buffer.iter().collect();
-                    clear_menu_and_break_line(&final_text, &items);
+                    clear_menu_and_break_line(&final_text, cursor_row);
                     return Some(final_text.trim().to_owned());
                 }
                 _ => {}
@@ -392,46 +403,140 @@ fn would_change(_buffer: &[char], context: &CompletionContext, item: &MenuItem) 
     }
 }
 
-fn draw(text: &str, cursor: usize, items: &[MenuItem], selected: usize, footer: &str) {
+/// Where the input cursor sits inside the wrapped `❯ text` block. Rows are
+/// 0-based from the prompt row; `cursor_column` is a 1-based terminal
+/// column. Terminals wrap the line every `width` display columns, so redraw
+/// and cursor moves must be row-aware: a single-row `\r` + clear-below left
+/// one stale duplicate of the prompt line behind per keystroke once the
+/// input wrapped past the terminal width.
+struct InputLayout {
+    cursor_row: usize,
+    cursor_column: usize,
+    last_row: usize,
+}
+
+fn input_layout(text: &str, cursor: usize, width: usize) -> InputLayout {
+    let width = width.max(usize::from(PROMPT_COLUMNS) + 1);
+    let mut columns_before_cursor = usize::from(PROMPT_COLUMNS);
+    let mut total_columns = usize::from(PROMPT_COLUMNS);
+    for (index, character) in text.chars().enumerate() {
+        let columns = crate::browser::char_columns(character);
+        if index < cursor {
+            columns_before_cursor += columns;
+        }
+        total_columns += columns;
+    }
+    let last_row = (total_columns - 1) / width;
+    let row = columns_before_cursor / width;
+    if row > last_row {
+        // The text exactly fills its final row and the cursor is at its
+        // end: the terminal defers the wrap until the next character, so
+        // the cursor physically rests on the last row's final column.
+        InputLayout {
+            cursor_row: last_row,
+            cursor_column: width,
+            last_row,
+        }
+    } else {
+        InputLayout {
+            cursor_row: row,
+            cursor_column: columns_before_cursor % width + 1,
+            last_row,
+        }
+    }
+}
+
+/// Truncate `line` to at most `width` display columns, passing ANSI escape
+/// sequences through uncounted. Menu and footer rows must never wrap: the
+/// redraw math counts each as exactly one terminal row.
+fn clip_columns(line: &str, width: usize) -> String {
+    let mut output = String::new();
+    let mut used = 0usize;
+    let mut characters = line.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\x1b' {
+            output.push(character);
+            for follow in characters.by_ref() {
+                output.push(follow);
+                if follow.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        let columns = crate::browser::char_columns(character);
+        if used + columns > width {
+            break;
+        }
+        used += columns;
+        output.push(character);
+    }
+    output
+}
+
+fn terminal_width() -> usize {
+    terminal::size().map_or(80, |(columns, _)| usize::from(columns).max(1))
+}
+
+fn draw(
+    text: &str,
+    cursor: usize,
+    items: &[MenuItem],
+    selected: usize,
+    footer: &str,
+    cursor_row: &mut usize,
+) {
     use std::fmt::Write as _;
-    let mut output = String::from("\r\x1b[J\x1b[1;36m❯\x1b[0m ");
+    let width = terminal_width();
+    let mut output = String::new();
+    // Climb from the cursor's wrapped row back to the prompt row before
+    // clearing; `\x1b[J` from a lower row would leave the rows above intact.
+    if *cursor_row > 0 {
+        let _ = write!(output, "\x1b[{}A", *cursor_row);
+    }
+    output.push_str("\r\x1b[J\x1b[1;36m❯\x1b[0m ");
     output.push_str(text);
     // Rows drawn below the input that the cursor must be moved back up over.
+    // Each is clipped to one terminal row so the count stays exact.
+    let clip_width = width.saturating_sub(1);
     let mut rows_below = 0usize;
     if items.is_empty() {
         // No completion menu: show the persistent footer hint, if any.
         if !footer.is_empty() {
-            let _ = write!(output, "\r\n{DIM}{footer}{RESET}");
+            let _ = write!(
+                output,
+                "\r\n{DIM}{}{RESET}",
+                clip_columns(footer, clip_width)
+            );
             rows_below = 1;
         }
     } else {
         for (index, item) in items.iter().enumerate() {
-            output.push_str("\r\n");
-            if index == selected {
-                output.push_str(INVERSE);
-            } else {
-                output.push_str(DIM);
-            }
-            output.push_str("  ");
-            output.push_str(&item.label);
-            output.push_str(RESET);
+            let style = if index == selected { INVERSE } else { DIM };
+            let row = clip_columns(&format!("{style}  {}", item.label), clip_width);
+            let _ = write!(output, "\r\n{row}{RESET}");
         }
         rows_below = items.len();
     }
-    if rows_below > 0 {
-        let _ = write!(output, "\x1b[{rows_below}A");
+    let layout = input_layout(text, cursor, width);
+    let up = rows_below + layout.last_row - layout.cursor_row;
+    if up > 0 {
+        let _ = write!(output, "\x1b[{up}A");
     }
-    let column = u16::try_from(cursor)
-        .unwrap_or(u16::MAX)
-        .saturating_add(PROMPT_COLUMNS + 1);
-    let _ = write!(output, "\r\x1b[{column}G");
+    let _ = write!(output, "\x1b[{}G", layout.cursor_column);
+    *cursor_row = layout.cursor_row;
     eprint!("{output}");
     let _ = io::stderr().flush();
 }
 
-fn clear_menu_and_break_line(text: &str, items: &[MenuItem]) {
-    let _ = items;
-    eprint!("\r\x1b[J\x1b[1;36m❯\x1b[0m {text}\r\n");
+fn clear_menu_and_break_line(text: &str, cursor_row: usize) {
+    use std::fmt::Write as _;
+    let mut output = String::new();
+    if cursor_row > 0 {
+        let _ = write!(output, "\x1b[{cursor_row}A");
+    }
+    let _ = write!(output, "\r\x1b[J\x1b[1;36m❯\x1b[0m {text}\r\n");
+    eprint!("{output}");
     let _ = io::stderr().flush();
 }
 
@@ -632,12 +737,55 @@ fn filter_files(files: &[String], query: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Choice, CompletionContext, Editor, completion_context, filter_files, next_selectable,
-        select_window,
+        Choice, CompletionContext, Editor, clip_columns, completion_context, filter_files,
+        input_layout, next_selectable, select_window,
     };
 
     fn chars(text: &str) -> Vec<char> {
         text.chars().collect()
+    }
+
+    #[test]
+    fn wrapped_input_layout_places_the_cursor_row_aware() {
+        // Fits on one row: row 0, column = prompt(2) + cursor + 1.
+        let layout = input_layout("hello", 2, 80);
+        assert_eq!(
+            (layout.cursor_row, layout.cursor_column, layout.last_row),
+            (0, 5, 0)
+        );
+        // 100 chars at width 40: 102 total columns spread over rows 0..=2.
+        let text = "x".repeat(100);
+        let layout = input_layout(&text, 100, 40);
+        assert_eq!(
+            (layout.cursor_row, layout.cursor_column, layout.last_row),
+            (2, 23, 2)
+        );
+        let layout = input_layout(&text, 0, 40);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (0, 3));
+        // Text exactly filling two rows: the terminal defers the wrap, so
+        // the end-of-line cursor rests on the last row's final column.
+        let text = "y".repeat(78);
+        let layout = input_layout(&text, 78, 40);
+        assert_eq!(
+            (layout.cursor_row, layout.cursor_column, layout.last_row),
+            (1, 40, 1)
+        );
+        // Wide characters weigh two display columns.
+        let layout = input_layout("漢漢漢", 3, 8);
+        assert_eq!(
+            (layout.cursor_row, layout.cursor_column, layout.last_row),
+            (0, 8, 0)
+        );
+    }
+
+    #[test]
+    fn menu_and_footer_rows_clip_to_one_terminal_row() {
+        assert_eq!(clip_columns("short", 10), "short");
+        assert_eq!(clip_columns("abcdefghij", 4), "abcd");
+        // ANSI escape sequences pass through without counting as columns.
+        assert_eq!(clip_columns("\x1b[2mabcdef\x1b[0m", 3), "\x1b[2mabc");
+        // Wide characters weigh two columns, so only two fit in four.
+        assert_eq!(clip_columns("漢漢漢", 4), "漢漢");
     }
 
     #[test]

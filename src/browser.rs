@@ -814,7 +814,7 @@ fn color_diff(original: &str, fitted: &str) -> String {
 /// marks/joiners/variation selectors across none; counting `chars()` as one
 /// column each made such lines overflow their pane and wrap into the tree
 /// column. Range table, not a Unicode library — pragmatic, like `sanitize`.
-const fn char_columns(character: char) -> usize {
+pub(crate) const fn char_columns(character: char) -> usize {
     match character as u32 {
         // Zero width: combining marks, joiners/format controls, variation
         // selectors (VS16 turns the preceding character into emoji).
