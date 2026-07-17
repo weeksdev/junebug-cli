@@ -20,6 +20,68 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// being rewound; `.git/` cannot be tracked anyway; build caches are skipped.
 const EXCLUDES: &str = ".git/\n.junebug/\n.febo/\n.env\n.env.*\ntarget/\nnode_modules/\n";
 
+/// Stable workspace identity: FNV-1a 64 over the canonical path's UTF-8
+/// bytes, lowercased on Windows so differently cased spellings of one
+/// directory share a store. `DefaultHasher` is explicitly not guaranteed
+/// stable across Rust releases, and a changed hash would silently orphan a
+/// workspace's rewind history.
+fn stable_workspace_id(identity: &Path) -> String {
+    let text = identity.to_string_lossy();
+    let text = if cfg!(windows) {
+        text.to_lowercase()
+    } else {
+        text.into_owned()
+    };
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// The pre-0.6 identity, kept only to find shadow repos created by older
+/// releases; if the running std's `DefaultHasher` ever changes, the lookup
+/// simply misses and the workspace starts a fresh (stable) store.
+fn legacy_workspace_id(identity: &Path) -> String {
+    let mut hasher = DefaultHasher::new();
+    identity.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// `canonicalize` on Windows returns verbatim paths (`\\?\C:\…`) that some
+/// git builds mishandle; strip the prefix for the plain drive form.
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    if cfg!(windows) {
+        let text = path.to_string_lossy();
+        if let Some(stripped) = text.strip_prefix(r"\\?\")
+            && !stripped.starts_with("UNC")
+        {
+            return PathBuf::from(stripped);
+        }
+    }
+    path
+}
+
+/// Pick the shadow-repo directory for a workspace: an existing store under
+/// the stable id wins, else an existing store under the legacy id (Junebug
+/// first, then the pre-rename Febo location), else a fresh stable-id path.
+fn resolve_git_dir(home: &Path, stable_id: &str, legacy_id: &str) -> PathBuf {
+    let stable = home.join(".junebug").join("checkpoints").join(stable_id);
+    if stable.join("HEAD").exists() {
+        return stable;
+    }
+    for legacy in [
+        home.join(".junebug").join("checkpoints").join(legacy_id),
+        home.join(".febo").join("checkpoints").join(legacy_id),
+    ] {
+        if legacy.join("HEAD").exists() {
+            return legacy;
+        }
+    }
+    stable
+}
+
 #[derive(Debug, Clone)]
 pub struct Checkpoint {
     pub tag: String,
@@ -46,25 +108,19 @@ impl Checkpointer {
     pub fn new(workspace: &Path) -> Result<Self, String> {
         let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
             .ok_or("cannot locate a home directory")?;
-        // Canonicalize only for the identity hash so `.` and the absolute
-        // path map to the same shadow repo; keep the original path for Git.
-        let identity = workspace
+        // Canonicalize so `.`, the absolute path, and a symlinked spelling
+        // of the workspace all share one shadow repo — and run Git against
+        // that same canonical path, so identity and operations can't drift.
+        let canonical = workspace
             .canonicalize()
             .unwrap_or_else(|_| workspace.to_path_buf());
-        let mut hasher = DefaultHasher::new();
-        identity.hash(&mut hasher);
-        let home = PathBuf::from(home);
-        let suffix = format!("{:016x}", hasher.finish());
-        let current = home.join(".junebug").join("checkpoints").join(&suffix);
-        let legacy = home.join(".febo").join("checkpoints").join(suffix);
-        // Existing workspaces keep using their old shadow repo so `/rewind`
-        // history survives the product rename. New workspaces use Junebug.
-        let git_dir = if current.join("HEAD").exists() || !legacy.join("HEAD").exists() {
-            current
-        } else {
-            legacy
-        };
-        Self::with_git_dir(workspace.to_path_buf(), git_dir)
+        let git_workspace = strip_verbatim_prefix(canonical.clone());
+        let git_dir = resolve_git_dir(
+            &PathBuf::from(home),
+            &stable_workspace_id(&git_workspace),
+            &legacy_workspace_id(&canonical),
+        );
+        Self::with_git_dir(git_workspace, git_dir)
     }
 
     /// Like [`Checkpointer::new`] with an explicit shadow-repo location
@@ -273,6 +329,87 @@ mod tests {
         let checkpointer =
             Checkpointer::with_git_dir(workspace.clone(), base.join("shadow")).expect("init");
         (base, checkpointer)
+    }
+
+    #[test]
+    fn stable_workspace_id_is_a_fixed_function_of_the_path() {
+        // Locked to a precomputed FNV-1a 64 value: if this assertion ever
+        // fails, the identity scheme changed and existing users would lose
+        // their rewind history — add a migration instead.
+        assert_eq!(
+            super::stable_workspace_id(Path::new("/tmp/junebug-stable-id")),
+            "92837eedaf911fe8"
+        );
+    }
+
+    #[test]
+    fn resolve_git_dir_prefers_stable_then_migrates_legacy_stores() {
+        let home = std::env::temp_dir().join(format!(
+            "junebug-checkpoint-resolve-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let stable = home.join(".junebug/checkpoints/stable-id");
+        let legacy_junebug = home.join(".junebug/checkpoints/legacy-id");
+        let legacy_febo = home.join(".febo/checkpoints/legacy-id");
+
+        // A fresh workspace gets the stable location.
+        assert_eq!(
+            super::resolve_git_dir(&home, "stable-id", "legacy-id"),
+            stable
+        );
+
+        // An existing pre-stable store keeps being used (Junebug over Febo).
+        fs::create_dir_all(&legacy_febo).expect("febo dir");
+        fs::write(legacy_febo.join("HEAD"), "ref").expect("febo head");
+        assert_eq!(
+            super::resolve_git_dir(&home, "stable-id", "legacy-id"),
+            legacy_febo
+        );
+        fs::create_dir_all(&legacy_junebug).expect("junebug dir");
+        fs::write(legacy_junebug.join("HEAD"), "ref").expect("junebug head");
+        assert_eq!(
+            super::resolve_git_dir(&home, "stable-id", "legacy-id"),
+            legacy_junebug
+        );
+
+        // Once a stable store exists it wins over every legacy location.
+        fs::create_dir_all(&stable).expect("stable dir");
+        fs::write(stable.join("HEAD"), "ref").expect("stable head");
+        assert_eq!(
+            super::resolve_git_dir(&home, "stable-id", "legacy-id"),
+            stable
+        );
+
+        fs::remove_dir_all(home).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_and_real_workspace_paths_share_one_identity() {
+        let base = std::env::temp_dir().join(format!(
+            "junebug-checkpoint-symlink-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let real = base.join("real");
+        let link = base.join("link");
+        fs::create_dir_all(&real).expect("workspace");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let via_real = real.canonicalize().expect("canonical real");
+        let via_link = link.canonicalize().expect("canonical link");
+        assert_eq!(
+            super::stable_workspace_id(&via_real),
+            super::stable_workspace_id(&via_link),
+            "both spellings must map to the same shadow repo"
+        );
+
+        fs::remove_dir_all(base).expect("cleanup");
     }
 
     #[test]
