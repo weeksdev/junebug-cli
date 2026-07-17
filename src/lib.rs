@@ -18,6 +18,7 @@ pub mod router;
 pub mod session;
 pub mod swarm;
 pub mod tool;
+pub mod websearch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionMode {

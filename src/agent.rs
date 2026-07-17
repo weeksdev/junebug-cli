@@ -360,6 +360,12 @@ fn approval_prompt(
             };
             format!("Junebug requests command execution in the workspace:\n  {command}{warning}")
         }
+        "web_search" => {
+            // The query text leaves the machine; show exactly what is sent
+            // so the approval is informed.
+            let query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
+            format!("Junebug requests a web search (the query is sent to DuckDuckGo):\n  {query}")
+        }
         other => format!("Junebug requests approval to run {other}"),
     }
 }
@@ -450,6 +456,15 @@ pub fn execute_tool(
             }
             "git_status" => workspace.git_status_at(Path::new(path), unrestricted),
             "git_diff" => workspace.git_diff_at(Path::new(path), unrestricted),
+            "web_search" => {
+                let query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
+                let max_results = arguments
+                    .get("max_results")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(crate::websearch::DEFAULT_RESULTS);
+                crate::websearch::web_search(query, max_results)
+            }
             _ => Err(format!("unknown tool: {}", call.name)),
         }
     };
@@ -487,6 +502,41 @@ mod tests {
             &mut [],
         );
         assert!(result.contains("unknown tool"));
+    }
+
+    #[test]
+    fn web_search_is_gated_by_network_policy_before_any_request() {
+        let workspace = Workspace::new(PathBuf::from("."));
+        let request = call("web_search", r#"{"query":"junebug cli"}"#);
+        // Plan mode hard-denies network risk without consulting approval.
+        let policy = PolicyEngine::new(PermissionMode::Yolo, true);
+        let mut approve = |_: &str| panic!("plan mode must never ask for approval");
+        let result = execute_tool(
+            &workspace,
+            &request,
+            &policy,
+            &mut approve,
+            &mut |_: &str| {},
+            &mut [],
+        );
+        assert!(result.contains("denied"), "got: {result}");
+        // Outside yolo the approval prompt shows the outgoing query, and a
+        // declined approval blocks the call before any network activity.
+        let policy = PolicyEngine::new(PermissionMode::WorkspaceWrite, false);
+        let mut approve = |prompt: &str| {
+            assert!(prompt.contains("DuckDuckGo"), "got: {prompt}");
+            assert!(prompt.contains("junebug cli"), "got: {prompt}");
+            false
+        };
+        let result = execute_tool(
+            &workspace,
+            &request,
+            &policy,
+            &mut approve,
+            &mut |_: &str| {},
+            &mut [],
+        );
+        assert!(result.contains("denied"), "got: {result}");
     }
 
     #[test]
