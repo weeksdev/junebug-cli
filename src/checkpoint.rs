@@ -82,6 +82,26 @@ fn resolve_git_dir(home: &Path, stable_id: &str, legacy_id: &str) -> PathBuf {
     stable
 }
 
+/// A directory that merely contains several independent Git repositories is
+/// a repository container, not a useful checkpoint boundary. Snapshotting it
+/// can walk many gigabytes before the first model request and make the REPL
+/// appear frozen. Real Git workspaces remain eligible even when they contain
+/// submodules or nested repositories.
+fn is_repository_container(workspace: &Path) -> bool {
+    if workspace.join(".git").exists() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(workspace) else {
+        return false;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir() && entry.path().join(".git").exists())
+        .take(2)
+        .count()
+        > 1
+}
+
 #[derive(Debug, Clone)]
 pub struct Checkpoint {
     pub tag: String,
@@ -115,6 +135,12 @@ impl Checkpointer {
             .canonicalize()
             .unwrap_or_else(|_| workspace.to_path_buf());
         let git_workspace = strip_verbatim_prefix(canonical.clone());
+        if is_repository_container(&git_workspace) {
+            return Err(format!(
+                "{} contains multiple Git repositories; run Junebug inside one project (checkpoints disabled here)",
+                git_workspace.display()
+            ));
+        }
         let git_dir = resolve_git_dir(
             &PathBuf::from(home),
             &stable_workspace_id(&git_workspace),
@@ -340,6 +366,27 @@ mod tests {
             super::stable_workspace_id(Path::new("/tmp/junebug-stable-id")),
             "92837eedaf911fe8"
         );
+    }
+
+    #[test]
+    fn repository_containers_are_not_checkpointed() {
+        let base = std::env::temp_dir().join(format!(
+            "junebug-checkpoint-container-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(base.join("one/.git")).expect("first repo");
+        assert!(!super::is_repository_container(&base));
+        fs::create_dir_all(base.join("two/.git")).expect("second repo");
+        assert!(super::is_repository_container(&base));
+
+        // A real workspace may legitimately contain nested repositories,
+        // including Git submodules, without being mistaken for a container.
+        fs::create_dir(base.join(".git")).expect("workspace git directory");
+        assert!(!super::is_repository_container(&base));
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
