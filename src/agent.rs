@@ -84,6 +84,9 @@ pub trait TurnObserver {
     /// Line diff of a completed file write. UI-only: it is never added to
     /// the model context.
     fn on_file_diff(&mut self, _path: &str, _diff: &str) {}
+    /// An out-of-band status line (e.g. a retry after a provider error).
+    /// UI-only, like diffs.
+    fn on_notice(&mut self, _text: &str) {}
 }
 
 /// Run the model-driven tool loop until the model stops requesting tools or
@@ -117,6 +120,10 @@ pub fn run_loop(
     let mut input_tokens = 0;
     let mut output_tokens = 0;
     let mut consecutive_tool_failures = 0;
+    // Whole-loop retry budgets, matching the swarm's: transient stream
+    // deaths retry fast, rate limits wait the window out.
+    let mut transient_retries = 0usize;
+    let mut rate_limit_retries = 0usize;
     let mut last_provider = String::new();
     let mut last_model = String::new();
     let mut last_band = None;
@@ -167,10 +174,40 @@ pub fn run_loop(
                 switches += 1;
             }
         }
-        let turn =
-            selection
+        let turn = loop {
+            match selection
                 .provider
-                .stream_turn(selection.model, &request_messages, tools, cancel)?;
+                .stream_turn(selection.model, &request_messages, tools, cancel)
+            {
+                Ok(turn) => break turn,
+                Err(error) => {
+                    // A user interrupt surfaces as a provider error; never
+                    // retry it. Retrying a whole turn is safe: nothing was
+                    // added to `messages` or the session on failure.
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(error);
+                    }
+                    let Some(delay) = crate::swarm::retry_delay(
+                        &error,
+                        &mut transient_retries,
+                        &mut rate_limit_retries,
+                    ) else {
+                        return Err(error);
+                    };
+                    session.record("turn_retry", &format!("retrying in {delay}s: {error}"))?;
+                    observer.on_notice(&format!("provider error — retrying in {delay}s ({error})"));
+                    // Sliced sleep so Esc keeps working during the wait.
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(delay);
+                    while std::time::Instant::now() < deadline {
+                        if cancel.load(Ordering::Relaxed) {
+                            return Err(error);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                }
+            }
+        };
         if turn.tool_calls.is_empty() && !assistant_has_content(&turn.assistant_message) {
             return Err(
                 "provider returned an empty assistant turn; history was left unchanged".to_owned(),

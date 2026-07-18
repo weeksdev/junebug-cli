@@ -678,6 +678,7 @@ enum TurnEvent {
     FileDiff(String),
     ApprovalRequest(String),
     RouteChanged(RouteDecision),
+    Notice(String),
 }
 
 /// Forwards turn activity from the agent worker thread to the UI thread.
@@ -706,6 +707,10 @@ impl TurnObserver for ChannelObserver {
 
     fn on_file_diff(&mut self, _path: &str, diff: &str) {
         let _ = self.events.send(TurnEvent::FileDiff(diff.to_owned()));
+    }
+
+    fn on_notice(&mut self, text: &str) {
+        let _ = self.events.send(TurnEvent::Notice(text.to_owned()));
     }
 }
 
@@ -1449,6 +1454,9 @@ fn run_interactive_turn(
                             decision.route.model, decision.route.provider
                         );
                     }
+                    TurnEvent::Notice(text) => {
+                        eprint!("{YELLOW}⟳ {text}{RESET}{ending}");
+                    }
                 }
             }
             if worker.is_finished() {
@@ -1839,8 +1847,7 @@ fn swarm_agent(
     // side effects, exactly like a rework does). Rate limits get their own
     // budget with waits long enough to outlast the limit window — three
     // roles sharing one API key trip them routinely on long swarms.
-    const TRANSIENT_DELAYS: [u64; 2] = [2, 5];
-    const RATE_LIMIT_DELAYS: [u64; 4] = [15, 30, 60, 60];
+    use junebug_cli::swarm::{RATE_LIMIT_DELAYS, TRANSIENT_DELAYS};
     let mut transient_retries = 0usize;
     let mut rate_limit_retries = 0usize;
     loop {
@@ -1956,6 +1963,9 @@ fn swarm_agent(
                             let _ = answer_tx.send(approved);
                         }
                         TurnEvent::RouteChanged(_) => {}
+                        TurnEvent::Notice(text) => {
+                            eprint!("{YELLOW}⟳ {text}{RESET}{ending}");
+                        }
                     }
                 }
                 if worker.is_finished() {

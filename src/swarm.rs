@@ -285,6 +285,34 @@ pub fn classify_provider_error(error: &str) -> ProviderErrorClass {
     ProviderErrorClass::Fatal
 }
 
+/// Transient errors retry quickly; rate limits wait out the limit window.
+pub const TRANSIENT_DELAYS: [u64; 2] = [2, 5];
+pub const RATE_LIMIT_DELAYS: [u64; 4] = [15, 30, 60, 60];
+
+/// Seconds to wait before retrying a failed provider turn, advancing the
+/// matching per-class retry counter — or `None` when the error is fatal or
+/// that class's budget is exhausted. Shared by swarm agent turns and the
+/// main agent loop so both recover from the same failures the same way.
+pub fn retry_delay(
+    error: &str,
+    transient_retries: &mut usize,
+    rate_limit_retries: &mut usize,
+) -> Option<u64> {
+    match classify_provider_error(error) {
+        ProviderErrorClass::RateLimit if *rate_limit_retries < RATE_LIMIT_DELAYS.len() => {
+            let delay = RATE_LIMIT_DELAYS[*rate_limit_retries];
+            *rate_limit_retries += 1;
+            Some(delay)
+        }
+        ProviderErrorClass::Transient if *transient_retries < TRANSIENT_DELAYS.len() => {
+            let delay = TRANSIENT_DELAYS[*transient_retries];
+            *transient_retries += 1;
+            Some(delay)
+        }
+        _ => None,
+    }
+}
+
 /// The constitution portion of the plan: everything before the task array.
 #[must_use]
 pub fn constitution_of(plan: &str) -> String {
