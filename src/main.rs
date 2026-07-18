@@ -772,13 +772,26 @@ fn repl(
     loop {
         let mut permission = permission_state.get();
         eprintln!();
-        let footer = status_footer(&current_model, routing_auto, permission, args.plan);
+        let context_used = context_percent(messages, args.max_context_chars);
+        let footer = status_footer(
+            &current_model,
+            routing_auto,
+            permission,
+            args.plan,
+            context_used,
+        );
         let mut shift_tab = || {
             if !args.plan {
                 permission = permission_state.cycle();
                 let _ = session.record("permission_changed", permission.as_str());
             }
-            status_footer(&current_model, routing_auto, permission, args.plan)
+            status_footer(
+                &current_model,
+                routing_auto,
+                permission,
+                args.plan,
+                context_used,
+            )
         };
         let Some(line) = editor.read_line_with_shortcut(&footer, Some(&mut shift_tab)) else {
             break;
@@ -917,6 +930,16 @@ fn repl(
             eprintln!("no model yet — use {BOLD}/keys{RESET} or start Ollama first");
             continue;
         };
+        // Summarize proactively near the budget instead of letting the
+        // deterministic char-based compaction silently drop early turns.
+        let used_percent = context_percent(messages, args.max_context_chars);
+        if used_percent >= AUTO_COMPACT_PERCENT && messages.len() > 3 {
+            eprint!("{DIM}context {used_percent}% full — auto-compacting…{RESET}");
+            match compact_history(active, messages, session) {
+                Ok((before, after)) => eprintln!("{DIM} {before} → {after} messages{RESET}"),
+                Err(error) => eprintln!("{DIM} failed: {error}{RESET}"),
+            }
+        }
         let expanded = expand_mentions(
             workspace,
             turn_input,
@@ -952,6 +975,7 @@ fn status_footer(
     routing_auto: bool,
     permission: PermissionMode,
     plan: bool,
+    context_percent: usize,
 ) -> String {
     let (effective, color) = if plan {
         ("plan · read-only", MAGENTA)
@@ -964,14 +988,44 @@ fn status_footer(
         }
     };
     format!(
-        "{color}● {effective}{RESET}{DIM} · {}  ·  ⇧tab permissions  ·  /help",
+        "{color}● {effective}{RESET}{DIM} · {}{}  ·  ⇧tab permissions  ·  /help",
         if routing_auto {
             format!("auto:{model}")
         } else {
             model.to_owned()
-        }
+        },
+        context_gauge(context_percent),
     )
 }
+
+/// The context-usage part of the footer. Hidden while usage is low, dimmed
+/// once visible, and colored as it approaches the compaction threshold so
+/// an imminent auto-compact never comes as a surprise.
+fn context_gauge(percent: usize) -> String {
+    if percent < 25 {
+        return String::new();
+    }
+    let color = if percent >= AUTO_COMPACT_PERCENT {
+        RED
+    } else if percent >= 60 {
+        YELLOW
+    } else {
+        DIM
+    };
+    format!(" · {color}ctx {percent}%{RESET}{DIM}")
+}
+
+/// Serialized history size as a percentage of the context budget.
+fn context_percent(messages: &[Value], max_context_chars: usize) -> usize {
+    junebug_cli::context::serialized_len(messages)
+        .saturating_mul(100)
+        .checked_div(max_context_chars)
+        .unwrap_or(0)
+}
+
+/// Auto-compaction threshold: history beyond this share of the budget is
+/// summarized before the next turn.
+const AUTO_COMPACT_PERCENT: usize = 85;
 
 const fn permission_color(permission: PermissionMode) -> &'static str {
     match permission {
@@ -2834,6 +2888,27 @@ mod tests {
             .expect("args");
         assert!(parsed.resume.is_none());
         assert!(parsed.resume_pick);
+    }
+
+    #[test]
+    fn context_gauge_scales_with_usage() {
+        use super::{context_gauge, context_percent};
+        use serde_json::json;
+        // Low usage stays out of the footer entirely.
+        assert_eq!(context_gauge(10), "");
+        assert!(context_gauge(40).contains("ctx 40%"));
+        assert!(
+            context_gauge(70).contains(super::YELLOW),
+            "warning color as the budget tightens"
+        );
+        assert!(
+            context_gauge(90).contains(super::RED),
+            "alarm at the auto-compact threshold"
+        );
+        let messages = vec![json!({"role":"user","content":"x".repeat(50)})];
+        let percent = context_percent(&messages, 100);
+        assert!(percent > 0, "serialized length must register");
+        assert_eq!(context_percent(&messages, 0), 0, "zero budget cannot panic");
     }
 
     #[test]
