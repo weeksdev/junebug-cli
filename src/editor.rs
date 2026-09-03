@@ -9,15 +9,22 @@ use std::path::{Path, PathBuf};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 
-pub const SLASH_COMMANDS: [(&str, &str); 15] = [
+pub const SLASH_COMMANDS: [(&str, &str); 19] = [
     ("/changes", "browse changed files and per-file diffs"),
+    (
+        "/commits",
+        "browse recent commits; enter opens that commit's changed files",
+    ),
     ("/compact", "summarize the conversation to free context"),
     ("/diff", "show the uncommitted Git diff"),
     ("/exit", "quit (Ctrl-D also works)"),
     ("/explorer", "browse, search, and edit workspace files"),
     ("/help", "show help"),
     ("/keys", "set or replace a provider API key"),
-    ("/model", "pick or switch the model"),
+    (
+        "/model",
+        "pick or switch the model; add a provider to scope the picker",
+    ),
     ("/permissions", "change what Junebug may do without asking"),
     ("/quit", "quit"),
     (
@@ -34,6 +41,18 @@ pub const SLASH_COMMANDS: [(&str, &str); 15] = [
         "progress readout of the saved swarm (add ai for a model summary)",
     ),
     ("/swarm-setup", "assign models to swarm roles"),
+    (
+        "/investigate",
+        "run the abductive-reasoning harness on a question (read-only; works under --plan)",
+    ),
+    (
+        "/investigate-status",
+        "ranked hypotheses and synthesis of a saved investigation",
+    ),
+    (
+        "/investigate-setup",
+        "optionally assign models to investigation roles",
+    ),
 ];
 
 const MENU_LIMIT: usize = 8;
@@ -44,6 +63,21 @@ const PROMPT_COLUMNS: u16 = 2;
 const RESET: &str = "\x1b[0m";
 const DIM: &str = "\x1b[2m";
 const INVERSE: &str = "\x1b[7m";
+const PROMPT: &str = "\x1b[1;36m❯\x1b[0m";
+/// Prompt glyph while a `!` shell escape is being typed — a distinct color
+/// from the normal prompt (and from every permission-mode footer color) so
+/// it's obvious the line will run as a raw command, not go to the model.
+const SHELL_PROMPT: &str = "\x1b[1;32m❯\x1b[0m";
+
+/// The prompt glyph for the current input: green for a `!` shell escape,
+/// cyan otherwise.
+fn prompt_glyph(text: &str) -> &'static str {
+    if text.starts_with('!') {
+        SHELL_PROMPT
+    } else {
+        PROMPT
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MenuItem {
@@ -352,7 +386,7 @@ impl Editor {
 }
 
 fn fallback_read_line() -> Option<String> {
-    eprint!("\x1b[1;36m❯\x1b[0m ");
+    eprint!("{PROMPT} ");
     let mut line = String::new();
     match io::stdin().read_line(&mut line) {
         Ok(0) | Err(_) => None,
@@ -511,7 +545,7 @@ fn draw(
     if *cursor_row > 0 {
         let _ = write!(output, "\x1b[{}A", *cursor_row);
     }
-    output.push_str("\r\x1b[J\x1b[1;36m❯\x1b[0m ");
+    let _ = write!(output, "\r\x1b[J{} ", prompt_glyph(text));
     output.push_str(text);
     // Rows drawn below the input that the cursor must be moved back up over.
     // Each is clipped to one terminal row so the count stays exact.
@@ -552,7 +586,7 @@ fn clear_menu_and_break_line(text: &str, cursor_row: usize) {
     if cursor_row > 0 {
         let _ = write!(output, "\x1b[{cursor_row}A");
     }
-    let _ = write!(output, "\r\x1b[J\x1b[1;36m❯\x1b[0m {text}\r\n");
+    let _ = write!(output, "\r\x1b[J{} {text}\r\n", prompt_glyph(text));
     eprint!("{output}");
     let _ = io::stderr().flush();
 }
@@ -590,7 +624,10 @@ impl Choice {
 
 /// Show an arrow-key selectable menu on the alternate rows below `title` and
 /// return the chosen index, or `None` if the user cancels (Esc/Ctrl-C) or no
-/// terminal is available. `initial` is the pre-highlighted row.
+/// terminal is available. `initial` is the pre-highlighted row. Typing any
+/// other character filters the choices live (case-insensitive substring); a
+/// match on a section heading (see `Choice::section`) reveals its whole
+/// group. Backspace edits the query; Esc clears it before it cancels the menu.
 #[must_use]
 pub fn select_menu(title: &str, choices: &[Choice], initial: usize) -> Option<usize> {
     if choices.is_empty() || choices.iter().all(|choice| !choice.selectable) {
@@ -599,12 +636,14 @@ pub fn select_menu(title: &str, choices: &[Choice], initial: usize) -> Option<us
     if !io::stdin().is_terminal() || terminal::enable_raw_mode().is_err() {
         return None;
     }
+    let mut query = String::new();
+    let mut visible = visible_indices(choices, &query);
     let mut selected = initial.min(choices.len() - 1);
     if !choices[selected].selectable {
-        selected = next_selectable(choices, selected, 1)?;
+        selected = next_selectable(choices, &visible, selected, 1)?;
     }
     let result = loop {
-        draw_select(title, choices, selected);
+        draw_select(title, choices, selected, &query, &visible);
         let Ok(Event::Key(key)) = event::read() else {
             continue;
         };
@@ -613,15 +652,33 @@ pub fn select_menu(title: &str, choices: &[Choice], initial: usize) -> Option<us
         }
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                selected = next_selectable(choices, selected, -1)?;
+            KeyCode::Up => {
+                if let Some(next) = next_selectable(choices, &visible, selected, -1) {
+                    selected = next;
+                }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                selected = next_selectable(choices, selected, 1)?;
+            KeyCode::Down => {
+                if let Some(next) = next_selectable(choices, &visible, selected, 1) {
+                    selected = next;
+                }
             }
-            KeyCode::Enter | KeyCode::Tab => break Some(selected),
-            KeyCode::Esc => break None,
+            KeyCode::Enter | KeyCode::Tab if visible.contains(&selected) => break Some(selected),
+            KeyCode::Esc if query.is_empty() => break None,
+            KeyCode::Esc => {
+                query.clear();
+                visible = visible_indices(choices, &query);
+                selected = next_selectable(choices, &visible, usize::MAX, 1).unwrap_or(selected);
+            }
             KeyCode::Char('c') if control => break None,
+            KeyCode::Backspace if query.pop().is_some() => {
+                visible = visible_indices(choices, &query);
+                selected = next_selectable(choices, &visible, usize::MAX, 1).unwrap_or(selected);
+            }
+            KeyCode::Char(c) if !control => {
+                query.push(c);
+                visible = visible_indices(choices, &query);
+                selected = next_selectable(choices, &visible, usize::MAX, 1).unwrap_or(selected);
+            }
             _ => {}
         }
     };
@@ -632,35 +689,131 @@ pub fn select_menu(title: &str, choices: &[Choice], initial: usize) -> Option<us
     result
 }
 
-fn next_selectable(choices: &[Choice], selected: usize, direction: isize) -> Option<usize> {
-    let mut index = selected;
-    for _ in 0..choices.len() {
-        index = if direction < 0 {
-            index.checked_sub(1).unwrap_or(choices.len() - 1)
-        } else {
-            (index + 1) % choices.len()
-        };
-        if choices[index].selectable {
-            return Some(index);
+/// Indices of `choices` to show for `query` (case-insensitive substring, empty
+/// shows everything). A match on a section heading pulls in every choice
+/// under it regardless of their own label; otherwise a section heading is
+/// shown only when at least one of its choices matches, to keep the group
+/// visible for context.
+fn visible_indices(choices: &[Choice], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..choices.len()).collect();
+    }
+    let query = query.to_lowercase();
+    let mut visible = Vec::new();
+    let mut header_index: Option<usize> = None;
+    let mut header_matches = false;
+    let mut section_children: Vec<usize> = Vec::new();
+    let mut matching_children: Vec<usize> = Vec::new();
+    for (index, choice) in choices.iter().enumerate() {
+        if !choice.selectable {
+            flush_section(
+                &mut visible,
+                header_index,
+                header_matches,
+                &section_children,
+                &matching_children,
+            );
+            header_index = Some(index);
+            header_matches = choice.label.to_lowercase().contains(&query);
+            section_children.clear();
+            matching_children.clear();
+            continue;
+        }
+        section_children.push(index);
+        if choice.label.to_lowercase().contains(&query) {
+            matching_children.push(index);
         }
     }
-    None
+    flush_section(
+        &mut visible,
+        header_index,
+        header_matches,
+        &section_children,
+        &matching_children,
+    );
+    visible
 }
 
-fn draw_select(title: &str, choices: &[Choice], selected: usize) {
+/// Append one section's indices to `visible`: the whole section when its
+/// heading matched, otherwise just the entries that matched on their own
+/// (with the heading kept for context if there were any).
+fn flush_section(
+    visible: &mut Vec<usize>,
+    header_index: Option<usize>,
+    header_matches: bool,
+    section_children: &[usize],
+    matching_children: &[usize],
+) {
+    if header_matches {
+        visible.extend(header_index);
+        visible.extend_from_slice(section_children);
+    } else if !matching_children.is_empty() {
+        visible.extend(header_index);
+        visible.extend_from_slice(matching_children);
+    }
+}
+
+/// Next selectable index within `visible`, cycling in `direction`. Starting
+/// from a `selected` that isn't in `visible` (e.g. right after a filter
+/// change) lands on the first selectable entry.
+fn next_selectable(
+    choices: &[Choice],
+    visible: &[usize],
+    selected: usize,
+    direction: isize,
+) -> Option<usize> {
+    let selectable: Vec<usize> = visible
+        .iter()
+        .copied()
+        .filter(|&index| choices[index].selectable)
+        .collect();
+    if selectable.is_empty() {
+        return None;
+    }
+    let position = selectable.iter().position(|&index| index == selected);
+    let next = match position {
+        Some(p) if direction < 0 => {
+            if p == 0 {
+                selectable.len() - 1
+            } else {
+                p - 1
+            }
+        }
+        Some(p) => (p + 1) % selectable.len(),
+        None => 0,
+    };
+    Some(selectable[next])
+}
+
+fn draw_select(title: &str, choices: &[Choice], selected: usize, query: &str, visible: &[usize]) {
     use std::fmt::Write as _;
-    // Reserve space for the title, scroll indicators, and the prompt area
-    // below the picker. The selected row stays centered where possible.
+    // Reserve space for the title, the search line, scroll indicators, and
+    // the prompt area below the picker. The selected row stays centered
+    // where possible.
     let terminal_rows = terminal::size().map_or(24, |(_, rows)| usize::from(rows));
-    let item_capacity = terminal_rows.saturating_sub(6).max(3);
-    let (start, end) = select_window(choices.len(), selected, item_capacity);
+    let item_capacity = terminal_rows.saturating_sub(7).max(3);
+    let position = visible
+        .iter()
+        .position(|&index| index == selected)
+        .unwrap_or(0);
+    let (start, end) = select_window(visible.len(), position, item_capacity);
     let mut output = format!("\r\x1b[J\x1b[1m{title}\x1b[0m");
-    let mut rendered_rows = 0usize;
+    let mut rendered_rows = 1usize;
+    if query.is_empty() {
+        let _ = write!(output, "\r\n{DIM}  type to search{RESET}");
+    } else {
+        let _ = write!(output, "\r\n{DIM}  search:{RESET} {query}");
+    }
     if start > 0 {
         let _ = write!(output, "\r\n{DIM}    ↑ {start} more{RESET}");
         rendered_rows += 1;
     }
-    for (index, choice) in choices.iter().enumerate().take(end).skip(start) {
+    if visible.is_empty() {
+        let _ = write!(output, "\r\n{DIM}    no matches{RESET}");
+        rendered_rows += 1;
+    }
+    for &index in visible.iter().take(end).skip(start) {
+        let choice = &choices[index];
         output.push_str("\r\n");
         rendered_rows += 1;
         if !choice.selectable {
@@ -678,8 +831,8 @@ fn draw_select(title: &str, choices: &[Choice], selected: usize) {
             let _ = write!(output, "  {DIM}{}{RESET}", choice.hint);
         }
     }
-    if end < choices.len() {
-        let _ = write!(output, "\r\n{DIM}    ↓ {} more{RESET}", choices.len() - end);
+    if end < visible.len() {
+        let _ = write!(output, "\r\n{DIM}    ↓ {} more{RESET}", visible.len() - end);
         rendered_rows += 1;
     }
     // Return the cursor to the title row so the next redraw overwrites cleanly.
@@ -755,7 +908,7 @@ fn filter_files(files: &[String], query: &str) -> Vec<String> {
 mod tests {
     use super::{
         Choice, CompletionContext, Editor, clip_columns, completion_context, filter_files,
-        input_layout, next_selectable, select_window,
+        input_layout, next_selectable, select_window, visible_indices,
     };
 
     fn chars(text: &str) -> Vec<char> {
@@ -857,9 +1010,29 @@ mod tests {
             Choice::section("anthropic"),
             Choice::new("claude", ""),
         ];
-        assert_eq!(next_selectable(&choices, 1, 1), Some(3));
-        assert_eq!(next_selectable(&choices, 3, 1), Some(1));
-        assert_eq!(next_selectable(&choices, 1, -1), Some(3));
+        let visible: Vec<usize> = (0..choices.len()).collect();
+        assert_eq!(next_selectable(&choices, &visible, 1, 1), Some(3));
+        assert_eq!(next_selectable(&choices, &visible, 3, 1), Some(1));
+        assert_eq!(next_selectable(&choices, &visible, 1, -1), Some(3));
+    }
+
+    #[test]
+    fn search_query_filters_by_matching_section_or_model_name() {
+        let choices = vec![
+            Choice::section("openai"),
+            Choice::new("gpt-4o", ""),
+            Choice::section("openrouter"),
+            Choice::new("anthropic/claude-3.5-sonnet", ""),
+            Choice::new("google/gemini-pro", ""),
+        ];
+        // Empty query shows everything.
+        assert_eq!(visible_indices(&choices, ""), vec![0, 1, 2, 3, 4]);
+        // A match on a section heading reveals the whole section.
+        assert_eq!(visible_indices(&choices, "openrouter"), vec![2, 3, 4]);
+        // Otherwise only matching entries show, with their heading for context.
+        assert_eq!(visible_indices(&choices, "claude"), vec![2, 3]);
+        // No match anywhere yields nothing.
+        assert!(visible_indices(&choices, "mistral").is_empty());
     }
 
     #[test]

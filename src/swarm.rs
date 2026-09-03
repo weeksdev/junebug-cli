@@ -117,18 +117,8 @@ pub struct Task {
 ///
 /// Returns an error when no parsable task array is present or it is empty.
 pub fn parse_tasks(text: &str) -> Result<Vec<Task>, String> {
-    let start = match text.find("```json") {
-        Some(fence) => text[fence..].find('[').map(|offset| fence + offset),
-        None => text.find('['),
-    }
-    .ok_or("the plan contains no JSON task array")?;
-    let end = text
-        .rfind(']')
-        .ok_or("the plan contains no JSON task array")?;
-    if start > end {
-        return Err("the plan contains no JSON task array".to_owned());
-    }
-    let mut tasks: Vec<Task> = serde_json::from_str(&text[start..=end])
+    let raw = crate::jsonblock::find_array(text).ok_or("the plan contains no JSON task array")?;
+    let mut tasks: Vec<Task> = serde_json::from_str(raw)
         .map_err(|error| format!("could not parse the task array: {error}"))?;
     if tasks.is_empty() {
         return Err("the plan contains no tasks".to_owned());

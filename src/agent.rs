@@ -15,6 +15,11 @@ use crate::router::RouteDecision;
 use crate::session::SessionWriter;
 use crate::tool::{BUILTIN_TOOLS, ToolRisk, Workspace};
 
+/// `run_loop`'s error when a provider turn has no tool calls and no text
+/// after exhausting the empty-turn retry budget.
+const EMPTY_TURN_ERROR: &str =
+    "provider returned an empty assistant turn; history was left unchanged";
+
 pub struct McpClient {
     pub name: String,
     pub client: mcp::Client,
@@ -124,6 +129,7 @@ pub fn run_loop(
     // deaths retry fast, rate limits wait the window out.
     let mut transient_retries = 0usize;
     let mut rate_limit_retries = 0usize;
+    let mut empty_turn_retries = 0usize;
     let mut last_provider = String::new();
     let mut last_model = String::new();
     let mut last_band = None;
@@ -179,6 +185,40 @@ pub fn run_loop(
                 .provider
                 .stream_turn(selection.model, &request_messages, tools, cancel)
             {
+                // Some routed/niche models (seen via OpenRouter) occasionally
+                // return a turn with no tool calls and no text at all — a
+                // one-off upstream hiccup, not a real "the model is done"
+                // signal. Retry it exactly like a transient transport error:
+                // nothing was added to `messages` or the session yet, so a
+                // retry is safe.
+                Ok(turn)
+                    if turn.tool_calls.is_empty()
+                        && !assistant_has_content(&turn.assistant_message) =>
+                {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(EMPTY_TURN_ERROR.to_owned());
+                    }
+                    let Some(&delay) = crate::swarm::TRANSIENT_DELAYS.get(empty_turn_retries)
+                    else {
+                        return Err(EMPTY_TURN_ERROR.to_owned());
+                    };
+                    empty_turn_retries += 1;
+                    session.record(
+                        "turn_retry",
+                        &format!("retrying in {delay}s: {EMPTY_TURN_ERROR}"),
+                    )?;
+                    observer.on_notice(&format!(
+                        "provider returned an empty turn — retrying in {delay}s"
+                    ));
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(delay);
+                    while std::time::Instant::now() < deadline {
+                        if cancel.load(Ordering::Relaxed) {
+                            return Err(EMPTY_TURN_ERROR.to_owned());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                }
                 Ok(turn) => break turn,
                 Err(error) => {
                     // A user interrupt surfaces as a provider error; never
@@ -208,11 +248,6 @@ pub fn run_loop(
                 }
             }
         };
-        if turn.tool_calls.is_empty() && !assistant_has_content(&turn.assistant_message) {
-            return Err(
-                "provider returned an empty assistant turn; history was left unchanged".to_owned(),
-            );
-        }
         input_tokens = input_tokens.max(turn.input_tokens);
         output_tokens += turn.output_tokens;
         for text in &turn.text_deltas {
@@ -252,6 +287,23 @@ pub fn run_loop(
             let write_preview = write_preview(workspace, &call, unrestricted);
             let result = if cancel.load(Ordering::Relaxed) {
                 "ERROR: interrupted by user".to_owned()
+            } else if call.name == "task" {
+                observer.on_tool_call(&call.name, &call.arguments);
+                run_subagent(
+                    workspace,
+                    selection.provider,
+                    selection.model,
+                    &call.arguments,
+                    tools,
+                    &tool_policy,
+                    mcp_clients,
+                    approve,
+                    checkpoint,
+                    max_context_chars,
+                    max_turns,
+                    cancel,
+                    observer,
+                )
             } else {
                 observer.on_tool_call(&call.name, &call.arguments);
                 execute_tool(
@@ -515,6 +567,15 @@ pub fn execute_tool(
                 Path::new(arguments.get("path").and_then(Value::as_str).unwrap_or(".")),
                 unrestricted,
             ),
+            "semantic_search" => {
+                let query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
+                let limit = arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(crate::semsearch::DEFAULT_RESULTS);
+                crate::semsearch::search(workspace.root(), query, limit)
+            }
             "write_file" => {
                 let content = arguments
                     .get("content")
@@ -581,20 +642,189 @@ pub fn execute_tool(
                     unrestricted,
                 )
             }
+            "write_todos" => {
+                let todos = arguments
+                    .get("todos")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| {
+                                let content =
+                                    item.get("content").and_then(Value::as_str)?.to_owned();
+                                let status = match item
+                                    .get("status")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("pending")
+                                {
+                                    "in_progress" => crate::tool::TodoStatus::InProgress,
+                                    "completed" => crate::tool::TodoStatus::Completed,
+                                    _ => crate::tool::TodoStatus::Pending,
+                                };
+                                Some(crate::tool::Todo { content, status })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                Ok(workspace.set_todos(todos))
+            }
             _ => Err(format!("unknown tool: {}", call.name)),
         }
     };
     result.unwrap_or_else(|error| format!("ERROR: {error}"))
 }
 
+/// Forwards a sub-agent's activity into the parent turn's observer as
+/// out-of-band notices instead of `on_text`/`on_tool_*`, so its intermediate
+/// steps show up as a quiet log line rather than interleaving with the
+/// parent's own streamed reply. File diffs still pass through directly —
+/// a sub-agent editing a file is real workspace activity worth showing
+/// exactly like the parent's own edits.
+struct SubagentRelay<'a> {
+    inner: &'a mut dyn TurnObserver,
+    label: &'a str,
+}
+
+impl TurnObserver for SubagentRelay<'_> {
+    fn on_text(&mut self, _text: &str) {}
+
+    fn on_tool_call(&mut self, name: &str, arguments: &str) {
+        self.inner.on_notice(&format!(
+            "↳ {}: {name}({})",
+            self.label,
+            clip(arguments, 60)
+        ));
+    }
+
+    fn on_tool_result(&mut self, _name: &str, result: &str) {
+        self.inner
+            .on_notice(&format!("↳ {}: → {}", self.label, clip(result, 80)));
+    }
+
+    fn on_file_diff(&mut self, path: &str, diff: &str) {
+        self.inner.on_file_diff(path, diff);
+    }
+}
+
+/// First line of `text`, truncated to `max` characters — enough to make an
+/// activity notice legible without echoing a sub-agent's full output.
+fn clip(text: &str, max: usize) -> String {
+    let first_line = text.lines().next().unwrap_or("").trim();
+    if first_line.chars().count() <= max {
+        first_line.to_owned()
+    } else {
+        let mut truncated: String = first_line.chars().take(max).collect();
+        truncated.push('…');
+        truncated
+    }
+}
+
+/// Dispatch a `task` call: run a nested, single-purpose agent loop with a
+/// fresh, isolated message history and its own session log, returning only
+/// its final answer to the caller. This is the "context quarantine" half of
+/// the deep-agent pattern — the parent never sees the sub-agent's
+/// intermediate tool calls, only a clean summary, so delegating a large
+/// investigation doesn't bloat the parent's own context. Sub-agents cannot
+/// spawn further sub-agents or touch the shared todo list (both are
+/// excluded from their tool list), so delegation is exactly one level deep
+/// and the plan stays owned by whichever agent is actually showing it to
+/// the user.
+#[allow(clippy::too_many_arguments)]
+fn run_subagent(
+    workspace: &Workspace,
+    provider: &dyn ModelProvider,
+    model: &str,
+    arguments: &str,
+    tools: &[Value],
+    policy: &PolicyEngine,
+    mcp_clients: &mut [McpClient],
+    approve: &mut dyn FnMut(&str) -> bool,
+    checkpoint: &mut dyn FnMut(&str),
+    max_context_chars: usize,
+    max_turns: usize,
+    cancel: &AtomicBool,
+    observer: &mut dyn TurnObserver,
+) -> String {
+    let arguments: Value = match serde_json::from_str(arguments) {
+        Ok(arguments) => arguments,
+        Err(error) => return format!("ERROR: invalid tool arguments: {error}"),
+    };
+    let Some(prompt) = arguments.get("prompt").and_then(Value::as_str) else {
+        return "ERROR: task requires a \"prompt\" argument".to_owned();
+    };
+    let label = arguments
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("sub-agent")
+        .to_owned();
+    let sub_tools: Vec<Value> = tools
+        .iter()
+        .filter(|tool| {
+            !matches!(
+                tool.pointer("/function/name").and_then(Value::as_str),
+                Some("task" | "write_todos")
+            )
+        })
+        .cloned()
+        .collect();
+    let session = match SessionWriter::create(workspace.root()) {
+        Ok(session) => session,
+        Err(error) => return format!("ERROR: could not start sub-agent session: {error}"),
+    };
+    let mut messages = vec![
+        json!({
+            "role": "system",
+            "content": format!(
+                "You are a focused sub-agent spawned to complete one self-contained task and report back. There is no user watching this conversation live and you cannot ask follow-up questions, so do the best you can with what you were given, then finish with a clear, complete final answer summarizing what you found or did. The startup workspace is exactly: {}",
+                workspace.root().display()
+            )
+        }),
+        json!({"role": "user", "content": prompt}),
+    ];
+    let mut source = PinnedModel::new(provider, model);
+    let mut relay = SubagentRelay {
+        inner: observer,
+        label: &label,
+    };
+    if let Err(error) = run_loop(
+        &mut source,
+        workspace,
+        &sub_tools,
+        policy,
+        &mut messages,
+        mcp_clients,
+        &session,
+        approve,
+        checkpoint,
+        max_context_chars,
+        max_turns,
+        cancel,
+        &mut relay,
+    ) {
+        return format!("ERROR: sub-agent failed: {error}");
+    }
+    messages
+        .last()
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map_or_else(
+            || "(sub-agent finished with no final message)".to_owned(),
+            ToOwned::to_owned,
+        )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{assistant_has_content, execute_tool};
+    use super::{PinnedModel, TurnObserver, assistant_has_content, execute_tool, run_loop};
     use crate::PermissionMode;
     use crate::policy::PolicyEngine;
-    use crate::provider::ToolCall;
+    use crate::provider::{ModelProvider, ModelTurn, ToolCall};
+    use crate::session::SessionWriter;
     use crate::tool::Workspace;
+    use std::cell::Cell;
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
 
     fn call(name: &str, arguments: &str) -> ToolCall {
         ToolCall {
@@ -666,6 +896,101 @@ mod tests {
         assert!(assistant_has_content(
             &serde_json::json!({"role":"assistant","content":"done"})
         ));
+    }
+
+    /// A provider that returns one empty turn (no tool calls, no content)
+    /// before answering normally — simulating a one-off empty completion
+    /// from a flaky upstream route.
+    struct FlakyProvider {
+        calls: Cell<usize>,
+    }
+
+    impl ModelProvider for FlakyProvider {
+        fn name(&self) -> &'static str {
+            "flaky"
+        }
+
+        fn stream_turn(
+            &self,
+            _model: &str,
+            _messages: &[serde_json::Value],
+            _tools: &[serde_json::Value],
+            _cancel: &AtomicBool,
+        ) -> Result<ModelTurn, String> {
+            let call = self.calls.get();
+            self.calls.set(call + 1);
+            let assistant_message = if call == 0 {
+                serde_json::json!({"role": "assistant", "content": null})
+            } else {
+                serde_json::json!({"role": "assistant", "content": "done"})
+            };
+            Ok(ModelTurn {
+                text_deltas: if call == 0 {
+                    vec![]
+                } else {
+                    vec!["done".to_owned()]
+                },
+                tool_calls: vec![],
+                assistant_message,
+                input_tokens: 1,
+                output_tokens: 1,
+            })
+        }
+    }
+
+    struct SilentObserver;
+
+    impl TurnObserver for SilentObserver {
+        fn on_text(&mut self, _text: &str) {}
+        fn on_tool_call(&mut self, _name: &str, _arguments: &str) {}
+        fn on_tool_result(&mut self, _name: &str, _result: &str) {}
+    }
+
+    #[test]
+    fn empty_provider_turns_are_retried_instead_of_failing_the_run() {
+        let root = std::env::temp_dir().join(format!(
+            "junebug-empty-turn-retry-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("workspace");
+        let workspace = Workspace::new(root.clone());
+        let policy = PolicyEngine::new(PermissionMode::ReadOnly, false);
+        let provider = FlakyProvider {
+            calls: Cell::new(0),
+        };
+        let mut source = PinnedModel::new(&provider, "flaky-model");
+        let session = SessionWriter::create(workspace.root()).expect("session");
+        let mut messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let mut approve = |_: &str| true;
+        let mut checkpoint = |_: &str| {};
+        let cancel = AtomicBool::new(false);
+        let mut observer = SilentObserver;
+        let outcome = run_loop(
+            &mut source,
+            &workspace,
+            &[],
+            &policy,
+            &mut messages,
+            &mut [],
+            &session,
+            &mut approve,
+            &mut checkpoint,
+            100_000,
+            4,
+            &cancel,
+            &mut observer,
+        );
+        std::fs::remove_dir_all(&root).expect("cleanup");
+        let outcome = outcome.expect("an empty turn should be retried, not fatal");
+        assert_eq!(
+            provider.calls.get(),
+            2,
+            "should retry once after the empty turn"
+        );
+        assert_eq!(outcome.output_tokens, 1);
     }
 
     #[test]

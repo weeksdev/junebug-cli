@@ -58,6 +58,13 @@ pub enum ProviderKind {
     Anthropic,
     Ollama,
     LocalOpenAi,
+    /// Delegates the whole turn to a local, already-authenticated `claude`
+    /// CLI subprocess instead of a REST call — see `cli_delegate`. Not a
+    /// `ModelProvider` implemented here; `endpoint`/`models_endpoint`/
+    /// `api_key_environment` are meaningless for it and return placeholders.
+    ClaudeCli,
+    /// Same idea as `ClaudeCli`, delegating to a local `codex` CLI subprocess.
+    CodexCli,
 }
 
 impl ProviderKind {
@@ -72,8 +79,10 @@ impl ProviderKind {
             "anthropic" | "claude" => Ok(Self::Anthropic),
             "ollama" | "local" => Ok(Self::Ollama),
             "local-openai" | "openai-local" | "lmstudio" | "vllm" => Ok(Self::LocalOpenAi),
+            "claude-cli" => Ok(Self::ClaudeCli),
+            "codex-cli" | "codex" => Ok(Self::CodexCli),
             _ => Err(format!(
-                "unsupported provider '{value}'; use openai, openrouter, deepseek, anthropic, ollama, or local-openai"
+                "unsupported provider '{value}'; use openai, openrouter, deepseek, anthropic, ollama, local-openai, claude-cli, or codex-cli"
             )),
         }
     }
@@ -86,6 +95,8 @@ impl ProviderKind {
             Self::Anthropic => "anthropic",
             Self::Ollama => "ollama",
             Self::LocalOpenAi => "local-openai",
+            Self::ClaudeCli => "claude-cli",
+            Self::CodexCli => "codex-cli",
         }
     }
     #[must_use]
@@ -99,6 +110,10 @@ impl ProviderKind {
             Self::LocalOpenAi => {
                 format!("{}/v1/chat/completions", local_openai_base_url())
             }
+            // Delegate kinds run a local CLI subprocess (`cli_delegate`),
+            // never an HTTP request; not constructed as an
+            // `OpenAiCompatibleProvider`, so this is never called.
+            Self::ClaudeCli | Self::CodexCli => String::new(),
         }
     }
     #[must_use]
@@ -110,6 +125,7 @@ impl ProviderKind {
             Self::Anthropic => "https://api.anthropic.com/v1/models".to_owned(),
             Self::Ollama => format!("{}/v1/models", ollama_base_url()),
             Self::LocalOpenAi => format!("{}/v1/models", local_openai_base_url()),
+            Self::ClaudeCli | Self::CodexCli => String::new(),
         }
     }
 
@@ -122,8 +138,18 @@ impl ProviderKind {
             Self::Anthropic => "ANTHROPIC_API_KEY",
             Self::Ollama => "OLLAMA_HOST",
             Self::LocalOpenAi => "LOCAL_OPENAI_API_KEY",
+            // No key is read for these; auth is whatever the `claude`/`codex`
+            // binary already has configured (subscription login or its own
+            // API key). These names are never looked up in practice because
+            // `requires_api_key` is false for both.
+            Self::ClaudeCli => "JUNEBUG_CLAUDE_CLI_UNUSED",
+            Self::CodexCli => "JUNEBUG_CODEX_CLI_UNUSED",
         }
     }
+    /// `"default"` for the delegate kinds is a sentinel, not a real model
+    /// name: it means "let the local CLI pick its own default" and is
+    /// recognized specially by `CliDelegateProvider::new`/`set_model` rather
+    /// than passed as a literal `--model` value.
     #[must_use]
     pub const fn default_model(self) -> &'static str {
         match self {
@@ -133,17 +159,31 @@ impl ProviderKind {
             Self::Anthropic => "claude-sonnet-4-5",
             Self::Ollama => "qwen3:8b",
             Self::LocalOpenAi => "local-model",
+            Self::ClaudeCli | Self::CodexCli => "default",
         }
     }
 
     #[must_use]
     pub const fn requires_api_key(self) -> bool {
-        !matches!(self, Self::Ollama | Self::LocalOpenAi)
+        !matches!(
+            self,
+            Self::Ollama | Self::LocalOpenAi | Self::ClaudeCli | Self::CodexCli
+        )
+    }
+
+    /// Whether this kind is driven by shelling out to a local, already
+    /// logged-in CLI (`cli_delegate`) instead of Junebug's own REST/tool
+    /// loop. Delegate kinds run their own agentic tool loop internally and
+    /// are excluded from auto-routing (`router.rs`), which assumes small,
+    /// individually pinned REST calls.
+    #[must_use]
+    pub const fn is_cli_delegate(self) -> bool {
+        matches!(self, Self::ClaudeCli | Self::CodexCli)
     }
 
     /// All supported providers, in default preference order.
     #[must_use]
-    pub const fn all() -> [Self; 6] {
+    pub const fn all() -> [Self; 8] {
         [
             Self::OpenRouter,
             Self::OpenAi,
@@ -151,11 +191,17 @@ impl ProviderKind {
             Self::DeepSeek,
             Self::Ollama,
             Self::LocalOpenAi,
+            Self::ClaudeCli,
+            Self::CodexCli,
         ]
     }
 
     /// Whether a credential for this provider is available from the
-    /// environment, the workspace `.env`, or the user credential store.
+    /// environment, the workspace `.env`, or the user credential store. For
+    /// the delegate kinds this checks only that the `claude`/`codex` binary
+    /// is on `PATH` — not whether it is actually logged in, which the first
+    /// real invocation surfaces on its own (same as Ollama's reachability
+    /// check not confirming a model is pulled).
     #[must_use]
     pub fn has_credential(self) -> bool {
         if self == Self::Ollama {
@@ -164,10 +210,31 @@ impl ProviderKind {
         if self == Self::LocalOpenAi {
             return local_openai_is_available();
         }
+        if self == Self::ClaudeCli {
+            return cli_binary_available("claude");
+        }
+        if self == Self::CodexCli {
+            return cli_binary_available("codex");
+        }
         let environment = self.api_key_environment();
         std::env::var(environment).is_ok_and(|value| !value.is_empty())
             || dotenv_value(environment).is_some()
     }
+}
+
+/// Whether `name` resolves to an executable on `PATH`, mirroring
+/// `tool::ripgrep_available`'s directory-scan technique instead of spawning
+/// the binary just to check it exists.
+fn cli_binary_available(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let binary = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    };
+    std::env::split_paths(&path).any(|dir| dir.join(&binary).is_file())
 }
 
 fn normalize_base_url(value: &str) -> String {
@@ -186,7 +253,12 @@ fn normalize_base_url(value: &str) -> String {
     }
 }
 
-fn ollama_base_url() -> String {
+/// The reachable Ollama runtime's base URL (`OLLAMA_HOST` or the default
+/// local port), exposed for callers outside the chat/model-list adapters —
+/// e.g. the semantic-search embeddings client, which talks to Ollama's
+/// `/api/embeddings` endpoint directly.
+#[must_use]
+pub fn ollama_base_url() -> String {
     let host = std::env::var("OLLAMA_HOST")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -581,6 +653,103 @@ impl OpenAiCompatibleProvider {
             ));
         }
         parse_anthropic_sse(BufReader::new(response), cancel)
+    }
+}
+
+/// The provider actually driving the current turn: either a REST call
+/// (`OpenAiCompatibleProvider`, every cloud/local-server kind) or a local CLI
+/// subprocess delegate (`CliDelegateProvider`, `claude-cli`/`codex-cli` — see
+/// `cli_delegate`). Lets the REPL hold one concrete type regardless of which
+/// kind of backend is selected; `ModelProvider::stream_turn` dispatches to
+/// whichever is active.
+pub enum ActiveProvider {
+    Rest(OpenAiCompatibleProvider),
+    Delegate(crate::cli_delegate::CliDelegateProvider),
+}
+
+impl ActiveProvider {
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as
+    /// `OpenAiCompatibleProvider::from_environment`, or when a delegate
+    /// kind's CLI binary is not on `PATH`.
+    pub fn from_environment(
+        kind: ProviderKind,
+        model: Option<String>,
+        workspace: &std::path::Path,
+        permission: crate::PermissionMode,
+        plan: bool,
+    ) -> Result<Self, String> {
+        if kind.is_cli_delegate() {
+            return crate::cli_delegate::CliDelegateProvider::new(
+                kind,
+                workspace.to_path_buf(),
+                model,
+                permission,
+                plan,
+            )
+            .map(Self::Delegate);
+        }
+        OpenAiCompatibleProvider::from_environment(kind, model).map(Self::Rest)
+    }
+
+    #[must_use]
+    pub fn model(&self) -> &str {
+        match self {
+            Self::Rest(provider) => provider.model(),
+            Self::Delegate(provider) => provider.model(),
+        }
+    }
+
+    pub fn set_model(&mut self, model: String) {
+        match self {
+            Self::Rest(provider) => provider.set_model(model),
+            Self::Delegate(provider) => provider.set_model(model),
+        }
+    }
+
+    /// Live-sync a permission-mode change (`/permissions`, Shift+Tab) into
+    /// an active delegate provider's sandbox mapping. A no-op for REST
+    /// providers, which have no local sandbox of their own to update — their
+    /// every action already goes through Junebug's own `PolicyEngine`.
+    pub fn set_permission(&self, permission: crate::PermissionMode) {
+        if let Self::Delegate(provider) = self {
+            provider.set_permission(permission);
+        }
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error for transport failures or an unexpected response
+    /// shape. Delegate providers return a small fixed list rather than a
+    /// live catalog — see `CliDelegateProvider::list_models`.
+    pub fn list_models(&self) -> Result<Vec<String>, String> {
+        match self {
+            Self::Rest(provider) => provider.list_models(),
+            Self::Delegate(provider) => provider.list_models(),
+        }
+    }
+}
+
+impl ModelProvider for ActiveProvider {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Rest(provider) => provider.name(),
+            Self::Delegate(provider) => provider.name(),
+        }
+    }
+
+    fn stream_turn(
+        &self,
+        model: &str,
+        messages: &[Value],
+        tools: &[Value],
+        cancel: &AtomicBool,
+    ) -> Result<ModelTurn, String> {
+        match self {
+            Self::Rest(provider) => provider.stream_turn(model, messages, tools, cancel),
+            Self::Delegate(provider) => provider.stream_turn(model, messages, tools, cancel),
+        }
     }
 }
 

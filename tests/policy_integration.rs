@@ -92,12 +92,46 @@ fn write_file_turn(path: &str, content: &str) -> ModelTurn {
 }
 
 fn final_turn() -> ModelTurn {
+    text_turn("done")
+}
+
+fn text_turn(text: &str) -> ModelTurn {
     ModelTurn {
-        text_deltas: vec!["done".to_owned()],
+        text_deltas: vec![text.to_owned()],
         tool_calls: Vec::new(),
-        assistant_message: json!({"role": "assistant", "content": "done"}),
+        assistant_message: json!({"role": "assistant", "content": text}),
         input_tokens: 1,
         output_tokens: 1,
+    }
+}
+
+fn task_turn(description: &str, prompt: &str) -> ModelTurn {
+    let arguments = json!({"description": description, "prompt": prompt}).to_string();
+    ModelTurn {
+        text_deltas: Vec::new(),
+        tool_calls: vec![ToolCall {
+            id: "call-1".to_owned(),
+            name: "task".to_owned(),
+            arguments: arguments.clone(),
+        }],
+        assistant_message: json!({"role": "assistant", "content": Value::Null, "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "task", "arguments": arguments}}]}),
+        input_tokens: 10,
+        output_tokens: 5,
+    }
+}
+
+fn write_todos_turn(todos: &Value) -> ModelTurn {
+    let arguments = json!({"todos": todos}).to_string();
+    ModelTurn {
+        text_deltas: Vec::new(),
+        tool_calls: vec![ToolCall {
+            id: "call-1".to_owned(),
+            name: "write_todos".to_owned(),
+            arguments: arguments.clone(),
+        }],
+        assistant_message: json!({"role": "assistant", "content": Value::Null, "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "write_todos", "arguments": arguments}}]}),
+        input_tokens: 10,
+        output_tokens: 5,
     }
 }
 
@@ -255,6 +289,113 @@ fn ask_permission_only_writes_when_approved() {
         "ask mode must consult the approver exactly once"
     );
     assert!(!root.join("notes.txt").exists());
+
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn task_tool_runs_an_isolated_subagent_and_returns_only_its_summary() {
+    let root = temp_workspace("task-tool");
+    let workspace = Workspace::new(root.clone());
+    let session = SessionWriter::create(&root).expect("session");
+    let provider = FixtureProvider::new(vec![
+        task_turn("investigate", "find every caller of foo"),
+        text_turn("foo is called from bar.rs and baz.rs"),
+        final_turn(),
+    ]);
+    let policy = PolicyEngine::new(PermissionMode::WorkspaceWrite, false);
+    let mut messages = vec![json!({"role": "user", "content": "delegate this"})];
+    let mut mcp_clients: Vec<agent::McpClient> = Vec::new();
+    let mut approve = |_: &str| true;
+
+    let mut source = agent::PinnedModel::new(&provider, "fixture-model");
+    agent::run_loop(
+        &mut source,
+        &workspace,
+        &[],
+        &policy,
+        &mut messages,
+        &mut mcp_clients,
+        &session,
+        &mut approve,
+        &mut |_: &str| {},
+        100_000,
+        5,
+        &AtomicBool::new(false),
+        &mut Silent,
+    )
+    .expect("loop completes");
+
+    let tool_message = messages
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("tool result message recorded");
+    assert_eq!(
+        tool_message["content"].as_str().expect("string content"),
+        "foo is called from bar.rs and baz.rs",
+        "the task tool result must be exactly the sub-agent's final answer"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message["content"] == "find every caller of foo"),
+        "the sub-agent's own prompt must never leak into the parent's message history"
+    );
+
+    let session_files = fs::read_dir(root.join(".junebug").join("sessions"))
+        .expect("sessions dir")
+        .count();
+    assert_eq!(
+        session_files, 2,
+        "the sub-agent must get its own session log, separate from the parent's"
+    );
+
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn write_todos_tool_records_and_renders_the_plan() {
+    let root = temp_workspace("write-todos");
+    let workspace = Workspace::new(root.clone());
+    let session = SessionWriter::create(&root).expect("session");
+    let provider = FixtureProvider::new(vec![
+        write_todos_turn(&json!([
+            {"content": "step one", "status": "in_progress"},
+            {"content": "step two", "status": "pending"},
+        ])),
+        final_turn(),
+    ]);
+    let policy = PolicyEngine::new(PermissionMode::ReadOnly, false);
+    let mut messages = vec![json!({"role": "user", "content": "plan this"})];
+    let mut mcp_clients: Vec<agent::McpClient> = Vec::new();
+    let mut approve = |_: &str| panic!("write_todos must never require approval");
+
+    let mut source = agent::PinnedModel::new(&provider, "fixture-model");
+    agent::run_loop(
+        &mut source,
+        &workspace,
+        &[],
+        &policy,
+        &mut messages,
+        &mut mcp_clients,
+        &session,
+        &mut approve,
+        &mut |_: &str| {},
+        100_000,
+        5,
+        &AtomicBool::new(false),
+        &mut Silent,
+    )
+    .expect("loop completes");
+
+    let tool_message = messages
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("tool result message recorded");
+    let rendered = tool_message["content"].as_str().expect("string content");
+    assert!(rendered.contains("1 in progress"), "got: {rendered}");
+    assert!(rendered.contains("▶ step one"), "got: {rendered}");
+    assert!(rendered.contains("☐ step two"), "got: {rendered}");
 
     fs::remove_dir_all(root).expect("cleanup");
 }

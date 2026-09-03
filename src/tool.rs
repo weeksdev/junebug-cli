@@ -30,7 +30,54 @@ pub struct ToolDefinition {
     pub risk: ToolRisk,
 }
 
-pub const BUILTIN_TOOLS: [ToolDefinition; 10] = [
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Todo {
+    pub content: String,
+    pub status: TodoStatus,
+}
+
+/// Render the plan as the `write_todos` tool result: a one-line summary
+/// first (so the collapsed activity line stays useful), then a checklist.
+#[must_use]
+pub fn render_todos(todos: &[Todo]) -> String {
+    if todos.is_empty() {
+        return "todo list cleared".to_owned();
+    }
+    let in_progress = todos
+        .iter()
+        .filter(|todo| todo.status == TodoStatus::InProgress)
+        .count();
+    let completed = todos
+        .iter()
+        .filter(|todo| todo.status == TodoStatus::Completed)
+        .count();
+    let mut rendered = format!(
+        "{} in progress, {} pending, {completed} completed",
+        in_progress,
+        todos.len() - in_progress - completed
+    );
+    for todo in todos {
+        let mark = match todo.status {
+            TodoStatus::Pending => "☐",
+            TodoStatus::InProgress => "▶",
+            TodoStatus::Completed => "☑",
+        };
+        rendered.push('\n');
+        rendered.push_str(mark);
+        rendered.push(' ');
+        rendered.push_str(&todo.content);
+    }
+    rendered
+}
+
+pub const BUILTIN_TOOLS: [ToolDefinition; 13] = [
     ToolDefinition {
         name: "list_dir",
         risk: ToolRisk::Read,
@@ -41,6 +88,10 @@ pub const BUILTIN_TOOLS: [ToolDefinition; 10] = [
     },
     ToolDefinition {
         name: "search",
+        risk: ToolRisk::Read,
+    },
+    ToolDefinition {
+        name: "semantic_search",
         risk: ToolRisk::Read,
     },
     ToolDefinition {
@@ -71,11 +122,20 @@ pub const BUILTIN_TOOLS: [ToolDefinition; 10] = [
         name: "fetch_url",
         risk: ToolRisk::Network,
     },
+    ToolDefinition {
+        name: "write_todos",
+        risk: ToolRisk::Read,
+    },
+    ToolDefinition {
+        name: "task",
+        risk: ToolRisk::Read,
+    },
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Workspace {
     root: PathBuf,
+    todos: Mutex<Vec<Todo>>,
 }
 
 impl Workspace {
@@ -83,12 +143,25 @@ impl Workspace {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root: root.canonicalize().unwrap_or(root),
+            todos: Mutex::new(Vec::new()),
         }
     }
 
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Replace the plan tracked by `write_todos` and return its rendering.
+    /// Poisoning (a prior panic while holding the lock) is recovered from
+    /// rather than propagated — a stale plan is never worth crashing a turn.
+    pub fn set_todos(&self, todos: Vec<Todo>) -> String {
+        let rendered = render_todos(&todos);
+        *self
+            .todos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = todos;
+        rendered
     }
 
     fn checked_path(&self, requested: &Path, unrestricted: bool) -> Result<PathBuf, String> {
@@ -640,7 +713,7 @@ struct StreamCapture {
 }
 
 /// Captured stream state plus an EOF signal for timed joins.
-struct DrainedStream {
+pub(crate) struct DrainedStream {
     state: Arc<Mutex<StreamCapture>>,
     eof: mpsc::Receiver<()>,
 }
@@ -649,7 +722,11 @@ struct DrainedStream {
 /// cap. The EOF channel lets the caller wait with a timeout: an orphaned
 /// grandchild can hold the pipe open long after the shell exits, and the
 /// command must not hang on it.
-fn drain_stream(stream: Option<impl std::io::Read + Send + 'static>) -> DrainedStream {
+///
+/// Shared with other subprocess-driven features (e.g. `cli_delegate`) so
+/// every place Junebug shells out gets the same bounded, non-hanging output
+/// capture instead of reimplementing it.
+pub(crate) fn drain_stream(stream: Option<impl std::io::Read + Send + 'static>) -> DrainedStream {
     let state = Arc::new(Mutex::new(StreamCapture {
         bytes: Vec::new(),
         total: 0,
@@ -681,7 +758,7 @@ fn drain_stream(stream: Option<impl std::io::Read + Send + 'static>) -> DrainedS
 
 /// Concatenate captured stdout then stderr, waiting briefly for EOF on each
 /// stream first. Returns the text plus the true combined byte count.
-fn collect_output(stdout: &DrainedStream, stderr: &DrainedStream) -> (String, usize) {
+pub(crate) fn collect_output(stdout: &DrainedStream, stderr: &DrainedStream) -> (String, usize) {
     let mut text = String::new();
     let mut total = 0;
     for stream in [stdout, stderr] {
@@ -697,7 +774,7 @@ fn collect_output(stdout: &DrainedStream, stderr: &DrainedStream) -> (String, us
 /// Kill the command and every descendant. On unix the child leads its own
 /// process group (see `process_group(0)` at spawn), so the group is
 /// signalled; on Windows `taskkill /T` walks the process tree.
-fn kill_command_tree(child: &mut Child) {
+pub(crate) fn kill_command_tree(child: &mut Child) {
     let id = child.id();
     if cfg!(windows) {
         let _ = Command::new("taskkill")

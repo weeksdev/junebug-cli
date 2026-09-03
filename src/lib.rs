@@ -1,21 +1,27 @@
 //! Core types for Junebug CLI. Public contracts live here so future TUI, CLI and
 //! app-server interfaces all use the same provider and policy boundaries.
 
+pub mod abduction;
 pub mod agent;
+pub mod bayes;
 pub mod browser;
 pub mod checkpoint;
+pub mod cli_delegate;
 pub mod commands;
 pub mod config;
 pub mod context;
 pub mod diff;
 pub mod editor;
+pub mod hardware;
 pub mod hooks;
 pub mod instructions;
+pub mod jsonblock;
 pub mod markdown;
 pub mod mcp;
 pub mod policy;
 pub mod provider;
 pub mod router;
+pub mod semsearch;
 pub mod session;
 pub mod swarm;
 pub mod tool;

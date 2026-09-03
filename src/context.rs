@@ -14,23 +14,8 @@ pub fn compact(messages: &[Value], budget: usize) -> Vec<Value> {
         .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
         .cloned();
     let start = usize::from(system.is_some());
-    let mut used = system.as_ref().map_or(0, serialized_len_one);
-    // `cut` is the index of the oldest retained message; the newest message
-    // is always retained even when it alone exceeds the budget.
-    let mut cut = messages.len();
-    while cut > start {
-        let length = serialized_len_one(&messages[cut - 1]);
-        if used.saturating_add(length) > budget && cut < messages.len() {
-            break;
-        }
-        used = used.saturating_add(length);
-        cut -= 1;
-    }
-    // Providers reject a `tool` message whose assistant `tool_calls` message
-    // was dropped, so widen past the budget until the boundary is valid.
-    while cut > start && messages[cut].get("role").and_then(Value::as_str) == Some("tool") {
-        cut -= 1;
-    }
+    let remaining_budget = budget.saturating_sub(system.as_ref().map_or(0, serialized_len_one));
+    let cut = tail_cut(messages, start, remaining_budget);
     let omitted = cut - start;
     let mut compacted = Vec::new();
     if let Some(system) = system {
@@ -41,6 +26,30 @@ pub fn compact(messages: &[Value], budget: usize) -> Vec<Value> {
     }
     compacted.extend_from_slice(&messages[cut..]);
     compacted
+}
+
+/// Index of the oldest message to keep so the kept suffix (`messages[cut..]`)
+/// fits within `budget` characters — the newest message is always kept even
+/// when it alone exceeds the budget. Never lands on a `tool` message whose
+/// preceding assistant `tool_calls` message got cut, since providers reject
+/// that pairing. `start` bounds the search from below — e.g. past a leading
+/// system message the caller keeps separately.
+#[must_use]
+pub fn tail_cut(messages: &[Value], start: usize, budget: usize) -> usize {
+    let mut used = 0usize;
+    let mut cut = messages.len();
+    while cut > start {
+        let length = serialized_len_one(&messages[cut - 1]);
+        if used.saturating_add(length) > budget && cut < messages.len() {
+            break;
+        }
+        used = used.saturating_add(length);
+        cut -= 1;
+    }
+    while cut > start && messages[cut].get("role").and_then(Value::as_str) == Some("tool") {
+        cut -= 1;
+    }
+    cut
 }
 
 #[must_use]
@@ -54,7 +63,7 @@ fn serialized_len_one(message: &Value) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::compact;
+    use super::{compact, tail_cut};
     use serde_json::{Value, json};
     #[test]
     fn preserves_system_and_recent_message() {
@@ -103,5 +112,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tail_cut_keeps_a_small_verbatim_tail_out_of_a_large_history() {
+        let messages = vec![
+            json!({"role":"system", "content":"sys"}),
+            json!({"role":"user", "content":"old old old old old old old"}),
+            json!({"role":"assistant", "content":"old reply old reply old reply"}),
+            json!({"role":"user", "content":"recent"}),
+            json!({"role":"assistant", "content":"newest"}),
+        ];
+        // A budget too small for the whole history but big enough for the
+        // newest message keeps just that.
+        let cut = tail_cut(&messages, 1, 40);
+        assert_eq!(cut, 4, "should cut right before the newest message");
+        // A budget covering everything after the system message keeps it all.
+        let cut = tail_cut(&messages, 1, 10_000);
+        assert_eq!(cut, 1);
     }
 }

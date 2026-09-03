@@ -27,6 +27,7 @@ const INVERSE: &str = "\x1b[7m";
 const MAX_FILES: usize = 10_000;
 const MAX_DEPTH: usize = 16;
 const MAX_VIEW_BYTES: u64 = 1024 * 1024;
+const MAX_COMMITS: usize = 500;
 
 #[derive(Debug, Clone)]
 struct Node {
@@ -40,6 +41,24 @@ struct Node {
 struct Change {
     path: PathBuf,
     status: String,
+}
+
+#[derive(Debug, Clone)]
+struct Commit {
+    hash: String,
+    short: String,
+    author: String,
+    when: String,
+    subject: String,
+}
+
+/// Distinguishes the three browser screens for `draw_screen`'s header,
+/// footer, and detail-pane rendering (unified diff colors vs. plain text).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BrowserMode {
+    Explorer,
+    Changes,
+    Commits,
 }
 
 /// Open a tree/file browser for `root`. Files can be opened in the user's
@@ -80,6 +99,23 @@ pub fn changes(root: &Path, checkpointer: Option<&Checkpointer>) -> Result<(), S
 enum ChangeBaseline<'a> {
     WorkspaceGit,
     Checkpoint(&'a Checkpointer),
+    Commit(&'a str),
+}
+
+/// Open a read-only browser of recent commits (`git log`); selecting one
+/// opens the same changed-file browser as `/changes`, scoped to that
+/// commit's own diff instead of the working tree.
+///
+/// # Errors
+///
+/// Returns an error when `root` is not a Git work tree, Git fails, or
+/// terminal input cannot be initialized.
+pub fn commits(root: &Path) -> Result<(), String> {
+    let commits = list_commits(root)?;
+    if commits.is_empty() {
+        return Err("no commits found — this repository has no history yet".to_owned());
+    }
+    run_commits(root, &commits)
 }
 
 fn scan_tree(root: &Path) -> Result<Vec<Node>, String> {
@@ -204,11 +240,126 @@ fn diff_for(root: &Path, change: &Change, baseline: ChangeBaseline<'_>) -> Vec<S
             with_head.or_else(|_| git(root, &["diff", "--no-ext-diff", "--", &path]))
         }
         ChangeBaseline::Checkpoint(checkpointer) => checkpointer.diff_from_head(&change.path),
+        // `--root` makes this work for a repository's first commit too,
+        // which has no parent to diff against.
+        ChangeBaseline::Commit(hash) => git(
+            root,
+            &[
+                "diff-tree",
+                "-p",
+                "--no-commit-id",
+                "-r",
+                "--root",
+                hash,
+                "--",
+                &path,
+            ],
+        ),
     };
     match diff {
         Ok(diff) if diff.is_empty() => vec!["(no textual diff)".to_owned()],
         Ok(diff) => diff.lines().map(sanitize).collect(),
         Err(error) => vec![format!("Git diff unavailable: {error}")],
+    }
+}
+
+/// Recent commits, newest first, capped at `MAX_COMMITS` so a long-lived
+/// repository does not make `/commits` slow to open.
+fn list_commits(root: &Path) -> Result<Vec<Commit>, String> {
+    let limit = format!("-n{MAX_COMMITS}");
+    let output = git(
+        root,
+        &[
+            "log",
+            "--date=relative",
+            "--pretty=tformat:%H%x00%h%x00%an%x00%ad%x00%s",
+            &limit,
+        ],
+    )?;
+    Ok(parse_log(&output))
+}
+
+fn parse_log(output: &str) -> Vec<Commit> {
+    output
+        .split('\n')
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let mut fields = line.split('\0');
+            Some(Commit {
+                hash: fields.next()?.to_owned(),
+                short: fields.next()?.to_owned(),
+                author: fields.next()?.to_owned(),
+                when: fields.next()?.to_owned(),
+                subject: fields.next().unwrap_or("").to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// Files a commit touched, relative to its parent (or the empty tree for a
+/// root commit, via `--root`), reusing the same `Change` shape and diff
+/// browser as the working-tree `/changes` screen.
+fn commit_changes(root: &Path, hash: &str) -> Result<Vec<Change>, String> {
+    let output = git(
+        root,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            "-z",
+            "--root",
+            "-M",
+            hash,
+        ],
+    )?;
+    Ok(parse_diff_tree(&output))
+}
+
+fn parse_diff_tree(output: &str) -> Vec<Change> {
+    let mut fields = output.split('\0').filter(|field| !field.is_empty());
+    let mut changes = Vec::new();
+    while let Some(status) = fields.next() {
+        let Some(path) = fields.next() else { break };
+        // A rename/copy record carries an extra new-path field; the old
+        // path (just consumed) is discarded, matching working-tree R/C
+        // handling in `parse_status`.
+        let path = if status.starts_with('R') || status.starts_with('C') {
+            fields.next().unwrap_or(path)
+        } else {
+            path
+        };
+        changes.push(Change {
+            path: PathBuf::from(path),
+            status: status.chars().next().unwrap_or('?').to_string(),
+        });
+    }
+    changes.sort_by(|left, right| left.path.cmp(&right.path));
+    changes
+}
+
+fn commit_label(commit: &Commit) -> String {
+    format!("{}  {}", commit.short, commit.subject)
+}
+
+/// Preview shown while browsing the commit list: author, relative date,
+/// full message, and a diffstat — cheap enough to fetch on every selection
+/// change (cached by hash in `run_commits`, like the explorer's file cache).
+fn commit_preview(root: &Path, hash: &str) -> Vec<String> {
+    match git(
+        root,
+        &[
+            "show",
+            "--no-patch",
+            "--stat",
+            "--no-color",
+            "--date=relative",
+            "--format=%an, %ad%n%n%B",
+            hash,
+        ],
+    ) {
+        Ok(output) => output.lines().map(sanitize).collect(),
+        Err(error) => vec![format!("Git show unavailable: {error}")],
     }
 }
 
@@ -324,7 +475,7 @@ fn run_explorer(
             scroll,
             &query,
             searching,
-            false,
+            BrowserMode::Explorer,
             detail_focused,
             notice.as_deref(),
         );
@@ -506,7 +657,7 @@ fn run_changes(
             scroll,
             &query,
             searching,
-            true,
+            BrowserMode::Changes,
             detail_focused,
             None,
         );
@@ -589,6 +740,151 @@ fn run_changes(
             }
             KeyCode::Home => scroll = 0,
             KeyCode::End => scroll = lines.len().saturating_sub(view_height()),
+            _ => {}
+        }
+    };
+    leave_screen();
+    let _ = terminal::disable_raw_mode();
+    result
+}
+
+/// Commit list; Enter drills into the same changed-file browser as
+/// `/changes`, scoped to that one commit's diff via `ChangeBaseline::Commit`.
+/// That nested browser owns its own raw-mode/alt-screen lifecycle, so this
+/// loop leaves and re-enters the screen around it exactly like `edit_file`
+/// does for `$EDITOR` — most terminals track only one alt-screen buffer, so
+/// nesting an `enter_screen` inside another without unwinding first would
+/// leave the outer one stranded when the inner `leave_screen` fires.
+#[allow(clippy::too_many_lines)]
+fn run_commits(root: &Path, commits: &[Commit]) -> Result<(), String> {
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Err("/commits requires an interactive terminal".to_owned());
+    }
+    terminal::enable_raw_mode().map_err(|error| error.to_string())?;
+    enter_screen();
+    let mut selected = 0usize;
+    let mut scroll = 0usize;
+    let mut query = String::new();
+    let mut searching = false;
+    let mut cached_hash = None::<String>;
+    let mut cached_lines = Vec::<String>::new();
+    let mut notice = None::<String>;
+    let result = loop {
+        let query_lower = query.to_ascii_lowercase();
+        let visible = commits
+            .iter()
+            .filter(|commit| {
+                query.is_empty()
+                    || commit.subject.to_ascii_lowercase().contains(&query_lower)
+                    || commit.author.to_ascii_lowercase().contains(&query_lower)
+                    || commit.short.contains(&query_lower)
+            })
+            .collect::<Vec<_>>();
+        selected = selected.min(visible.len().saturating_sub(1));
+        let selected_commit = visible.get(selected).copied();
+        if let Some(commit) = selected_commit {
+            if cached_hash.as_deref() != Some(commit.hash.as_str()) {
+                cached_lines = commit_preview(root, &commit.hash);
+                cached_hash = Some(commit.hash.clone());
+            }
+        } else {
+            cached_hash = None;
+            cached_lines.clear();
+        }
+        let lines = &cached_lines;
+        let labels = visible
+            .iter()
+            .map(|commit| commit_label(commit))
+            .collect::<Vec<_>>();
+        let detail_title = selected_commit
+            .map(|commit| format!("{} · {}, {}", commit.short, commit.author, commit.when))
+            .unwrap_or_default();
+        draw_screen(
+            "Commits",
+            root,
+            &labels,
+            selected,
+            &detail_title,
+            lines,
+            scroll,
+            &query,
+            searching,
+            BrowserMode::Commits,
+            false,
+            notice.as_deref(),
+        );
+        let event = match event::read() {
+            Ok(event) => event,
+            Err(error) => break Err(error.to_string()),
+        };
+        let Event::Key(key) = event else { continue };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        notice = None;
+        if searching {
+            match key.code {
+                KeyCode::Enter => searching = false,
+                KeyCode::Esc => {
+                    searching = false;
+                    query.clear();
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    selected = 0;
+                    scroll = 0;
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    query.push(character);
+                    selected = 0;
+                    scroll = 0;
+                }
+                _ => {}
+            }
+            continue;
+        }
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
+            KeyCode::Char('/') => searching = true,
+            KeyCode::Up | KeyCode::Char('k') => {
+                selected = selected.saturating_sub(1);
+                scroll = 0;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                selected = (selected + 1).min(visible.len().saturating_sub(1));
+                scroll = 0;
+            }
+            KeyCode::PageDown => scroll = scroll.saturating_add(view_height()),
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                scroll = scroll.saturating_add(view_height());
+            }
+            KeyCode::PageUp => scroll = scroll.saturating_sub(view_height()),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                scroll = scroll.saturating_sub(view_height());
+            }
+            KeyCode::Home => scroll = 0,
+            KeyCode::End => scroll = lines.len().saturating_sub(view_height()),
+            KeyCode::Enter | KeyCode::Right => {
+                if let Some(commit) = selected_commit {
+                    match commit_changes(root, &commit.hash) {
+                        Ok(changes) if changes.is_empty() => {
+                            notice = Some("no file changes in this commit".to_owned());
+                        }
+                        Ok(changes) => {
+                            leave_screen();
+                            let _ = terminal::disable_raw_mode();
+                            let outcome =
+                                run_changes(root, &changes, ChangeBaseline::Commit(&commit.hash));
+                            let _ = terminal::enable_raw_mode();
+                            enter_screen();
+                            if let Err(error) = outcome {
+                                notice = Some(error);
+                            }
+                        }
+                        Err(error) => notice = Some(error),
+                    }
+                }
+            }
             _ => {}
         }
     };
@@ -706,10 +1002,11 @@ fn draw_screen(
     detail_scroll: usize,
     query: &str,
     searching: bool,
-    diff: bool,
+    mode: BrowserMode,
     detail_focused: bool,
     notice: Option<&str>,
 ) {
+    let diff = mode == BrowserMode::Changes;
     let (columns, rows) = terminal::size().unwrap_or((100, 30));
     let columns = usize::from(columns).max(40);
     let rows = usize::from(rows).max(8);
@@ -735,7 +1032,11 @@ fn draw_screen(
     );
     let left_header = format!(
         "{} ({})",
-        if diff { "changed files" } else { "workspace" },
+        match mode {
+            BrowserMode::Explorer => "workspace",
+            BrowserMode::Changes => "changed files",
+            BrowserMode::Commits => "commits",
+        },
         labels.len()
     );
     let detail_header = fit(detail_title, right_width);
@@ -768,24 +1069,31 @@ fn draw_screen(
         };
         let _ = write!(output, "{left} │ {right}\r\n");
     }
-    // The explorer (`!diff`) supports opening the file in $EDITOR; the
-    // changes browser stays read-only.
+    // The explorer supports opening the file in $EDITOR; the changes and
+    // commits browsers stay read-only.
     let footer = if detail_focused {
         if diff {
             "DIFF FOCUS · ↑↓ scroll · pgup/pgdn · ← back to tree · q close"
         } else {
             "FILE FOCUS · ↑↓ scroll · pgup/pgdn · e edit · ← back to tree · q close"
         }
-    } else if columns >= 100 {
-        if diff {
-            "↑↓ files · → focus diff · / search · read-only · q/esc close"
-        } else {
-            "↑↓ files · → focus file · / search · e edit · ←/→ tree · q/esc close"
-        }
-    } else if diff {
-        "↑↓ files · pgup/pgdn diff · / search · q close"
     } else {
-        "↑↓ files · pgup/pgdn view · / search · e edit · q close"
+        match (mode, columns >= 100) {
+            (BrowserMode::Commits, true) => {
+                "↑↓ commits · enter/→ view changed files · / search · q/esc close"
+            }
+            (BrowserMode::Commits, false) => "↑↓ commits · enter view files · / search · q close",
+            (BrowserMode::Changes, true) => {
+                "↑↓ files · → focus diff · / search · read-only · q/esc close"
+            }
+            (BrowserMode::Changes, false) => "↑↓ files · pgup/pgdn diff · / search · q close",
+            (BrowserMode::Explorer, true) => {
+                "↑↓ files · → focus file · / search · e edit · ←/→ tree · q/esc close"
+            }
+            (BrowserMode::Explorer, false) => {
+                "↑↓ files · pgup/pgdn view · / search · e edit · q close"
+            }
+        }
     };
     if let Some(notice) = notice {
         let _ = write!(output, "{YELLOW}{}{RESET}", fit(notice, columns));
@@ -953,8 +1261,8 @@ fn leave_screen() {
 #[cfg(test)]
 mod tests {
     use super::{
-        Change, Node, change_label, explorer_label, fit, fit_ansi, parse_status, sanitize,
-        visible_ansi_width, visible_nodes,
+        Change, Node, change_label, commit_label, explorer_label, fit, fit_ansi, parse_diff_tree,
+        parse_log, parse_status, sanitize, visible_ansi_width, visible_nodes,
     };
     use std::collections::HashSet;
     use std::path::PathBuf;
@@ -1037,6 +1345,43 @@ mod tests {
         assert_eq!(changes.len(), 2);
         assert_eq!(changes[0].path, PathBuf::from("new.txt"));
         assert_eq!(changes[1].path, PathBuf::from("src/main.rs"));
+    }
+
+    #[test]
+    fn diff_tree_name_status_becomes_changed_file_rows() {
+        let changes = parse_diff_tree("M\0src/main.rs\0A\0src/new.rs\0");
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].path, PathBuf::from("src/main.rs"));
+        assert_eq!(changes[0].status, "M");
+        assert_eq!(changes[1].path, PathBuf::from("src/new.rs"));
+        assert_eq!(changes[1].status, "A");
+    }
+
+    #[test]
+    fn diff_tree_rename_keeps_the_new_path_and_a_single_letter_status() {
+        let changes = parse_diff_tree("R100\0old.rs\0renamed.rs\0");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, PathBuf::from("renamed.rs"));
+        assert_eq!(changes[0].status, "R");
+    }
+
+    #[test]
+    fn git_log_output_becomes_commit_rows() {
+        let commits = parse_log(
+            "abc123\0abc123\0Ada Lovelace\x003 days ago\0Fix the analytical engine\n\
+             def456\0def456\0Ada Lovelace\0a week ago\0Initial commit\n",
+        );
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].hash, "abc123");
+        assert_eq!(commits[0].subject, "Fix the analytical engine");
+        assert_eq!(commits[1].when, "a week ago");
+        assert!(commit_label(&commits[0]).contains("Fix the analytical engine"));
+    }
+
+    #[test]
+    fn commit_log_lines_missing_fields_are_skipped_not_panicking() {
+        assert_eq!(parse_log("abc\0abc\0only three fields\n").len(), 0);
+        assert_eq!(parse_log("\n\n").len(), 0);
     }
 
     #[test]
