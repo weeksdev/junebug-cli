@@ -756,17 +756,33 @@ pub(crate) fn drain_stream(stream: Option<impl std::io::Read + Send + 'static>) 
     DrainedStream { state, eof }
 }
 
+/// Wait briefly for EOF on one drained stream, then return its captured text
+/// and true byte count. Shared by `collect_output` (which needs stdout and
+/// stderr combined) and callers that need them kept separate (e.g.
+/// `plugin`, whose stdout is a strict JSON protocol that stderr noise must
+/// never be mixed into).
+pub(crate) fn collect_one(stream: &DrainedStream) -> (String, usize) {
+    let _ = stream.eof.recv_timeout(Duration::from_secs(2));
+    stream.state.lock().map_or_else(
+        |_| (String::new(), 0),
+        |capture| {
+            (
+                String::from_utf8_lossy(&capture.bytes).into_owned(),
+                capture.total,
+            )
+        },
+    )
+}
+
 /// Concatenate captured stdout then stderr, waiting briefly for EOF on each
 /// stream first. Returns the text plus the true combined byte count.
 pub(crate) fn collect_output(stdout: &DrainedStream, stderr: &DrainedStream) -> (String, usize) {
     let mut text = String::new();
     let mut total = 0;
     for stream in [stdout, stderr] {
-        let _ = stream.eof.recv_timeout(Duration::from_secs(2));
-        if let Ok(capture) = stream.state.lock() {
-            text.push_str(&String::from_utf8_lossy(&capture.bytes));
-            total += capture.total;
-        }
+        let (chunk, chunk_total) = collect_one(stream);
+        text.push_str(&chunk);
+        total += chunk_total;
     }
     (text, total)
 }

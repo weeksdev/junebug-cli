@@ -18,6 +18,7 @@ pub mod instructions;
 pub mod jsonblock;
 pub mod markdown;
 pub mod mcp;
+pub mod plugin;
 pub mod policy;
 pub mod provider;
 pub mod router;

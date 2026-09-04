@@ -101,7 +101,7 @@ impl CliDelegateProvider {
         permission: PermissionMode,
         plan: bool,
     ) -> Result<Self, String> {
-        if !kind.is_cli_delegate() {
+        if !matches!(kind, ProviderKind::ClaudeCli | ProviderKind::CodexCli) {
             return Err(format!("{} is not a CLI delegate provider", kind.name()));
         }
         Ok(Self {
@@ -264,7 +264,7 @@ impl ModelProvider for CliDelegateProvider {
 
 /// The most recent user message's text content, joined if it was structured
 /// as content blocks.
-fn latest_user_text(messages: &[Value]) -> Option<String> {
+pub(crate) fn latest_user_text(messages: &[Value]) -> Option<String> {
     messages.iter().rev().find_map(|message| {
         if message.get("role").and_then(Value::as_str) != Some("user") {
             return None;
@@ -428,7 +428,7 @@ fn describe_spawn_error(kind: ProviderKind, error: &std::io::Error) -> String {
     }
 }
 
-fn tail_chars(text: &str, cap: usize) -> String {
+pub(crate) fn tail_chars(text: &str, cap: usize) -> String {
     let count = text.chars().count();
     text.chars()
         .skip(count.saturating_sub(cap))

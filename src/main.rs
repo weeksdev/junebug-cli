@@ -1279,10 +1279,11 @@ fn pick_configured_model(
     title: &str,
     current: Option<&Target>,
     include_cli_delegates: bool,
+    root: &Path,
 ) -> Option<Target> {
     let available: Vec<ProviderKind> = junebug_cli::provider::available_providers()
         .into_iter()
-        .filter(|kind| include_cli_delegates || !kind.is_cli_delegate())
+        .filter(|kind| include_cli_delegates || !kind.is_external_delegate())
         .collect();
     if available.is_empty() {
         return None;
@@ -1307,11 +1308,23 @@ fn pick_configured_model(
     for kind in available {
         choices.push(Choice::section(kind.name()));
         targets.push(None);
-        // CLI delegate kinds (claude-cli/codex-cli) have no live REST model
-        // catalog to fetch — show one "default" entry (the sentinel
-        // `ProviderKind::default_model` recognizes) instead of constructing
-        // an `OpenAiCompatibleProvider`, which would just fail for them.
-        let (mut models, fallback) = if kind.is_cli_delegate() {
+        // Plugins have a real discoverable local catalog (configured
+        // manifests) — list it instead of a placeholder.
+        let (mut models, fallback) = if kind == ProviderKind::Plugin {
+            let names = junebug_cli::plugin::list_available_names(root);
+            if names.is_empty() {
+                eprintln!(
+                    "{CLEAR_LINE}{DIM}no plugins configured — create ~/.junebug/plugins/<name>.json{RESET}"
+                );
+                continue;
+            }
+            (names, false)
+        } else if kind.is_external_delegate() {
+            // CLI delegate kinds (claude-cli/codex-cli) have no live REST
+            // model catalog to fetch — show one "default" entry (the
+            // sentinel `ProviderKind::default_model` recognizes) instead of
+            // constructing an `OpenAiCompatibleProvider`, which would just
+            // fail for them.
             (vec![kind.default_model().to_owned()], true)
         } else {
             let provider = match OpenAiCompatibleProvider::from_environment(kind, None) {
@@ -1411,6 +1424,7 @@ fn handle_model_command(
             "Model — choose any available provider",
             Some(&current),
             true,
+            root,
         ) else {
             eprintln!(
                 "{DIM}unchanged ({} · {}){RESET}",
@@ -1546,7 +1560,9 @@ fn handle_provider_scoped_model(
             }
             Err(error) => eprintln!("{RED}error:{RESET} {error}"),
         };
-    let models = if kind.is_cli_delegate() {
+    let models = if kind == ProviderKind::Plugin {
+        junebug_cli::plugin::list_available_names(root)
+    } else if kind.is_external_delegate() {
         vec![kind.default_model().to_owned()]
     } else {
         match OpenAiCompatibleProvider::from_environment(kind, None) {
@@ -2502,10 +2518,11 @@ fn handle_swarm_setup(root: &Path) {
     );
     let pick = |role: &str, hint: &str, current: Option<&Target>| -> Option<Target> {
         // Swarm roles run inside Junebug's own tool loop and checker
-        // verification; claude-cli/codex-cli delegate their whole turn to
-        // an external CLI's own tool loop instead, which doesn't fit that
-        // model, so they are excluded here (still selectable from /model).
-        pick_configured_model(&format!("{role} model — {hint}"), current, false)
+        // verification; claude-cli/codex-cli/plugin delegate their whole
+        // turn to an external agent's own tool loop instead, which doesn't
+        // fit that model, so they are excluded here (still selectable from
+        // /model).
+        pick_configured_model(&format!("{role} model — {hint}"), current, false, root)
     };
     let Some(boss) = pick(
         "boss",
@@ -3295,7 +3312,7 @@ fn handle_investigate_setup(root: &Path) {
         "{BOLD}Investigate setup{RESET} {DIM}— assign models per role, or cancel any prompt to keep using the active provider/model for every role. Route the skeptic to a different model family (e.g. claude-cli/codex-cli) for less-correlated adversarial review.{RESET}"
     );
     let pick = |role: &str, hint: &str, current: Option<&Target>| -> Option<Target> {
-        pick_configured_model(&format!("{role} model — {hint}"), current, true)
+        pick_configured_model(&format!("{role} model — {hint}"), current, true, root)
     };
     let Some(generator) = pick(
         "generator",
@@ -3940,7 +3957,7 @@ fn tool_schemas(plan: bool) -> Vec<Value> {
 
 fn print_help() {
     println!(
-        "Junebug CLI {VERSION}\n\nUSAGE:\n  junebug [OPTIONS] [prompt]     interactive REPL when prompt is omitted\n  junebug exec --json [OPTIONS] <prompt>\n  junebug set --provider NAME API_KEY   save the key to ~/.junebug/credentials.env, then start the REPL\n\nOPTIONS:\n  --provider openrouter|openai|deepseek|anthropic|ollama|local-openai|claude-cli|codex-cli\n  --model MODEL|auto\n  --permission read-only|ask|workspace-write|yolo   (default read-only)\n  --plan                        hard read-only guard regardless of --permission\n  --resume [SESSION]            continue a session (the path must exist); with no path, pick from a list\n  --resume-compact [SESSION]    like --resume but summarizes large histories first\n  --max-context-chars COUNT\n  --no-project-instructions\n  --no-checkpoints              disable automatic workspace snapshots (/rewind)\n  --enable-hooks / --enable-mcp\n\nREPL: /help /model /hardware /index /permissions /rewind /compact /status /changes /explorer /commits /diff /investigate /exit — esc interrupts a running turn.\n\nPROVIDERS:\n  OPENROUTER_API_KEY   provider=openrouter\n  OPENAI_API_KEY       provider=openai\n  DEEPSEEK_API_KEY     provider=deepseek\n  ANTHROPIC_API_KEY    provider=anthropic (Claude)\n  OLLAMA_HOST          provider=ollama (optional; defaults to http://127.0.0.1:11434)\n  LOCAL_OPENAI_BASE_URL provider=local-openai (LM Studio, vLLM, llama.cpp)\n  LOCAL_OPENAI_API_KEY  optional bearer token for local-openai\n  claude-cli            delegates to your local, already-logged-in `claude` CLI (Pro/Max subscription or API key — whatever it's configured with); no key needed\n  codex-cli             delegates to your local, already-logged-in `codex` CLI (ChatGPT subscription or API key); no key needed\n\nRepository hooks and MCP servers are disabled unless explicitly enabled."
+        "Junebug CLI {VERSION}\n\nUSAGE:\n  junebug [OPTIONS] [prompt]     interactive REPL when prompt is omitted\n  junebug exec --json [OPTIONS] <prompt>\n  junebug set --provider NAME API_KEY   save the key to ~/.junebug/credentials.env, then start the REPL\n\nOPTIONS:\n  --provider openrouter|openai|deepseek|anthropic|ollama|local-openai|claude-cli|codex-cli|plugin\n  --model MODEL|auto\n  --permission read-only|ask|workspace-write|yolo   (default read-only)\n  --plan                        hard read-only guard regardless of --permission\n  --resume [SESSION]            continue a session (the path must exist); with no path, pick from a list\n  --resume-compact [SESSION]    like --resume but summarizes large histories first\n  --max-context-chars COUNT\n  --no-project-instructions\n  --no-checkpoints              disable automatic workspace snapshots (/rewind)\n  --enable-hooks / --enable-mcp\n\nREPL: /help /model /hardware /index /permissions /rewind /compact /status /changes /explorer /commits /diff /investigate /exit — esc interrupts a running turn.\n\nPROVIDERS:\n  OPENROUTER_API_KEY   provider=openrouter\n  OPENAI_API_KEY       provider=openai\n  DEEPSEEK_API_KEY     provider=deepseek\n  ANTHROPIC_API_KEY    provider=anthropic (Claude)\n  OLLAMA_HOST          provider=ollama (optional; defaults to http://127.0.0.1:11434)\n  LOCAL_OPENAI_BASE_URL provider=local-openai (LM Studio, vLLM, llama.cpp)\n  LOCAL_OPENAI_API_KEY  optional bearer token for local-openai\n  claude-cli            delegates to your local, already-logged-in `claude` CLI (Pro/Max subscription or API key — whatever it's configured with); no key needed\n  codex-cli             delegates to your local, already-logged-in `codex` CLI (ChatGPT subscription or API key); no key needed\n  plugin                delegates to a locally configured external agent — see PLUGIN_PROTOCOL.md; select with --model <plugin-name>\n\nRepository hooks and MCP servers are disabled unless explicitly enabled."
     );
 }
 

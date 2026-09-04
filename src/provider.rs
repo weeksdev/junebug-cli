@@ -65,6 +65,11 @@ pub enum ProviderKind {
     ClaudeCli,
     /// Same idea as `ClaudeCli`, delegating to a local `codex` CLI subprocess.
     CodexCli,
+    /// Delegates the whole turn to a locally configured external agent — see
+    /// `plugin`. The specific plugin is named by `model` (looked up as
+    /// `~/.junebug/plugins/<model>.json`, or a workspace override), not a
+    /// real model name; there is no default, `model` must always be given.
+    Plugin,
 }
 
 impl ProviderKind {
@@ -81,8 +86,9 @@ impl ProviderKind {
             "local-openai" | "openai-local" | "lmstudio" | "vllm" => Ok(Self::LocalOpenAi),
             "claude-cli" => Ok(Self::ClaudeCli),
             "codex-cli" | "codex" => Ok(Self::CodexCli),
+            "plugin" => Ok(Self::Plugin),
             _ => Err(format!(
-                "unsupported provider '{value}'; use openai, openrouter, deepseek, anthropic, ollama, local-openai, claude-cli, or codex-cli"
+                "unsupported provider '{value}'; use openai, openrouter, deepseek, anthropic, ollama, local-openai, claude-cli, codex-cli, or plugin"
             )),
         }
     }
@@ -97,6 +103,7 @@ impl ProviderKind {
             Self::LocalOpenAi => "local-openai",
             Self::ClaudeCli => "claude-cli",
             Self::CodexCli => "codex-cli",
+            Self::Plugin => "plugin",
         }
     }
     #[must_use]
@@ -110,10 +117,10 @@ impl ProviderKind {
             Self::LocalOpenAi => {
                 format!("{}/v1/chat/completions", local_openai_base_url())
             }
-            // Delegate kinds run a local CLI subprocess (`cli_delegate`),
-            // never an HTTP request; not constructed as an
+            // Delegate kinds run a local subprocess (`cli_delegate`/
+            // `plugin`), never an HTTP request; not constructed as an
             // `OpenAiCompatibleProvider`, so this is never called.
-            Self::ClaudeCli | Self::CodexCli => String::new(),
+            Self::ClaudeCli | Self::CodexCli | Self::Plugin => String::new(),
         }
     }
     #[must_use]
@@ -125,7 +132,7 @@ impl ProviderKind {
             Self::Anthropic => "https://api.anthropic.com/v1/models".to_owned(),
             Self::Ollama => format!("{}/v1/models", ollama_base_url()),
             Self::LocalOpenAi => format!("{}/v1/models", local_openai_base_url()),
-            Self::ClaudeCli | Self::CodexCli => String::new(),
+            Self::ClaudeCli | Self::CodexCli | Self::Plugin => String::new(),
         }
     }
 
@@ -144,12 +151,18 @@ impl ProviderKind {
             // `requires_api_key` is false for both.
             Self::ClaudeCli => "JUNEBUG_CLAUDE_CLI_UNUSED",
             Self::CodexCli => "JUNEBUG_CODEX_CLI_UNUSED",
+            // A plugin's own auth (if any) lives entirely in its own
+            // process; Junebug never reads or holds a credential for it.
+            Self::Plugin => "JUNEBUG_PLUGIN_UNUSED",
         }
     }
-    /// `"default"` for the delegate kinds is a sentinel, not a real model
-    /// name: it means "let the local CLI pick its own default" and is
+    /// `"default"` for the CLI-delegate kinds is a sentinel, not a real
+    /// model name: it means "let the local CLI pick its own default" and is
     /// recognized specially by `CliDelegateProvider::new`/`set_model` rather
-    /// than passed as a literal `--model` value.
+    /// than passed as a literal `--model` value. `Plugin` has no sensible
+    /// default at all — `model` there names *which plugin*, not a model —
+    /// so this is never actually consulted for it (see `PluginProvider::new`,
+    /// which requires a name and errors without one).
     #[must_use]
     pub const fn default_model(self) -> &'static str {
         match self {
@@ -160,6 +173,7 @@ impl ProviderKind {
             Self::Ollama => "qwen3:8b",
             Self::LocalOpenAi => "local-model",
             Self::ClaudeCli | Self::CodexCli => "default",
+            Self::Plugin => "",
         }
     }
 
@@ -167,23 +181,25 @@ impl ProviderKind {
     pub const fn requires_api_key(self) -> bool {
         !matches!(
             self,
-            Self::Ollama | Self::LocalOpenAi | Self::ClaudeCli | Self::CodexCli
+            Self::Ollama | Self::LocalOpenAi | Self::ClaudeCli | Self::CodexCli | Self::Plugin
         )
     }
 
     /// Whether this kind is driven by shelling out to a local, already
-    /// logged-in CLI (`cli_delegate`) instead of Junebug's own REST/tool
-    /// loop. Delegate kinds run their own agentic tool loop internally and
-    /// are excluded from auto-routing (`router.rs`), which assumes small,
-    /// individually pinned REST calls.
+    /// authenticated external process (`cli_delegate`'s `claude`/`codex`, or
+    /// a `plugin`) instead of Junebug's own REST/tool loop. These kinds run
+    /// their own agentic tool loop internally and are excluded from
+    /// auto-routing (`router.rs`) and from `/swarm-setup` (whose roles need
+    /// Junebug's own tool loop), which assume small, individually pinned
+    /// REST calls.
     #[must_use]
-    pub const fn is_cli_delegate(self) -> bool {
-        matches!(self, Self::ClaudeCli | Self::CodexCli)
+    pub const fn is_external_delegate(self) -> bool {
+        matches!(self, Self::ClaudeCli | Self::CodexCli | Self::Plugin)
     }
 
     /// All supported providers, in default preference order.
     #[must_use]
-    pub const fn all() -> [Self; 8] {
+    pub const fn all() -> [Self; 9] {
         [
             Self::OpenRouter,
             Self::OpenAi,
@@ -193,15 +209,20 @@ impl ProviderKind {
             Self::LocalOpenAi,
             Self::ClaudeCli,
             Self::CodexCli,
+            Self::Plugin,
         ]
     }
 
     /// Whether a credential for this provider is available from the
     /// environment, the workspace `.env`, or the user credential store. For
-    /// the delegate kinds this checks only that the `claude`/`codex` binary
-    /// is on `PATH` — not whether it is actually logged in, which the first
-    /// real invocation surfaces on its own (same as Ollama's reachability
-    /// check not confirming a model is pulled).
+    /// the CLI-delegate kinds this checks only that the `claude`/`codex`
+    /// binary is on `PATH` — not whether it is actually logged in, which the
+    /// first real invocation surfaces on its own (same as Ollama's
+    /// reachability check not confirming a model is pulled). For `Plugin`
+    /// this checks only that at least one manifest exists under
+    /// `~/.junebug/plugins/` (this method takes no workspace path, so a
+    /// workspace-only plugin manifest is invisible here — it still works
+    /// once selected by name).
     #[must_use]
     pub fn has_credential(self) -> bool {
         if self == Self::Ollama {
@@ -215,6 +236,9 @@ impl ProviderKind {
         }
         if self == Self::CodexCli {
             return cli_binary_available("codex");
+        }
+        if self == Self::Plugin {
+            return crate::plugin::any_plugin_configured();
         }
         let environment = self.api_key_environment();
         std::env::var(environment).is_ok_and(|value| !value.is_empty())
@@ -656,23 +680,26 @@ impl OpenAiCompatibleProvider {
     }
 }
 
-/// The provider actually driving the current turn: either a REST call
-/// (`OpenAiCompatibleProvider`, every cloud/local-server kind) or a local CLI
+/// The provider actually driving the current turn: a REST call
+/// (`OpenAiCompatibleProvider`, every cloud/local-server kind), a local CLI
 /// subprocess delegate (`CliDelegateProvider`, `claude-cli`/`codex-cli` — see
-/// `cli_delegate`). Lets the REPL hold one concrete type regardless of which
-/// kind of backend is selected; `ModelProvider::stream_turn` dispatches to
-/// whichever is active.
+/// `cli_delegate`), or a generically configured external plugin
+/// (`PluginProvider` — see `plugin`). Lets the REPL hold one concrete type
+/// regardless of which kind of backend is selected; `ModelProvider::stream_turn`
+/// dispatches to whichever is active.
 pub enum ActiveProvider {
     Rest(OpenAiCompatibleProvider),
     Delegate(crate::cli_delegate::CliDelegateProvider),
+    Plugin(crate::plugin::PluginProvider),
 }
 
 impl ActiveProvider {
     /// # Errors
     ///
     /// Returns an error under the same conditions as
-    /// `OpenAiCompatibleProvider::from_environment`, or when a delegate
-    /// kind's CLI binary is not on `PATH`.
+    /// `OpenAiCompatibleProvider::from_environment`, when a CLI-delegate
+    /// kind's binary is not on `PATH`, or when a plugin's manifest is
+    /// missing/unparsable.
     pub fn from_environment(
         kind: ProviderKind,
         model: Option<String>,
@@ -680,7 +707,11 @@ impl ActiveProvider {
         permission: crate::PermissionMode,
         plan: bool,
     ) -> Result<Self, String> {
-        if kind.is_cli_delegate() {
+        if kind == ProviderKind::Plugin {
+            return crate::plugin::PluginProvider::new(model, workspace.to_path_buf(), permission)
+                .map(Self::Plugin);
+        }
+        if kind.is_external_delegate() {
             return crate::cli_delegate::CliDelegateProvider::new(
                 kind,
                 workspace.to_path_buf(),
@@ -698,6 +729,7 @@ impl ActiveProvider {
         match self {
             Self::Rest(provider) => provider.model(),
             Self::Delegate(provider) => provider.model(),
+            Self::Plugin(provider) => provider.model(),
         }
     }
 
@@ -705,28 +737,34 @@ impl ActiveProvider {
         match self {
             Self::Rest(provider) => provider.set_model(model),
             Self::Delegate(provider) => provider.set_model(model),
+            Self::Plugin(provider) => provider.set_model(model),
         }
     }
 
     /// Live-sync a permission-mode change (`/permissions`, Shift+Tab) into
-    /// an active delegate provider's sandbox mapping. A no-op for REST
-    /// providers, which have no local sandbox of their own to update — their
-    /// every action already goes through Junebug's own `PolicyEngine`.
+    /// an active delegate/plugin provider's sandbox mapping. A no-op for
+    /// REST providers, which have no local sandbox of their own to update —
+    /// their every action already goes through Junebug's own `PolicyEngine`.
     pub fn set_permission(&self, permission: crate::PermissionMode) {
-        if let Self::Delegate(provider) = self {
-            provider.set_permission(permission);
+        match self {
+            Self::Delegate(provider) => provider.set_permission(permission),
+            Self::Plugin(provider) => provider.set_permission(permission),
+            Self::Rest(_) => {}
         }
     }
 
     /// # Errors
     ///
     /// Returns an error for transport failures or an unexpected response
-    /// shape. Delegate providers return a small fixed list rather than a
-    /// live catalog — see `CliDelegateProvider::list_models`.
+    /// shape. CLI-delegate providers return a small fixed list rather than a
+    /// live catalog — see `CliDelegateProvider::list_models`. Plugin
+    /// providers return every configured manifest name — see
+    /// `PluginProvider::list_models`.
     pub fn list_models(&self) -> Result<Vec<String>, String> {
         match self {
             Self::Rest(provider) => provider.list_models(),
             Self::Delegate(provider) => provider.list_models(),
+            Self::Plugin(provider) => provider.list_models(),
         }
     }
 }
@@ -736,6 +774,7 @@ impl ModelProvider for ActiveProvider {
         match self {
             Self::Rest(provider) => provider.name(),
             Self::Delegate(provider) => provider.name(),
+            Self::Plugin(provider) => provider.name(),
         }
     }
 
@@ -749,6 +788,7 @@ impl ModelProvider for ActiveProvider {
         match self {
             Self::Rest(provider) => provider.stream_turn(model, messages, tools, cancel),
             Self::Delegate(provider) => provider.stream_turn(model, messages, tools, cancel),
+            Self::Plugin(provider) => provider.stream_turn(model, messages, tools, cancel),
         }
     }
 }
