@@ -509,7 +509,7 @@ fn run(args: &Args) {
             .record("project_instruction", &file.path.display().to_string())
             .unwrap_or_else(|error| exit_runtime_error(&error));
     }
-    let mut tools = tool_schemas(args.plan);
+    let mut tools = tool_schemas_with_custom(args.plan, &root);
     // Plan mode denies every MCP call at the policy layer, so connecting
     // servers and offering their tools would only invite failed calls.
     let mut mcp_clients = if args.mcp && !args.plan {
@@ -856,7 +856,7 @@ fn repl(
             match name {
                 "exit" | "quit" => break,
                 "help" => eprintln!(
-                    "{BOLD}/keys{RESET}          set or replace a provider API key (input hidden)\n{BOLD}/model{RESET}         pick or switch the model; add a provider (e.g. openrouter) to scope the picker, type to search (↑/↓, enter)\n{BOLD}/hardware{RESET}      detected GPU/memory and the local model size it can run\n{BOLD}/index{RESET}         build or refresh the local semantic-search index\n{BOLD}/permissions{RESET}   change what Junebug may do without asking\n{BOLD}/rewind{RESET}        restore workspace files to an earlier checkpoint\n{BOLD}/swarm-setup{RESET}   assign models to swarm roles (boss/worker/checker)\n{BOLD}/swarm{RESET} GOAL    run a boss/worker/checker model swarm on a goal\n{BOLD}/swarm resume{RESET}  continue an aborted or paused swarm where it left off\n{BOLD}/swarm-status{RESET}  progress readout of the saved swarm; add {BOLD}ai{RESET} for a model summary\n{BOLD}/investigate{RESET} Q  run the abductive-reasoning harness on a question (read-only; works under --plan)\n{BOLD}/investigate-status{RESET}  ranked hypotheses and synthesis of a saved investigation\n{BOLD}/investigate-setup{RESET}  optionally assign models to investigation roles\n{BOLD}/compact{RESET}       summarize the conversation to free context\n{BOLD}/status{RESET}        provider, model, permissions, session\n{BOLD}/changes{RESET}       browse changed files and per-file diffs\n{BOLD}/explorer{RESET}      browse and search workspace files; e opens $EDITOR\n{BOLD}/commits{RESET}       browse recent commits; enter opens that commit's changed files\n{BOLD}/diff{RESET}          print the uncommitted Git diff\n{BOLD}/exit{RESET}          quit (Ctrl-D also works)\n\n{DIM}⇧tab cycles permissions while typing or during a turn · @path attaches a file · esc interrupts · !command runs a shell command directly (not seen by the model)\ncustom commands: .junebug/commands/<name>.md becomes /<name> ($ARGUMENTS is replaced){RESET}"
+                    "{BOLD}/keys{RESET}          set or replace a provider API key (input hidden)\n{BOLD}/model{RESET}         pick or switch the model; add a provider (e.g. openrouter) to scope the picker, type to search (↑/↓, enter)\n{BOLD}/hardware{RESET}      detected GPU/memory and the local model size it can run\n{BOLD}/index{RESET}         build or refresh the local semantic-search index\n{BOLD}/permissions{RESET}   change what Junebug may do without asking\n{BOLD}/rewind{RESET}        restore workspace files to an earlier checkpoint\n{BOLD}/swarm-setup{RESET}   assign models to swarm roles (boss/worker/checker)\n{BOLD}/swarm{RESET} GOAL    run a boss/worker/checker model swarm on a goal\n{BOLD}/swarm resume{RESET}  continue an aborted or paused swarm where it left off\n{BOLD}/swarm-status{RESET}  progress readout of the saved swarm; add {BOLD}ai{RESET} for a model summary\n{BOLD}/investigate{RESET} Q  run the abductive-reasoning harness on a question (read-only; works under --plan)\n{BOLD}/investigate-status{RESET}  ranked hypotheses and synthesis of a saved investigation\n{BOLD}/investigate-setup{RESET}  optionally assign models to investigation roles\n{BOLD}/agent-build{RESET} NOTES  conversationally design a custom agent (system prompt + tool subset); becomes /name\n{BOLD}/agent-update{RESET} NAME [NOTES]  refine an existing custom agent\n{BOLD}/agents{RESET}        list configured custom agents\n{BOLD}/tool-build{RESET} NOTES  design, write, and test-run a new custom tool script\n{BOLD}/tool-update{RESET} NAME [NOTES]  refine an existing custom tool\n{BOLD}/tools{RESET}         list configured custom tools\n{BOLD}/skill-build{RESET} NOTES  author a skill (instructions loaded into context); becomes /name\n{BOLD}/skill-update{RESET} NAME [NOTES]  refine an existing skill\n{BOLD}/skills{RESET}        list configured skills\n{BOLD}/compact{RESET}       summarize the conversation to free context\n{BOLD}/status{RESET}        provider, model, permissions, session\n{BOLD}/changes{RESET}       browse changed files and per-file diffs\n{BOLD}/explorer{RESET}      browse and search workspace files; e opens $EDITOR\n{BOLD}/commits{RESET}       browse recent commits; enter opens that commit's changed files\n{BOLD}/diff{RESET}          print the uncommitted Git diff\n{BOLD}/exit{RESET}          quit (Ctrl-D also works)\n\n{DIM}⇧tab cycles permissions while typing or during a turn · @path attaches a file · esc interrupts · !command runs a shell command directly (not seen by the model)\ncustom commands: .junebug/commands/<name>.md becomes /<name> ($ARGUMENTS is replaced)\ncustom agents/tools/skills: global (~/.junebug) and repo (.junebug) scoped, /agents /tools /skills to browse{RESET}"
                 ),
                 "status" => eprintln!(
                     "routing={} provider={} model={} band={} switches_this_task={} permission={} plan={} messages={} checkpoints={} session={}",
@@ -989,6 +989,135 @@ fn repl(
                         );
                     }
                 }
+                "agent-build" => {
+                    if argument.is_empty() {
+                        eprintln!("usage: /agent-build <notes describing the task>");
+                    } else {
+                        handle_agent_build(
+                            &mut editor,
+                            provider.as_ref(),
+                            workspace,
+                            root,
+                            permission,
+                            args.max_context_chars,
+                            argument,
+                            None,
+                        );
+                    }
+                }
+                "agent-update" => {
+                    let (name, notes) = argument.split_once(' ').unwrap_or((argument, ""));
+                    if name.is_empty() {
+                        eprintln!("usage: /agent-update <name> [notes]");
+                    } else if let Some(entry) = junebug_cli::custom_agent::load(root, name) {
+                        handle_agent_build(
+                            &mut editor,
+                            provider.as_ref(),
+                            workspace,
+                            root,
+                            permission,
+                            args.max_context_chars,
+                            notes.trim(),
+                            Some(&entry),
+                        );
+                    } else {
+                        eprintln!("no agent named '{name}' — see /agents");
+                    }
+                }
+                "agents" => {
+                    eprint!(
+                        "{CYAN}{}{RESET}",
+                        junebug_cli::custom_agent::format_list(&junebug_cli::custom_agent::list(
+                            root
+                        ))
+                    );
+                }
+                "tool-build" => {
+                    if argument.is_empty() {
+                        eprintln!("usage: /tool-build <notes describing the tool>");
+                    } else {
+                        handle_tool_build(
+                            &mut editor,
+                            provider.as_ref(),
+                            workspace,
+                            root,
+                            permission,
+                            args.plan,
+                            args.max_context_chars,
+                            argument,
+                            None,
+                        );
+                    }
+                }
+                "tool-update" => {
+                    let (name, notes) = argument.split_once(' ').unwrap_or((argument, ""));
+                    if name.is_empty() {
+                        eprintln!("usage: /tool-update <name> [notes]");
+                    } else if let Some(entry) = junebug_cli::custom_tool::load(root, name) {
+                        handle_tool_build(
+                            &mut editor,
+                            provider.as_ref(),
+                            workspace,
+                            root,
+                            permission,
+                            args.plan,
+                            args.max_context_chars,
+                            notes.trim(),
+                            Some(&entry),
+                        );
+                    } else {
+                        eprintln!("no tool named '{name}' — see /tools");
+                    }
+                }
+                "tools" => {
+                    eprint!(
+                        "{CYAN}{}{RESET}",
+                        junebug_cli::custom_tool::format_list(&junebug_cli::custom_tool::list(
+                            root
+                        ))
+                    );
+                }
+                "skill-build" => {
+                    if argument.is_empty() {
+                        eprintln!("usage: /skill-build <notes describing the skill>");
+                    } else {
+                        handle_skill_build(
+                            &mut editor,
+                            provider.as_ref(),
+                            workspace,
+                            root,
+                            permission,
+                            args.max_context_chars,
+                            argument,
+                            None,
+                        );
+                    }
+                }
+                "skill-update" => {
+                    let (name, notes) = argument.split_once(' ').unwrap_or((argument, ""));
+                    if name.is_empty() {
+                        eprintln!("usage: /skill-update <name> [notes]");
+                    } else if let Some(entry) = junebug_cli::skill::load(root, name) {
+                        handle_skill_build(
+                            &mut editor,
+                            provider.as_ref(),
+                            workspace,
+                            root,
+                            permission,
+                            args.max_context_chars,
+                            notes.trim(),
+                            Some(&entry),
+                        );
+                    } else {
+                        eprintln!("no skill named '{name}' — see /skills");
+                    }
+                }
+                "skills" => {
+                    eprint!(
+                        "{CYAN}{}{RESET}",
+                        junebug_cli::skill::format_list(&junebug_cli::skill::list(root))
+                    );
+                }
                 "compact" => {
                     let Some(active) = provider.as_ref() else {
                         eprintln!("no model yet — use {BOLD}/keys{RESET} or start Ollama first");
@@ -1008,8 +1137,52 @@ fn repl(
                         Err(error) => eprintln!("{DIM} failed: {error}{RESET}"),
                     }
                 }
+                // Precedence for a name that isn't a builtin: a custom
+                // agent runs its own dedicated turn; a skill injects its
+                // instructions into the shared history; a custom command
+                // expands into a regular prompt. Collisions across these
+                // three are expected to be rare (an agent name reads as a
+                // persona, a skill name as a capability, a command name as
+                // a prompt shorthand) — documented here since it's the only
+                // place the order actually matters.
                 other => {
-                    if let Some(command) =
+                    if let Some(entry) = junebug_cli::custom_agent::load(root, other) {
+                        if argument.is_empty() {
+                            eprintln!("usage: /{other} <message>   ({})", entry.agent.description);
+                        } else if let Some(active) = provider.as_ref() {
+                            run_named_agent_turn(
+                                &entry.agent,
+                                argument,
+                                messages,
+                                active,
+                                workspace,
+                                root,
+                                permission,
+                                args.plan,
+                                args.max_context_chars,
+                                session,
+                            );
+                        } else {
+                            eprintln!(
+                                "no model yet — use {BOLD}/keys{RESET} or start Ollama first"
+                            );
+                        }
+                    } else if let Some(entry) = junebug_cli::skill::load(root, other) {
+                        let skill_message = json!({
+                            "role": "system",
+                            "content": format!("[Skill: {}]\n{}", entry.skill.name, entry.skill.body)
+                        });
+                        let _ = session.record_message(&skill_message);
+                        messages.push(skill_message);
+                        if argument.is_empty() {
+                            eprintln!(
+                                "{DIM}loaded skill '{}' — applies to your next message{RESET}",
+                                entry.skill.name
+                            );
+                        } else {
+                            custom_prompt = Some(argument.to_owned());
+                        }
+                    } else if let Some(command) =
                         custom_commands.iter().find(|command| command.name == other)
                     {
                         custom_prompt =
@@ -3711,6 +3884,630 @@ fn report_investigation_stop(error: &str) {
     }
 }
 
+// ---------------------------------------------------------------------
+// Conversational builders: /agent-build, /agent-update, /tool-build,
+// /tool-update, /skill-build, /skill-update. All three share the same
+// shape (a back-and-forth conversation ending in a strict "<LABEL>: READY"
+// signal, then a confirm-and-save step) — see `run_builder_turn` (one
+// rendered turn, operating on a *persistent* message history, unlike
+// `investigate_agent`'s fresh-per-call design: a builder needs real memory
+// of its own back-and-forth) and `drive_builder` (the loop around it).
+// ---------------------------------------------------------------------
+
+/// Run one turn of a conversational builder, appending `user_input` to the
+/// persistent `messages` history and rendering the turn live with a
+/// spinner — the same worker-thread/channel structure every other
+/// role-based turn in this codebase uses, adapted from `investigate_agent`
+/// for a *persistent* rather than fresh-each-call message list, since a
+/// builder needs real multi-turn memory of its own conversation. Unlike
+/// `swarm_agent`/`investigate_agent` there is no outer transient/rate-limit
+/// retry wrapper here: `agent::run_loop` already retries those internally,
+/// and a builder conversation is auxiliary tooling, not the core turn loop
+/// — a deliberate scope trim, not an oversight.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_builder_turn(
+    provider: &ActiveProvider,
+    model: &str,
+    messages: &mut Vec<Value>,
+    user_input: &str,
+    tools: &[Value],
+    policy: &PolicyEngine,
+    workspace: &Workspace,
+    session: &SessionWriter,
+    max_context_chars: usize,
+    phase: &str,
+) -> Result<String, String> {
+    messages.push(json!({"role": "user", "content": user_input}));
+    let _ = session.record_message(messages.last().expect("just pushed"));
+    let (events_tx, events_rx) = mpsc::channel::<TurnEvent>();
+    let (answer_tx, answer_rx) = mpsc::channel::<bool>();
+    let cancel = AtomicBool::new(false);
+    let raw = terminal::enable_raw_mode().is_ok();
+    let started = Instant::now();
+    let result = thread::scope(|scope| {
+        let observer_tx = events_tx.clone();
+        let approve_tx = events_tx;
+        let cancel_ref = &cancel;
+        let messages_ref = &mut *messages;
+        let worker = scope.spawn(move || {
+            let mut observer = ChannelObserver {
+                events: observer_tx,
+            };
+            let mut approve = |message: &str| -> bool {
+                approve_tx
+                    .send(TurnEvent::ApprovalRequest(message.to_owned()))
+                    .is_ok()
+                    && answer_rx.recv().unwrap_or(false)
+            };
+            let mut checkpoint = |_label: &str| {};
+            let mut source = agent::PinnedModel::new(provider, model);
+            let mut clients: Vec<McpClient> = Vec::new();
+            agent::run_loop(
+                &mut source,
+                workspace,
+                tools,
+                policy,
+                messages_ref,
+                &mut clients,
+                session,
+                &mut approve,
+                &mut checkpoint,
+                max_context_chars,
+                MAX_TURNS,
+                cancel_ref,
+                &mut observer,
+            )
+        });
+        let mut renderer = markdown::Renderer::new(raw);
+        let mut frame = 0usize;
+        let mut spinner_shown = false;
+        let ending = if raw { "\r\n" } else { "\n" };
+        loop {
+            let mut drained = false;
+            while let Ok(turn_event) = events_rx.try_recv() {
+                drained = true;
+                if spinner_shown {
+                    eprint!("{CLEAR_LINE}");
+                    spinner_shown = false;
+                }
+                match turn_event {
+                    TurnEvent::Text(text) => {
+                        let output = renderer.push(&text);
+                        if !output.is_empty() {
+                            print!("{output}");
+                            let _ = io::stdout().flush();
+                        }
+                    }
+                    TurnEvent::ToolCall(name, arguments) => {
+                        let pending = renderer.finish();
+                        if !pending.is_empty() {
+                            print!("{pending}");
+                            let _ = io::stdout().flush();
+                        }
+                        eprint!(
+                            "{DIM}  ⏺ {name}({}){RESET}{ending}",
+                            tool_call_detail(&arguments)
+                        );
+                    }
+                    TurnEvent::ToolResult(result) => {
+                        let color = if result.starts_with("ERROR") {
+                            RED
+                        } else {
+                            DIM
+                        };
+                        eprint!("{color}  ⎿ {}{RESET}{ending}", tool_result_summary(&result));
+                    }
+                    TurnEvent::ApprovalRequest(message) => {
+                        if raw {
+                            let _ = terminal::disable_raw_mode();
+                        }
+                        eprintln!("\n{message}\nApprove? {BOLD}[y/N]{RESET}");
+                        let mut answer = String::new();
+                        let approved = io::stdin().read_line(&mut answer).is_ok()
+                            && parse_approval_answer(&answer);
+                        if raw {
+                            let _ = terminal::enable_raw_mode();
+                        }
+                        let _ = answer_tx.send(approved);
+                    }
+                    TurnEvent::FileDiff(diff) => {
+                        for line in junebug_cli::diff::clip(&diff, 80).lines() {
+                            let styled = if line.starts_with('+') {
+                                format!("{GREEN}{line}{RESET}")
+                            } else if line.starts_with('-') {
+                                format!("{RED}{line}{RESET}")
+                            } else {
+                                format!("{DIM}{line}{RESET}")
+                            };
+                            eprint!("    {styled}{ending}");
+                        }
+                    }
+                    TurnEvent::RouteChanged(_) => {}
+                    TurnEvent::Notice(text) => {
+                        eprint!("{YELLOW}⟳ {text}{RESET}{ending}");
+                    }
+                }
+            }
+            if worker.is_finished() {
+                if !drained {
+                    break;
+                }
+                continue;
+            }
+            if raw {
+                if event::poll(Duration::from_millis(80)).unwrap_or(false) {
+                    if let Ok(Event::Key(key)) = event::read() {
+                        if key.kind != KeyEventKind::Press {
+                            continue;
+                        }
+                        let ctrl_c = key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL);
+                        if (key.code == KeyCode::Esc || ctrl_c) && !cancel.load(Ordering::Relaxed) {
+                            cancel.store(true, Ordering::Relaxed);
+                            if spinner_shown {
+                                eprint!("{CLEAR_LINE}");
+                                spinner_shown = false;
+                            }
+                            eprint!("{YELLOW}interrupting…{RESET}{ending}");
+                        }
+                    }
+                } else {
+                    frame = (frame + 1) % SPINNER_FRAMES.len();
+                    eprint!(
+                        "{CLEAR_LINE}{CYAN}{}{RESET} {DIM}{phase} · {}s · {model} · esc interrupt{RESET}",
+                        SPINNER_FRAMES[frame],
+                        started.elapsed().as_secs()
+                    );
+                    spinner_shown = true;
+                }
+            } else {
+                thread::sleep(Duration::from_millis(80));
+            }
+        }
+        if spinner_shown {
+            eprint!("{CLEAR_LINE}");
+        }
+        let pending = renderer.finish();
+        if !pending.is_empty() {
+            print!("{pending}");
+            let _ = io::stdout().flush();
+        }
+        worker.join()
+    });
+    if raw {
+        let _ = terminal::disable_raw_mode();
+    }
+    let Ok(outcome) = result else {
+        return Err(format!("{phase} thread panicked"));
+    };
+    let outcome = outcome?;
+    if outcome.interrupted {
+        return Err("interrupted by user".to_owned());
+    }
+    println!();
+    Ok(final_assistant_text(messages))
+}
+
+/// `[y/N]` prompt used by every builder's save step to pick global vs repo
+/// scope — global agents/tools/skills are meant to be the exception (most
+/// things are project-specific), so the default is repo.
+fn prompt_global_scope() -> bool {
+    eprint!("Save globally — available in every repo, not just this one? {DIM}[y/N]{RESET} ");
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer).is_ok() && parse_approval_answer(&answer)
+}
+
+/// Shared driver for the three conversational builders: after each turn,
+/// if the builder's strict ready signal fired, parse the proposed spec,
+/// show it, and ask to confirm before saving; otherwise read the user's
+/// next message and continue the back-and-forth. Returns once saved,
+/// declined and abandoned (Ctrl-D), or the turn itself errors out.
+#[allow(clippy::too_many_arguments)]
+fn drive_builder<T>(
+    editor: &mut Editor,
+    footer: &str,
+    provider: &ActiveProvider,
+    messages: &mut Vec<Value>,
+    tools: &[Value],
+    policy: &PolicyEngine,
+    workspace: &Workspace,
+    session: &SessionWriter,
+    max_context_chars: usize,
+    phase: &str,
+    first_input: String,
+    parse_ready: fn(&str) -> bool,
+    parse_spec: fn(&str) -> Result<T, String>,
+    describe: fn(&T) -> String,
+    mut save: impl FnMut(&T) -> Result<PathBuf, String>,
+) {
+    let mut next_input = first_input;
+    loop {
+        let reply = match run_builder_turn(
+            provider,
+            provider.model(),
+            messages,
+            &next_input,
+            tools,
+            policy,
+            workspace,
+            session,
+            max_context_chars,
+            phase,
+        ) {
+            Ok(reply) => reply,
+            Err(error) => {
+                eprintln!("{RED}cancelled:{RESET} {error}");
+                return;
+            }
+        };
+        if parse_ready(&reply) {
+            match parse_spec(&reply) {
+                Ok(spec) => {
+                    eprintln!("\n{DIM}{}{RESET}", describe(&spec));
+                    eprint!("Save this? {BOLD}[y/N]{RESET} ");
+                    let mut answer = String::new();
+                    let confirmed = io::stdin().read_line(&mut answer).is_ok()
+                        && parse_approval_answer(&answer);
+                    if confirmed {
+                        match save(&spec) {
+                            Ok(path) => eprintln!("saved to {}", path.display()),
+                            Err(error) => eprintln!("{RED}error:{RESET} {error}"),
+                        }
+                        return;
+                    }
+                    "The user wants changes rather than accepting this — keep refining based on further conversation."
+                        .clone_into(&mut next_input);
+                    continue;
+                }
+                Err(error) => {
+                    next_input = format!(
+                        "Your previous reply could not be parsed ({error}) — reply again with ONLY a valid spec object as specified."
+                    );
+                    continue;
+                }
+            }
+        }
+        let Some(line) = editor.read_line_with_shortcut(footer, None) else {
+            eprintln!("{DIM}cancelled{RESET}");
+            return;
+        };
+        let line = line.trim().to_owned();
+        if line.is_empty() {
+            continue;
+        }
+        next_input = line;
+    }
+}
+
+/// `/agent-build <notes>` (fresh) or `/agent-update <name> [notes]`
+/// (`existing` populated, seeds the conversation with the current
+/// definition and saves back to the same scope it was loaded from instead
+/// of asking). Read-only tools throughout — an agent's own *definition* is
+/// never something the builder needs write access to produce.
+#[allow(clippy::too_many_arguments)]
+fn handle_agent_build(
+    editor: &mut Editor,
+    provider: Option<&ActiveProvider>,
+    workspace: &Workspace,
+    root: &Path,
+    permission: PermissionMode,
+    max_context_chars: usize,
+    notes: &str,
+    existing: Option<&junebug_cli::custom_agent::AgentEntry>,
+) {
+    let Some(active) = provider else {
+        eprintln!("no model yet — use {BOLD}/keys{RESET} or start Ollama first");
+        return;
+    };
+    let session = match SessionWriter::create(root) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("{RED}error:{RESET} {error}");
+            return;
+        }
+    };
+    let request = existing.as_ref().map_or_else(
+        || junebug_cli::custom_agent::build_request(notes),
+        |entry| junebug_cli::custom_agent::update_request(&entry.agent, notes),
+    );
+    let mut messages = vec![json!({
+        "role": "system",
+        "content": format!(
+            "{}\nThe startup workspace is exactly: {}",
+            junebug_cli::custom_agent::AGENT_BUILDER_SYSTEM,
+            workspace.root().display()
+        )
+    })];
+    let tools = tool_schemas(true);
+    let policy = PolicyEngine::new(permission, true);
+    let existing_scope = existing.as_ref().map(|entry| entry.scope);
+    drive_builder(
+        editor,
+        "designing a custom agent — reply, or ctrl-d to cancel",
+        active,
+        &mut messages,
+        &tools,
+        &policy,
+        workspace,
+        &session,
+        max_context_chars,
+        "designing agent",
+        request,
+        junebug_cli::custom_agent::parse_ready,
+        junebug_cli::custom_agent::parse_spec,
+        |spec: &junebug_cli::custom_agent::CustomAgent| {
+            format!(
+                "name: /{}\ndescription: {}\ntools: {}\npermission: {}\n\nsystem_prompt:\n{}",
+                spec.name,
+                spec.description,
+                if spec.tools.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    spec.tools.join(", ")
+                },
+                spec.permission
+                    .as_deref()
+                    .unwrap_or("(session's ambient permission)"),
+                spec.system_prompt
+            )
+        },
+        move |spec: &junebug_cli::custom_agent::CustomAgent| {
+            let scope = existing_scope.unwrap_or_else(|| {
+                if prompt_global_scope() {
+                    junebug_cli::custom_agent::Scope::Global
+                } else {
+                    junebug_cli::custom_agent::Scope::Repo
+                }
+            });
+            junebug_cli::custom_agent::save(root, spec, scope)
+        },
+    );
+}
+
+/// `/tool-build <notes>` (fresh) or `/tool-update <name> [notes]`
+/// (`existing` populated). Unlike agent/skill building, this needs real
+/// write and command-execution access — the builder scaffolds an actual
+/// script and must test-invoke it before proposing it as done (see
+/// `custom_tool::TOOL_BUILDER_SYSTEM`) — so it requires at least
+/// `workspace-write` permission and refuses under plan mode or read-only,
+/// the same guard `/swarm` already uses for the same reason.
+#[allow(clippy::too_many_arguments)]
+fn handle_tool_build(
+    editor: &mut Editor,
+    provider: Option<&ActiveProvider>,
+    workspace: &Workspace,
+    root: &Path,
+    permission: PermissionMode,
+    plan: bool,
+    max_context_chars: usize,
+    notes: &str,
+    existing: Option<&junebug_cli::custom_tool::ToolEntry>,
+) {
+    let Some(active) = provider else {
+        eprintln!("no model yet — use {BOLD}/keys{RESET} or start Ollama first");
+        return;
+    };
+    if plan || permission == PermissionMode::ReadOnly {
+        eprintln!(
+            "{RED}error:{RESET} building a tool means writing and running a script to test it — plan mode/read-only permission can't do that. Use /permissions to grant at least workspace-write first."
+        );
+        return;
+    }
+    let session = match SessionWriter::create(root) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("{RED}error:{RESET} {error}");
+            return;
+        }
+    };
+    let request = existing.as_ref().map_or_else(
+        || junebug_cli::custom_tool::build_request(notes),
+        |entry| junebug_cli::custom_tool::update_request(&entry.tool, notes),
+    );
+    let mut messages = vec![json!({
+        "role": "system",
+        "content": format!(
+            "{}\nThe startup workspace is exactly: {}",
+            junebug_cli::custom_tool::TOOL_BUILDER_SYSTEM,
+            workspace.root().display()
+        )
+    })];
+    let tools = tool_schemas(false);
+    let policy = PolicyEngine::new(permission, false);
+    let existing_scope = existing.as_ref().map(|entry| entry.scope);
+    drive_builder(
+        editor,
+        "designing & testing a custom tool — reply, or ctrl-d to cancel",
+        active,
+        &mut messages,
+        &tools,
+        &policy,
+        workspace,
+        &session,
+        max_context_chars,
+        "building tool",
+        request,
+        junebug_cli::custom_tool::parse_ready,
+        junebug_cli::custom_tool::parse_spec,
+        |spec: &junebug_cli::custom_tool::CustomTool| {
+            format!(
+                "name: {}\ndescription: {}\ncommand: {} {:?}\nparameters: {}",
+                spec.name, spec.description, spec.command, spec.args, spec.parameters
+            )
+        },
+        move |spec: &junebug_cli::custom_tool::CustomTool| {
+            let scope = existing_scope.unwrap_or_else(|| {
+                if prompt_global_scope() {
+                    junebug_cli::custom_tool::Scope::Global
+                } else {
+                    junebug_cli::custom_tool::Scope::Repo
+                }
+            });
+            junebug_cli::custom_tool::save(root, spec, scope)
+        },
+    );
+}
+
+/// `/skill-build <notes>` (fresh) or `/skill-update <name> [notes]`
+/// (`existing` populated). Read-only tools — a skill is only ever
+/// instructions, nothing to test the way a tool's script needs testing.
+#[allow(clippy::too_many_arguments)]
+fn handle_skill_build(
+    editor: &mut Editor,
+    provider: Option<&ActiveProvider>,
+    workspace: &Workspace,
+    root: &Path,
+    permission: PermissionMode,
+    max_context_chars: usize,
+    notes: &str,
+    existing: Option<&junebug_cli::skill::SkillEntry>,
+) {
+    let Some(active) = provider else {
+        eprintln!("no model yet — use {BOLD}/keys{RESET} or start Ollama first");
+        return;
+    };
+    let session = match SessionWriter::create(root) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("{RED}error:{RESET} {error}");
+            return;
+        }
+    };
+    let request = existing.as_ref().map_or_else(
+        || junebug_cli::skill::build_request(notes),
+        |entry| junebug_cli::skill::update_request(&entry.skill, notes),
+    );
+    let mut messages = vec![json!({
+        "role": "system",
+        "content": format!(
+            "{}\nThe startup workspace is exactly: {}",
+            junebug_cli::skill::SKILL_BUILDER_SYSTEM,
+            workspace.root().display()
+        )
+    })];
+    let tools = tool_schemas(true);
+    let policy = PolicyEngine::new(permission, true);
+    let existing_scope = existing.as_ref().map(|entry| entry.scope);
+    drive_builder(
+        editor,
+        "authoring a skill — reply, or ctrl-d to cancel",
+        active,
+        &mut messages,
+        &tools,
+        &policy,
+        workspace,
+        &session,
+        max_context_chars,
+        "authoring skill",
+        request,
+        junebug_cli::skill::parse_ready,
+        junebug_cli::skill::parse_spec,
+        |spec: &junebug_cli::skill::Skill| {
+            format!(
+                "name: /{}\ndescription: {}\n\n{}",
+                spec.name, spec.description, spec.body
+            )
+        },
+        move |spec: &junebug_cli::skill::Skill| {
+            let scope = existing_scope.unwrap_or_else(|| {
+                if prompt_global_scope() {
+                    junebug_cli::skill::Scope::Global
+                } else {
+                    junebug_cli::skill::Scope::Repo
+                }
+            });
+            junebug_cli::skill::save(root, spec, scope)
+        },
+    );
+}
+
+/// Direct `/<name>` invocation of a custom agent: one turn using its own
+/// system prompt and a tools subset narrowed to `agent.tools` (the
+/// intersection with what's actually available — never wider than the
+/// ambient tool set or permission), appended onto the *real*, shared
+/// conversation. Unlike `/swarm`/`/investigate` this sees everything
+/// discussed so far, and its own exchange becomes part of the visible
+/// history for whatever is asked next. The swap is scoped to this one
+/// call: the real `messages[0]` (Junebug's own system prompt) is never
+/// touched, so a plain follow-up afterward is answered by ordinary Junebug
+/// again, not by the agent.
+#[allow(clippy::too_many_arguments)]
+fn run_named_agent_turn(
+    agent: &junebug_cli::custom_agent::CustomAgent,
+    argument: &str,
+    messages: &mut Vec<Value>,
+    provider: &ActiveProvider,
+    workspace: &Workspace,
+    root: &Path,
+    permission: PermissionMode,
+    plan: bool,
+    max_context_chars: usize,
+    session: &SessionWriter,
+) {
+    let effective_permission = agent.effective_permission(permission);
+    let scoped_tools: Vec<Value> = if agent.tools.is_empty() {
+        Vec::new()
+    } else {
+        tool_schemas_with_custom(plan, root)
+            .into_iter()
+            .filter(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| agent.tools.iter().any(|allowed| allowed == name))
+            })
+            .collect()
+    };
+    let policy = PolicyEngine::new(effective_permission, plan);
+    let original_len = messages.len();
+    let mut agent_messages: Vec<Value> =
+        vec![json!({"role": "system", "content": &agent.system_prompt})];
+    if messages
+        .first()
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+        == Some("system")
+    {
+        agent_messages.extend_from_slice(&messages[1..]);
+    } else {
+        agent_messages.extend_from_slice(messages);
+    }
+    eprintln!(
+        "{BOLD}/{}{RESET} {DIM}· {} · {}{RESET}",
+        agent.name,
+        effective_permission.as_str(),
+        if scoped_tools.is_empty() {
+            "no tools".to_owned()
+        } else {
+            format!("{} tools", scoped_tools.len())
+        }
+    );
+    match run_builder_turn(
+        provider,
+        provider.model(),
+        &mut agent_messages,
+        argument,
+        &scoped_tools,
+        &policy,
+        workspace,
+        session,
+        max_context_chars,
+        &format!("running /{}", agent.name),
+    ) {
+        Ok(_reply) => {
+            // Everything this turn actually added — the new user message,
+            // any tool_call/tool_result pairs, and the final assistant
+            // reply — appended onto the real, shared history. `agent.
+            // system_prompt` itself never touches the real array. Already
+            // recorded to `session` by `run_loop` itself as the turn ran;
+            // no need to log it again here.
+            messages.extend_from_slice(&agent_messages[original_len..]);
+        }
+        Err(error) => {
+            eprintln!("{RED}/{} aborted:{RESET} {error}", agent.name);
+        }
+    }
+}
+
 /// Replace the conversation with a model-written summary, keeping the
 /// system prompt. The session log keeps the full raw history; compaction
 /// only changes the in-memory context sent on future turns.
@@ -3950,7 +4747,7 @@ fn tool_schemas(plan: bool) -> Vec<Value> {
         json!({"type":"function","function":{"name":"web_search","description":"Search the web (DuckDuckGo) for current information the workspace cannot answer: library versions, error messages, documentation, news. Returns numbered result titles, URLs, and snippets; use fetch_url to read a result page. The query is sent to an external service; outside yolo every call requires user approval.","parameters":{"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":10,"description":"Results to return (default 5)."}},"required":["query"],"additionalProperties":false}}}),
         json!({"type":"function","function":{"name":"fetch_url","description":"Fetch one http(s) URL and return its readable text (HTML is reduced to text; output truncated). Use after web_search to read a result page, or for documentation URLs. Outside yolo every call requires user approval.","parameters":{"type":"object","properties":{"url":{"type":"string"},"max_chars":{"type":"integer","minimum":1_000,"maximum":100_000,"description":"Characters to return (default 20000)."}},"required":["url"],"additionalProperties":false}}}),
         json!({"type":"function","function":{"name":"write_todos","description":"Track your plan for a multi-step task as a checklist. Call this to lay out the steps before starting, then again whenever a step's status changes — mark one in_progress before you start it and completed right after, rather than batching updates. Always pass the full list; each call replaces the previous one. Skip this for a single-step task.","parameters":{"type":"object","properties":{"todos":{"type":"array","items":{"type":"object","properties":{"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed"]}},"required":["content","status"],"additionalProperties":false}}},"required":["todos"],"additionalProperties":false}}}),
-        json!({"type":"function","function":{"name":"task","description":"Delegate a self-contained chunk of work to a fresh sub-agent with its own isolated context and the same tools and permissions as you (it cannot spawn further sub-agents). Use it to investigate or execute something that would take many exploratory tool calls — e.g. 'find every caller of X and summarize how each uses it' — without filling your own context with those intermediate steps; you only see its final answer. The sub-agent cannot ask you follow-up questions, so give it a complete, self-contained prompt with every bit of context it needs.","parameters":{"type":"object","properties":{"description":{"type":"string","description":"Short label for what this sub-agent is doing, shown in the activity log."},"prompt":{"type":"string","description":"The full task for the sub-agent, including all context it needs — it starts with nothing but this."}},"required":["description","prompt"],"additionalProperties":false}}}),
+        json!({"type":"function","function":{"name":"task","description":"Delegate a self-contained chunk of work to a fresh sub-agent. By default it gets an isolated context (no memory of this conversation) and the same tools and permissions as you, and cannot spawn further sub-agents. Use it to investigate or execute something that would take many exploratory tool calls — e.g. 'find every caller of X and summarize how each uses it' — without filling your own context with those intermediate steps; you only see its final answer, so give it a complete, self-contained prompt. Set agent to the name of one of your available custom agents (see their descriptions) to delegate with that agent's own tailored system prompt and narrower tool set instead — its permission can only ever be equal to or stricter than yours, never looser — and in that case it DOES see everything discussed in this conversation so far, so the prompt only needs to add whatever that history doesn't already cover.","parameters":{"type":"object","properties":{"description":{"type":"string","description":"Short label for what this sub-agent is doing, shown in the activity log."},"prompt":{"type":"string","description":"The full task for the sub-agent."},"agent":{"type":"string","description":"Optional: the name of a configured custom agent to delegate to instead of a generic, historyless sub-agent."}},"required":["description","prompt"],"additionalProperties":false}}}),
     ];
     if plan {
         tools.retain(|tool| {
@@ -3972,9 +4769,26 @@ fn tool_schemas(plan: bool) -> Vec<Value> {
     tools
 }
 
+/// `tool_schemas` plus any configured custom tools (`custom_tool.rs`) —
+/// split out rather than folded into `tool_schemas` itself because this is
+/// the only call site that should see them: the main REPL's own turn (and,
+/// by inheriting its tool list, the default `task` sub-agent). `/swarm` and
+/// `/investigate`'s fixed-function roles keep calling `tool_schemas`
+/// directly, unchanged, deliberately out of scope for custom tools. Plan
+/// mode never sees them at all — a custom tool's risk is unknowable (it
+/// always runs as `ToolRisk::Execute`, the same treatment MCP tools get),
+/// which is incompatible with plan mode's guarantee of zero side effects.
+fn tool_schemas_with_custom(plan: bool, root: &Path) -> Vec<Value> {
+    let mut tools = tool_schemas(plan);
+    if !plan {
+        tools.extend(junebug_cli::custom_tool::schemas(root));
+    }
+    tools
+}
+
 fn print_help() {
     println!(
-        "Junebug CLI {VERSION}\n\nUSAGE:\n  junebug [OPTIONS] [prompt]     interactive REPL when prompt is omitted\n  junebug exec --json [OPTIONS] <prompt>\n  junebug set --provider NAME API_KEY   save the key to ~/.junebug/credentials.env, then start the REPL\n\nOPTIONS:\n  --provider openrouter|openai|deepseek|anthropic|zai|ollama|local-openai|claude-cli|codex-cli|plugin\n  --model MODEL|auto\n  --permission read-only|ask|workspace-write|yolo   (default read-only)\n  --plan                        hard read-only guard regardless of --permission\n  --resume [SESSION]            continue a session (the path must exist); with no path, pick from a list\n  --resume-compact [SESSION]    like --resume but summarizes large histories first\n  --max-context-chars COUNT\n  --no-project-instructions\n  --no-checkpoints              disable automatic workspace snapshots (/rewind)\n  --enable-hooks / --enable-mcp\n\nREPL: /help /model /hardware /index /permissions /rewind /compact /status /changes /explorer /commits /diff /investigate /exit — esc interrupts a running turn.\n\nPROVIDERS:\n  OPENROUTER_API_KEY   provider=openrouter\n  OPENAI_API_KEY       provider=openai\n  DEEPSEEK_API_KEY     provider=deepseek\n  ANTHROPIC_API_KEY    provider=anthropic (Claude)\n  ZAI_API_KEY          provider=zai (Z.ai GLM, over their Claude-Code-compatible endpoint)\n  OLLAMA_HOST          provider=ollama (optional; defaults to http://127.0.0.1:11434)\n  LOCAL_OPENAI_BASE_URL provider=local-openai (LM Studio, vLLM, llama.cpp)\n  LOCAL_OPENAI_API_KEY  optional bearer token for local-openai\n  claude-cli            delegates to your local, already-logged-in `claude` CLI (Pro/Max subscription or API key — whatever it's configured with); no key needed\n  codex-cli             delegates to your local, already-logged-in `codex` CLI (ChatGPT subscription or API key); no key needed\n  plugin                delegates to a locally configured external agent — see PLUGIN_PROTOCOL.md; select with --model <plugin-name>\n\nRepository hooks and MCP servers are disabled unless explicitly enabled."
+        "Junebug CLI {VERSION}\n\nUSAGE:\n  junebug [OPTIONS] [prompt]     interactive REPL when prompt is omitted\n  junebug exec --json [OPTIONS] <prompt>\n  junebug set --provider NAME API_KEY   save the key to ~/.junebug/credentials.env, then start the REPL\n\nOPTIONS:\n  --provider openrouter|openai|deepseek|anthropic|zai|ollama|local-openai|claude-cli|codex-cli|plugin\n  --model MODEL|auto\n  --permission read-only|ask|workspace-write|yolo   (default read-only)\n  --plan                        hard read-only guard regardless of --permission\n  --resume [SESSION]            continue a session (the path must exist); with no path, pick from a list\n  --resume-compact [SESSION]    like --resume but summarizes large histories first\n  --max-context-chars COUNT\n  --no-project-instructions\n  --no-checkpoints              disable automatic workspace snapshots (/rewind)\n  --enable-hooks / --enable-mcp\n\nREPL: /help /model /hardware /index /permissions /rewind /compact /status /changes /explorer /commits /diff /investigate /agent-build /tool-build /skill-build /exit — esc interrupts a running turn.\n\nPROVIDERS:\n  OPENROUTER_API_KEY   provider=openrouter\n  OPENAI_API_KEY       provider=openai\n  DEEPSEEK_API_KEY     provider=deepseek\n  ANTHROPIC_API_KEY    provider=anthropic (Claude)\n  ZAI_API_KEY          provider=zai (Z.ai GLM, over their Claude-Code-compatible endpoint)\n  OLLAMA_HOST          provider=ollama (optional; defaults to http://127.0.0.1:11434)\n  LOCAL_OPENAI_BASE_URL provider=local-openai (LM Studio, vLLM, llama.cpp)\n  LOCAL_OPENAI_API_KEY  optional bearer token for local-openai\n  claude-cli            delegates to your local, already-logged-in `claude` CLI (Pro/Max subscription or API key — whatever it's configured with); no key needed\n  codex-cli             delegates to your local, already-logged-in `codex` CLI (ChatGPT subscription or API key); no key needed\n  plugin                delegates to a locally configured external agent — see PLUGIN_PROTOCOL.md; select with --model <plugin-name>\n\nRepository hooks and MCP servers are disabled unless explicitly enabled."
     );
 }
 

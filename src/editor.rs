@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 
-pub const SLASH_COMMANDS: [(&str, &str); 19] = [
+pub const SLASH_COMMANDS: [(&str, &str); 28] = [
     ("/changes", "browse changed files and per-file diffs"),
     (
         "/commits",
@@ -53,6 +53,33 @@ pub const SLASH_COMMANDS: [(&str, &str); 19] = [
         "/investigate-setup",
         "optionally assign models to investigation roles",
     ),
+    (
+        "/agent-build",
+        "conversationally design a new custom agent (system prompt + tool subset)",
+    ),
+    (
+        "/agent-update",
+        "refine an existing custom agent: /agent-update <name> [notes]",
+    ),
+    ("/agents", "list configured custom agents"),
+    (
+        "/tool-build",
+        "design, write, and test-run a new custom tool script",
+    ),
+    (
+        "/tool-update",
+        "refine an existing custom tool: /tool-update <name> [notes]",
+    ),
+    ("/tools", "list configured custom tools"),
+    (
+        "/skill-build",
+        "conversationally author a new skill (instructions loaded into context)",
+    ),
+    (
+        "/skill-update",
+        "refine an existing skill: /skill-update <name> [notes]",
+    ),
+    ("/skills", "list configured skills"),
 ];
 
 const MENU_LIMIT: usize = 8;

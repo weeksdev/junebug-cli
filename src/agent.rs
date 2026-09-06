@@ -313,6 +313,7 @@ pub fn run_loop(
                     max_turns,
                     cancel,
                     observer,
+                    messages,
                 )
             } else {
                 observer.on_tool_call(&call.name, &call.arguments);
@@ -524,8 +525,22 @@ pub fn execute_tool(
         Ok(arguments) => arguments,
         Err(error) => return format!("ERROR: invalid tool arguments: {error}"),
     };
-    let Some(risk) = tool_risk(&call.name) else {
-        return format!("ERROR: unknown tool: {}", call.name);
+    // A name that isn't a builtin or an `mcp__`-prefixed tool might be a
+    // configured custom tool (`custom_tool.rs`) — always `ToolRisk::Execute`
+    // (its script can do anything), the same treatment MCP tools already
+    // get, since a custom tool's actual risk is unknowable from its name.
+    let custom_tool = if tool_risk(&call.name).is_none() && !call.name.starts_with("mcp__") {
+        crate::custom_tool::load(workspace.root(), &call.name)
+    } else {
+        None
+    };
+    let risk = if custom_tool.is_some() {
+        ToolRisk::Execute
+    } else {
+        match tool_risk(&call.name) {
+            Some(risk) => risk,
+            None => return format!("ERROR: unknown tool: {}", call.name),
+        }
     };
     let path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
     let unrestricted = policy.unrestricted_access();
@@ -541,7 +556,13 @@ pub fn execute_tool(
     if risk != ToolRisk::Read {
         checkpoint(&checkpoint_label(call, &arguments, path));
     }
-    let result = if let Some((server, tool)) = call
+    let result = if let Some(entry) = &custom_tool {
+        Ok(crate::custom_tool::call(
+            &entry.tool,
+            &arguments,
+            workspace.root(),
+        ))
+    } else if let Some((server, tool)) = call
         .name
         .strip_prefix("mcp__")
         .and_then(|name| name.split_once("__"))
@@ -739,7 +760,7 @@ fn clip(text: &str, max: usize) -> String {
 /// excluded from their tool list), so delegation is exactly one level deep
 /// and the plan stays owned by whichever agent is actually showing it to
 /// the user.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_subagent(
     workspace: &Workspace,
     provider: &dyn ModelProvider,
@@ -754,6 +775,7 @@ fn run_subagent(
     max_turns: usize,
     cancel: &AtomicBool,
     observer: &mut dyn TurnObserver,
+    history: &[Value],
 ) -> String {
     let arguments: Value = match serde_json::from_str(arguments) {
         Ok(arguments) => arguments,
@@ -767,30 +789,75 @@ fn run_subagent(
         .and_then(Value::as_str)
         .unwrap_or("sub-agent")
         .to_owned();
+    // Naming a configured custom agent swaps in its own system prompt and
+    // narrows the tool set to its own list — see `custom_agent.rs`'s module
+    // doc for why this, uniquely among the ways a sub-agent can run, seeds
+    // its history from the parent's conversation instead of starting blank.
+    let requested_agent = arguments.get("agent").and_then(Value::as_str);
+    let named_agent = match requested_agent {
+        Some(name) => match crate::custom_agent::load(workspace.root(), name) {
+            Some(entry) => Some(entry.agent),
+            None => return format!("ERROR: no agent named '{name}'"),
+        },
+        None => None,
+    };
     let sub_tools: Vec<Value> = tools
         .iter()
         .filter(|tool| {
-            !matches!(
-                tool.pointer("/function/name").and_then(Value::as_str),
-                Some("task" | "write_todos")
-            )
+            let name = tool.pointer("/function/name").and_then(Value::as_str);
+            if matches!(name, Some("task" | "write_todos")) {
+                return false;
+            }
+            named_agent.as_ref().is_none_or(|agent| {
+                agent.tools.is_empty()
+                    || name.is_some_and(|name| agent.tools.iter().any(|allowed| allowed == name))
+            })
         })
         .cloned()
         .collect();
+    // A named agent's permission can only ever narrow the caller's own —
+    // `effective_permission` already enforces that; an unnamed sub-agent
+    // keeps the caller's policy exactly as before.
+    let scoped_policy;
+    let policy: &PolicyEngine = if let Some(agent) = &named_agent {
+        scoped_policy = PolicyEngine::new(
+            agent.effective_permission(policy.permission()),
+            policy.plan_mode(),
+        );
+        &scoped_policy
+    } else {
+        policy
+    };
     let session = match SessionWriter::create(workspace.root()) {
         Ok(session) => session,
         Err(error) => return format!("ERROR: could not start sub-agent session: {error}"),
     };
-    let mut messages = vec![
-        json!({
-            "role": "system",
-            "content": format!(
-                "You are a focused sub-agent spawned to complete one self-contained task and report back. There is no user watching this conversation live and you cannot ask follow-up questions, so do the best you can with what you were given, then finish with a clear, complete final answer summarizing what you found or did. The startup workspace is exactly: {}",
-                workspace.root().display()
-            )
-        }),
-        json!({"role": "user", "content": prompt}),
-    ];
+    let system_prompt = named_agent.as_ref().map_or_else(
+        || {
+            "You are a focused sub-agent spawned to complete one self-contained task and report back. There is no user watching this conversation live and you cannot ask follow-up questions, so do the best you can with what you were given, then finish with a clear, complete final answer summarizing what you found or did.".to_owned()
+        },
+        |agent| agent.system_prompt.clone(),
+    );
+    let mut messages = vec![json!({
+        "role": "system",
+        "content": format!(
+            "{system_prompt} The startup workspace is exactly: {}",
+            workspace.root().display()
+        )
+    })];
+    if named_agent.is_some() {
+        // Shares the parent conversation's history — the deliberate
+        // difference from the default (unnamed) sub-agent's blank slate.
+        let skip_leading_system = usize::from(
+            history
+                .first()
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str)
+                == Some("system"),
+        );
+        messages.extend_from_slice(&history[skip_leading_system..]);
+    }
+    messages.push(json!({"role": "user", "content": prompt}));
     let mut source = PinnedModel::new(provider, model);
     let mut relay = SubagentRelay {
         inner: observer,

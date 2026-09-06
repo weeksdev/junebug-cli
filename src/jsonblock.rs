@@ -11,11 +11,24 @@
 /// located at all.
 #[must_use]
 pub fn find_array(text: &str) -> Option<&str> {
+    find_delimited(text, '[', ']')
+}
+
+/// Same idea as `find_array`, for a single fenced or bare JSON *object*
+/// (`{...}`) instead of an array — used by builders that ask a model to end
+/// its reply with one spec object (an agent or tool definition) rather than
+/// a list.
+#[must_use]
+pub fn find_object(text: &str) -> Option<&str> {
+    find_delimited(text, '{', '}')
+}
+
+fn find_delimited(text: &str, open: char, close: char) -> Option<&str> {
     let start = match text.find("```json") {
-        Some(fence) => text[fence..].find('[').map(|offset| fence + offset),
-        None => text.find('['),
+        Some(fence) => text[fence..].find(open).map(|offset| fence + offset),
+        None => text.find(open),
     }?;
-    let end = text.rfind(']')?;
+    let end = text.rfind(close)?;
     if start > end {
         return None;
     }
@@ -47,5 +60,20 @@ mod tests {
     #[test]
     fn returns_none_when_brackets_are_reversed() {
         assert_eq!(find_array("] before ["), None);
+    }
+
+    #[test]
+    fn finds_a_fenced_object() {
+        let text =
+            "Here's the spec:\n```json\n{\"name\":\"a\",\"tools\":[\"read_file\"]}\n```\nDone.";
+        assert_eq!(
+            super::find_object(text),
+            Some("{\"name\":\"a\",\"tools\":[\"read_file\"]}")
+        );
+    }
+
+    #[test]
+    fn find_object_returns_none_with_no_brace_pair() {
+        assert_eq!(super::find_object("no json here"), None);
     }
 }
