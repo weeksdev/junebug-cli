@@ -125,7 +125,18 @@ fn parse_args(arguments: Vec<String>) -> Result<Option<Args>, String> {
     let mut resume = None;
     let mut resume_compact = false;
     let mut resume_pick = false;
-    let mut max_context_chars = 100_000;
+    // ~100K tokens (at ~4 chars/token) — most of a modern cloud model's
+    // real context window, not an arbitrary small guess. The previous
+    // 100_000-character default (~25K tokens) triggered the deterministic
+    // safety-net compaction (`context::compact`) far more often than
+    // actually needed to avoid overflowing a provider, on every tool-call
+    // turn, with no visible sign it had happened — surfaced by a live bug
+    // report once compaction started firing almost every question. This is
+    // still a flat, provider/model-agnostic constant (Junebug has no
+    // per-model context-window table yet, unlike e.g. Claude Code's ~83%-
+    // of-real-window threshold) — `--max-context-chars` remains the manual
+    // override for a small-context local model that needs a tighter cap.
+    let mut max_context_chars = 400_000;
     let mut hooks = false;
     let mut mcp = false;
     let mut plan = false;

@@ -153,6 +153,16 @@ pub fn run_loop(
                 "context_compacted",
                 &format!("{} to {} messages", messages.len(), request_messages.len()),
             )?;
+            // This safety-net trim used to be invisible — the only trace was
+            // the session-log line above, so it could silently rewrite
+            // history (and, before a related fix, occasionally produce a
+            // malformed request) with no on-screen sign anything happened.
+            // Claude Code shows compaction live; this is the same idea.
+            observer.on_notice(&format!(
+                "context compacted: {} → {} messages",
+                messages.len(),
+                request_messages.len()
+            ));
         }
         let selection = source.next(&TurnState {
             turn_index,
