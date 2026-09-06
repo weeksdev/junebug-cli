@@ -70,6 +70,14 @@ pub enum ProviderKind {
     /// `~/.junebug/plugins/<model>.json`, or a workspace override), not a
     /// real model name; there is no default, `model` must always be given.
     Plugin,
+    /// Z.ai's GLM models over their Claude-Code-compatible Anthropic Messages
+    /// API endpoint (`https://api.z.ai/api/anthropic`) — a real REST call
+    /// using `stream_anthropic`'s wire format, not a delegate. The one wire
+    /// difference from real Anthropic: Z.ai's endpoint authenticates via
+    /// `Authorization: Bearer` (matching their documented `ANTHROPIC_AUTH_TOKEN`
+    /// convention), not Anthropic's own `x-api-key` — see
+    /// `anthropic_auth_is_bearer`.
+    Zai,
 }
 
 impl ProviderKind {
@@ -87,8 +95,9 @@ impl ProviderKind {
             "claude-cli" => Ok(Self::ClaudeCli),
             "codex-cli" | "codex" => Ok(Self::CodexCli),
             "plugin" => Ok(Self::Plugin),
+            "zai" | "glm" => Ok(Self::Zai),
             _ => Err(format!(
-                "unsupported provider '{value}'; use openai, openrouter, deepseek, anthropic, ollama, local-openai, claude-cli, codex-cli, or plugin"
+                "unsupported provider '{value}'; use openai, openrouter, deepseek, anthropic, ollama, local-openai, claude-cli, codex-cli, plugin, or zai"
             )),
         }
     }
@@ -104,6 +113,7 @@ impl ProviderKind {
             Self::ClaudeCli => "claude-cli",
             Self::CodexCli => "codex-cli",
             Self::Plugin => "plugin",
+            Self::Zai => "zai",
         }
     }
     #[must_use]
@@ -113,6 +123,7 @@ impl ProviderKind {
             Self::OpenRouter => "https://openrouter.ai/api/v1/chat/completions".to_owned(),
             Self::DeepSeek => "https://api.deepseek.com/chat/completions".to_owned(),
             Self::Anthropic => "https://api.anthropic.com/v1/messages".to_owned(),
+            Self::Zai => "https://api.z.ai/api/anthropic/v1/messages".to_owned(),
             Self::Ollama => format!("{}/v1/chat/completions", ollama_base_url()),
             Self::LocalOpenAi => {
                 format!("{}/v1/chat/completions", local_openai_base_url())
@@ -130,6 +141,12 @@ impl ProviderKind {
             Self::OpenRouter => "https://openrouter.ai/api/v1/models".to_owned(),
             Self::DeepSeek => "https://api.deepseek.com/models".to_owned(),
             Self::Anthropic => "https://api.anthropic.com/v1/models".to_owned(),
+            // Best-effort: Z.ai's Anthropic-compatible endpoint may not
+            // implement Anthropic's `/v1/models` listing at all. An error or
+            // empty result here already falls back to `default_model()` in
+            // every caller (`pick_configured_model`, `/model <provider>`),
+            // so this is safe to just try.
+            Self::Zai => "https://api.z.ai/api/anthropic/v1/models".to_owned(),
             Self::Ollama => format!("{}/v1/models", ollama_base_url()),
             Self::LocalOpenAi => format!("{}/v1/models", local_openai_base_url()),
             Self::ClaudeCli | Self::CodexCli | Self::Plugin => String::new(),
@@ -154,6 +171,7 @@ impl ProviderKind {
             // A plugin's own auth (if any) lives entirely in its own
             // process; Junebug never reads or holds a credential for it.
             Self::Plugin => "JUNEBUG_PLUGIN_UNUSED",
+            Self::Zai => "ZAI_API_KEY",
         }
     }
     /// `"default"` for the CLI-delegate kinds is a sentinel, not a real
@@ -170,6 +188,7 @@ impl ProviderKind {
             Self::OpenRouter => "openrouter/free",
             Self::DeepSeek => "deepseek-v4-flash",
             Self::Anthropic => "claude-sonnet-4-5",
+            Self::Zai => "glm-5.3",
             Self::Ollama => "qwen3:8b",
             Self::LocalOpenAi => "local-model",
             Self::ClaudeCli | Self::CodexCli => "default",
@@ -183,6 +202,25 @@ impl ProviderKind {
             self,
             Self::Ollama | Self::LocalOpenAi | Self::ClaudeCli | Self::CodexCli | Self::Plugin
         )
+    }
+
+    /// Whether this kind speaks Anthropic's Messages API request/response
+    /// shape (`stream_anthropic`/`parse_anthropic_sse`) instead of the
+    /// OpenAI-compatible chat-completions shape every other REST kind uses.
+    #[must_use]
+    pub const fn uses_anthropic_wire_format(self) -> bool {
+        matches!(self, Self::Anthropic | Self::Zai)
+    }
+
+    /// Whether an Anthropic-wire-format kind authenticates via
+    /// `Authorization: Bearer <key>` instead of Anthropic's own `x-api-key`
+    /// header. Only meaningful when `uses_anthropic_wire_format` is true.
+    /// Z.ai documents `ANTHROPIC_AUTH_TOKEN` (which every Anthropic-format
+    /// client sends as a bearer token) rather than `ANTHROPIC_API_KEY`
+    /// (`x-api-key`) as the credential its endpoint expects.
+    #[must_use]
+    pub const fn anthropic_auth_is_bearer(self) -> bool {
+        matches!(self, Self::Zai)
     }
 
     /// Whether this kind is driven by shelling out to a local, already
@@ -199,11 +237,12 @@ impl ProviderKind {
 
     /// All supported providers, in default preference order.
     #[must_use]
-    pub const fn all() -> [Self; 9] {
+    pub const fn all() -> [Self; 10] {
         [
             Self::OpenRouter,
             Self::OpenAi,
             Self::Anthropic,
+            Self::Zai,
             Self::DeepSeek,
             Self::Ollama,
             Self::LocalOpenAi,
@@ -458,10 +497,13 @@ impl OpenAiCompatibleProvider {
             .client
             .get(self.kind.models_endpoint())
             .timeout(CONNECT_TIMEOUT);
-        request = if self.kind == ProviderKind::Anthropic {
-            request
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", "2023-06-01")
+        request = if self.kind.uses_anthropic_wire_format() {
+            let request = if self.kind.anthropic_auth_is_bearer() {
+                request.header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+            } else {
+                request.header("x-api-key", &self.api_key)
+            };
+            request.header("anthropic-version", "2023-06-01")
         } else {
             request.header(AUTHORIZATION, format!("Bearer {}", self.api_key))
         };
@@ -595,7 +637,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
         tools: &[Value],
         cancel: &AtomicBool,
     ) -> Result<ModelTurn, String> {
-        if self.kind == ProviderKind::Anthropic {
+        if self.kind.uses_anthropic_wire_format() {
             return self.stream_anthropic(model, messages, tools, cancel);
         }
         let request_messages = openai_request_messages(self.kind, messages);
@@ -660,10 +702,13 @@ impl OpenAiCompatibleProvider {
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.iter().filter_map(anthropic_tool).collect());
         }
-        let response = self
-            .client
-            .post(self.kind.endpoint())
-            .header("x-api-key", &self.api_key)
+        let request = self.client.post(self.kind.endpoint());
+        let request = if self.kind.anthropic_auth_is_bearer() {
+            request.header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+        } else {
+            request.header("x-api-key", &self.api_key)
+        };
+        let response = request
             .header("anthropic-version", "2023-06-01")
             .header(CONTENT_TYPE, "application/json")
             .json(&body)
@@ -672,7 +717,8 @@ impl OpenAiCompatibleProvider {
         let status = response.status();
         if !status.is_success() {
             return Err(format!(
-                "anthropic returned {status}: {}",
+                "{} returned {status}: {}",
+                self.kind.name(),
                 response.text().unwrap_or_default()
             ));
         }
@@ -1186,6 +1232,26 @@ mod tests {
         assert!(!ProviderKind::LocalOpenAi.requires_api_key());
         assert_eq!(ProviderKind::Ollama.default_model(), "qwen3:8b");
         assert!(ProviderKind::parse("fake").is_err());
+    }
+
+    #[test]
+    fn zai_parses_and_uses_the_anthropic_wire_format_with_bearer_auth() {
+        assert_eq!(ProviderKind::parse("zai"), Ok(ProviderKind::Zai));
+        assert_eq!(ProviderKind::parse("glm"), Ok(ProviderKind::Zai));
+        assert!(ProviderKind::Zai.requires_api_key());
+        assert_eq!(ProviderKind::Zai.api_key_environment(), "ZAI_API_KEY");
+        assert_eq!(ProviderKind::Zai.default_model(), "glm-5.3");
+        assert_eq!(
+            ProviderKind::Zai.endpoint(),
+            "https://api.z.ai/api/anthropic/v1/messages"
+        );
+        assert!(ProviderKind::Zai.uses_anthropic_wire_format());
+        assert!(ProviderKind::Zai.anthropic_auth_is_bearer());
+        // Real Anthropic is the one Anthropic-wire-format kind that keeps
+        // Anthropic's own x-api-key auth instead of Bearer.
+        assert!(ProviderKind::Anthropic.uses_anthropic_wire_format());
+        assert!(!ProviderKind::Anthropic.anthropic_auth_is_bearer());
+        assert!(!ProviderKind::Zai.is_external_delegate());
     }
 
     #[test]

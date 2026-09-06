@@ -38,9 +38,12 @@ OPENROUTER_API_KEY=... cargo run -- "Describe this project"
 OPENAI_API_KEY=... cargo run -- --provider openai --model gpt-4.1-mini "Describe this project"
 DEEPSEEK_API_KEY=... cargo run -- --provider deepseek --model deepseek-v4-flash "Describe this project"
 ANTHROPIC_API_KEY=... cargo run -- --provider anthropic --model claude-sonnet-4-5 "Describe this project"
+ZAI_API_KEY=... cargo run -- --provider zai --model glm-5.3 "Describe this project"
 ollama pull qwen3:8b
 cargo run -- --provider ollama --model qwen3:8b "Describe this project"
 ```
+
+`zai` uses [Z.ai](https://z.ai)'s GLM models over their Claude-Code-compatible Anthropic Messages API endpoint (`https://api.z.ai/api/anthropic`) — the same `stream_anthropic` wire format `anthropic` uses, just pointed elsewhere, since Z.ai built that endpoint specifically as a drop-in for Anthropic-format clients. The one real difference: Z.ai's endpoint authenticates via `Authorization: Bearer` (their documented `ANTHROPIC_AUTH_TOKEN` convention) rather than Anthropic's own `x-api-key` header — `ProviderKind::anthropic_auth_is_bearer` is the one place that's handled. Works with either a pay-as-you-go Z.ai API key or a key from a GLM Coding Plan subscription (flat monthly quota, cheaper than per-token billing for heavy use) — either way it's a single `ZAI_API_KEY` set the normal way (`junebug set --provider zai KEY`, `--provider zai`, or `.env`). Default model `glm-5.3`; `glm-5.3-flash` is the cheap/fast option.
 
 Ollama is detected automatically at `http://127.0.0.1:11434`; set `OLLAMA_HOST` for another local or LAN endpoint. It needs no Junebug credential. Installed Ollama models appear alongside cloud models in `/model` and `/swarm-setup`, and `ollama:model-name` works for direct selection. Junebug uses Ollama's OpenAI-compatible streaming chat, model-list, and tool-calling APIs and disables Qwen's long thinking trace for responsive agent turns. The default `qwen3:8b` is small enough for a 16 GB Apple Silicon Mac and supports real tool calls; plain code-completion models may only print tool-shaped text and are not suitable for agent mode.
 
