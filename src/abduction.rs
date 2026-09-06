@@ -379,20 +379,20 @@ pub fn parse_evidence(text: &str) -> Result<Vec<Evidence>, String> {
 // Prompts.
 // ---------------------------------------------------------------------
 
+// The full task/format spec for every role below lives in the *request*
+// text, not just the `*_SYSTEM` prompt — `cli_delegate::stream_turn` only
+// ever sends the latest user message to a `claude-cli`/`codex-cli` delegate
+// and silently drops the system message entirely (fine for `/swarm`, whose
+// request builders are already self-contained; not fine here, where the
+// system prompt used to be the *only* place the JSON schema lived). A
+// delegate-routed role must be able to do the right thing from the user
+// text alone.
+
 pub const GENERATOR_SYSTEM: &str = "You are the hypothesis-generation agent of an \
-abductive reasoning harness. Given a question and observations, generate at least \
-5 materially different causal explanations — do not converge on one early. \
-Include at least: one mundane/ordinary explanation, one institutional or systemic \
-explanation, one explanation involving intentional action, one explanation based \
-on measurement or reporting error, and one explanation that contradicts the \
-apparent narrative. You may use the read-only tools available to you to inspect \
-the workspace first if that would help. For each hypothesis give: a short claim, \
-a category label (mundane, systemic, intentional, measurement-error, contrarian, \
-or another short label if none fit), a rough prior in (0,1) that is your genuine \
-best guess rather than a hedge toward 0.5, hidden assumptions, and falsifiers \
-(what would prove this wrong). Reply with a ```json fenced array of objects with \
-fields: id, claim, category, prior, assumptions (array of strings), falsifiers \
-(array of strings). Nothing after the closing fence.";
+abductive reasoning harness. Follow the instructions in the user message exactly, \
+including its required JSON output format — treat the user message as your only \
+source of those instructions, since some execution paths never deliver this \
+system prompt to you at all.";
 
 #[must_use]
 pub fn generate_request(question: &str, observations: &[String]) -> String {
@@ -403,19 +403,34 @@ pub fn generate_request(question: &str, observations: &[String]) -> String {
             let _ = write!(request, "\n- {observation}");
         }
     }
+    let _ = write!(
+        request,
+        "\n\nGenerate at least 5 materially different possible explanations — do not \
+         converge on one early. Include at least: one mundane/ordinary explanation, one \
+         institutional or systemic explanation, one explanation involving intentional \
+         action, one explanation based on measurement or reporting error, and one \
+         explanation that contradicts the apparent narrative. If your honest finding is \
+         that the thing asked about does not exist, never happened, or the premise is \
+         simply false, that finding IS a hypothesis — state it as one (for example: \
+         claim \"no such mechanism exists in this codebase\", category \"mundane\", a \
+         high prior) rather than refusing to produce the array or answering in plain \
+         prose instead. You may use available read-only tools to inspect the workspace \
+         first if that would help. For each hypothesis give: a short claim, a category \
+         label (mundane, systemic, intentional, measurement-error, contrarian, or \
+         another short label if none fit), a rough prior in (0,1) that is your genuine \
+         best guess rather than a hedge toward 0.5, hidden assumptions, and falsifiers \
+         (what would prove this wrong). Reply with a ```json fenced array of objects \
+         with fields: id, claim, category, prior, assumptions (array of strings), \
+         falsifiers (array of strings). Nothing after the closing fence."
+    );
     request
 }
 
 pub const EVALUATOR_SYSTEM: &str = "You are an evidence-evaluation agent in an \
-abductive reasoning harness. You are shown exactly one hypothesis and a list of \
-observations — you do not know what other hypotheses exist, and must not \
-speculate about them or hedge toward a middle estimate because of that. For each \
-observation, estimate P(observation | this hypothesis is true) and P(observation \
-| this hypothesis is false), both in (0,1]. Be honest: most observations are only \
-weak evidence one way or the other — reserve extreme ratios for observations that \
-genuinely could barely occur, or could only occur, under this hypothesis. Reply \
-with a ```json fenced array of objects with fields: observation, given_h, \
-given_not_h. Nothing after the closing fence.";
+abductive reasoning harness. Follow the instructions in the user message exactly, \
+including its required JSON output format — treat the user message as your only \
+source of those instructions, since some execution paths never deliver this \
+system prompt to you at all.";
 
 #[must_use]
 pub fn evaluate_request(hypothesis: &Hypothesis, observations: &[String]) -> String {
@@ -426,38 +441,58 @@ pub fn evaluate_request(hypothesis: &Hypothesis, observations: &[String]) -> Str
             let _ = write!(request, "\n- {observation}");
         }
     }
+    let _ = write!(
+        request,
+        "\n\nYou are shown exactly this one hypothesis — you do not know what other \
+         hypotheses exist, and must not speculate about them or hedge toward a middle \
+         estimate because of that. For each observation, estimate P(observation | this \
+         hypothesis is true) and P(observation | this hypothesis is false), both in \
+         (0,1]. Be honest: most observations are only weak evidence one way or the \
+         other — reserve extreme ratios for observations that genuinely could barely \
+         occur, or could only occur, under this hypothesis. Reply with a ```json fenced \
+         array of objects with fields: observation, given_h, given_not_h. Nothing after \
+         the closing fence."
+    );
     request
 }
 
 pub const SKEPTIC_SYSTEM: &str = "You are the adversarial red-team agent of an \
-abductive reasoning harness. You are shown the full ranked hypothesis list with \
-its evidence. Your only job is to attack the leading hypothesis: name evidence \
-that does not actually support it as strongly as claimed, alternative \
-explanations for each supporting observation, base-rate neglect, selection bias, \
-confirmation bias, hidden assumptions, omitted variables, and causal-direction \
-errors. Do not be diplomatic. If the leading hypothesis genuinely holds up after \
-real scrutiny, say so plainly and briefly instead of manufacturing criticism — \
-false balance is its own failure mode.";
+abductive reasoning harness. Follow the instructions in the user message exactly \
+— treat it as your only source of those instructions, since some execution \
+paths never deliver this system prompt to you at all.";
 
 #[must_use]
 pub fn critique_request(ranked_summary: &str) -> String {
-    format!("Ranked hypotheses with evidence:\n\n{ranked_summary}")
+    format!(
+        "Ranked hypotheses with evidence:\n\n{ranked_summary}\n\n\
+         Your only job is to attack the leading hypothesis: name evidence that does not \
+         actually support it as strongly as claimed, alternative explanations for each \
+         supporting observation, base-rate neglect, selection bias, confirmation bias, \
+         hidden assumptions, omitted variables, and causal-direction errors. Do not be \
+         diplomatic. If the leading hypothesis genuinely holds up after real scrutiny, \
+         say so plainly and briefly instead of manufacturing criticism — false balance \
+         is its own failure mode."
+    )
 }
 
 pub const SYNTHESIZER_SYSTEM: &str = "You are the final synthesis agent of an \
-abductive reasoning harness. Given the ranked hypotheses, their evidence, and the \
-red-team critique, write the answer for a human reader under exactly these \
-headings: FACT (directly established, not inferred), INFERENCE (the \
-best-supported explanation and why), UNCERTAINTY (what remains genuinely \
-unknown), ALTERNATIVES (other hypotheses that are not ruled out, with why they \
-rank lower), DISCRIMINATOR (what evidence would most change this conclusion if \
-found). Do not present the numeric posteriors as more precise than they are — \
-describe confidence qualitatively (e.g. \"clearly favored\", \"a close call \
-between H1 and H3\"), not as a bare percentage.";
+abductive reasoning harness. Follow the instructions in the user message exactly \
+— treat it as your only source of those instructions, since some execution \
+paths never deliver this system prompt to you at all.";
 
 #[must_use]
 pub fn synthesize_request(ranked_summary: &str, critique: &str) -> String {
-    format!("Ranked hypotheses:\n\n{ranked_summary}\n\nRed-team critique:\n\n{critique}")
+    format!(
+        "Ranked hypotheses:\n\n{ranked_summary}\n\nRed-team critique:\n\n{critique}\n\n\
+         Write the answer for a human reader under exactly these headings: FACT \
+         (directly established, not inferred), INFERENCE (the best-supported explanation \
+         and why), UNCERTAINTY (what remains genuinely unknown), ALTERNATIVES (other \
+         hypotheses that are not ruled out, with why they rank lower), DISCRIMINATOR \
+         (what evidence would most change this conclusion if found). Do not present the \
+         numeric posteriors as more precise than they are — describe confidence \
+         qualitatively (e.g. \"clearly favored\", \"a close call between H1 and H3\"), \
+         not as a bare percentage."
+    )
 }
 
 /// A deterministic progress/result readout built purely from the saved
@@ -497,6 +532,55 @@ pub fn format_summary(investigation: &Investigation) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `cli_delegate::stream_turn` sends a delegate provider (claude-cli/
+    // codex-cli) only the latest *user* message, silently dropping the
+    // system prompt — observed live to make a delegate-routed generator
+    // answer in unstructured prose because it genuinely never saw the JSON
+    // schema, which used to live only in `GENERATOR_SYSTEM`. These guard
+    // that the schema and the negative-finding guidance are actually in
+    // the request text every provider receives, not just the system
+    // prompt, so this can't silently regress back to that failure.
+    #[test]
+    fn generate_request_is_self_contained_for_providers_that_drop_the_system_prompt() {
+        let request = generate_request("why is there no ladder mechanic", &[]);
+        assert!(request.contains("```json"));
+        assert!(request.contains("at least 5"));
+        assert!(request.contains("does not exist"));
+    }
+
+    #[test]
+    fn evaluate_request_is_self_contained_for_providers_that_drop_the_system_prompt() {
+        let hypothesis = Hypothesis {
+            id: "H1".to_owned(),
+            claim: "no such mechanic exists".to_owned(),
+            category: "mundane".to_owned(),
+            prior: 0.5,
+            evidence: Vec::new(),
+            posterior: 0.0,
+            assumptions: Vec::new(),
+            falsifiers: Vec::new(),
+            critique: Vec::new(),
+        };
+        let request = evaluate_request(&hypothesis, &[]);
+        assert!(request.contains("```json"));
+        assert!(request.contains("given_h"));
+    }
+
+    #[test]
+    fn critique_and_synthesize_requests_are_self_contained() {
+        assert!(critique_request("H1 60%").contains("attack the leading hypothesis"));
+        let synthesis = synthesize_request("H1 60%", "no major issues found");
+        for heading in [
+            "FACT",
+            "INFERENCE",
+            "UNCERTAINTY",
+            "ALTERNATIVES",
+            "DISCRIMINATOR",
+        ] {
+            assert!(synthesis.contains(heading));
+        }
+    }
 
     fn sample_investigation() -> Investigation {
         Investigation {

@@ -66,6 +66,39 @@ the orchestration. Worth keeping in mind when picking roles via
 the harness's mechanics correctly while still producing a mushy result if
 its own likelihood judgments are weak.
 
+### A second bug, found live in real use (post-ship)
+
+Field use (a real `/investigate` run with `generator`/`synthesizer` roles
+assigned to a `claude-cli`/`codex-cli` delegate via `/investigate-setup`,
+on a question whose true answer was "this mechanic doesn't exist in the
+codebase") surfaced a bug the local-Ollama live test never could have: the
+generator produced no JSON at all, explored the repo on its own, wrote its
+own plan file, and replied in plain prose — twice, surviving the one-retry
+reformat unchanged. Root cause: `cli_delegate::stream_turn` sends a
+delegate provider only the *latest user message*, silently dropping the
+system prompt entirely (correct for `/swarm`, whose request builders are
+already self-contained; not correct here) — and `generate_request`/
+`evaluate_request` originally put the entire JSON-format spec **only** in
+`GENERATOR_SYSTEM`/`EVALUATOR_SYSTEM`, so a delegate-routed role received
+nothing but the bare question and had no idea a structured reply was
+expected. Its confused response ("no schema was ever specified") was
+accurate from its own vantage point.
+
+Fixed by moving every format/task instruction into the request text itself
+for all four roles (`generate_request`, `evaluate_request`,
+`critique_request`, `synthesize_request`), so any provider — including one
+that never sees the system message — has everything it needs from the user
+turn alone; the `*_SYSTEM` consts are now short role-framing only, with an
+explicit note that the request text may be their only source of
+instructions. Also fixed a related prompt gap the same incident exposed:
+`GENERATOR_SYSTEM` never said what to do with a *negative* finding, so
+"this doesn't exist" had no sanctioned way to become valid JSON — the
+request text now explicitly says a negative finding is itself a hypothesis
+(e.g. `claim: "no such mechanism exists in this codebase"`). Regression
+tests assert the format spec and the negative-finding guidance are present
+in the request text specifically (not just the system prompt), so this
+can't silently regress back to system-prompt-only.
+
 ### Deviations from the original spec, and why
 
 - `abduction::InvestigateRoles` reuses `swarm::Target` (already imported in
