@@ -1706,6 +1706,11 @@ fn run_interactive_turn(
     let raw = terminal::enable_raw_mode().is_ok();
     let started = Instant::now();
     let plan_mode = policy.plan_mode();
+    // Shown in the live spinner line so the active model is visible while a
+    // turn is running, not just at the idle prompt. Kept up to date on
+    // `RouteChanged` so auto-routing shows the model actually driving the
+    // turn, not the one it started on.
+    let mut model_label = provider.model().to_owned();
     let result = thread::scope(|scope| {
         let observer_tx = events_tx.clone();
         let approve_tx = events_tx;
@@ -1828,6 +1833,7 @@ fn run_interactive_turn(
                             "{DIM}↳ {} ({}) — {reason}{RESET}{ending}",
                             decision.route.model, decision.route.provider
                         );
+                        model_label.clone_from(&decision.route.model);
                     }
                     TurnEvent::Notice(text) => {
                         eprint!("{YELLOW}⟳ {text}{RESET}{ending}");
@@ -1886,7 +1892,7 @@ fn run_interactive_turn(
                     frame = (frame + 1) % SPINNER_FRAMES.len();
                     let permission = permission_state.get();
                     eprint!(
-                        "{CLEAR_LINE}{CYAN}{}{RESET} {DIM}working… {}s · {RESET}{}{}{RESET} {DIM}(⇧tab permissions · esc interrupt){RESET}",
+                        "{CLEAR_LINE}{CYAN}{}{RESET} {DIM}working… {}s · {RESET}{}{}{RESET}{DIM} · {model_label}{RESET} {DIM}(⇧tab permissions · esc interrupt){RESET}",
                         SPINNER_FRAMES[frame],
                         started.elapsed().as_secs(),
                         permission_color(permission),
@@ -2387,7 +2393,7 @@ fn swarm_agent(
                     } else {
                         frame = (frame + 1) % SPINNER_FRAMES.len();
                         eprint!(
-                            "{CLEAR_LINE}{CYAN}{}{RESET} {DIM}{} · {}s · s status · p pause · esc pause now{RESET}",
+                            "{CLEAR_LINE}{CYAN}{}{RESET} {DIM}{} · {}s · {model} · s status · p pause · esc pause now{RESET}",
                             SPINNER_FRAMES[frame],
                             controls.phase,
                             started.elapsed().as_secs()
@@ -3207,7 +3213,7 @@ fn investigate_agent(
                     } else {
                         frame = (frame + 1) % SPINNER_FRAMES.len();
                         eprint!(
-                            "{CLEAR_LINE}{CYAN}{}{RESET} {DIM}{phase} · {}s · esc interrupt{RESET}",
+                            "{CLEAR_LINE}{CYAN}{}{RESET} {DIM}{phase} · {}s · {model} · esc interrupt{RESET}",
                             SPINNER_FRAMES[frame],
                             started.elapsed().as_secs()
                         );
